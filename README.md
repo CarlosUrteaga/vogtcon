@@ -7,7 +7,7 @@ Biblioteca Python experimental para evaluar contratos antes y después de que un
 
 El repositorio público, la distribución en PyPI y el import de Python se llaman `vogtcon`. El proyecto se publica bajo [Apache License 2.0](LICENSE). Algunos reportes históricos mencionan el nombre anterior `governor_contracts` y la copia vendor del benchmark; se conservaron como evidencia de esas etapas.
 
-Para empezar con una prueba local, consulta [Cómo probar Governor Contracts](PRUEBAS.md).
+Para empezar con una prueba local, sigue la sección [Probar la integración](#probar-la-integración).
 Para incorporarlo a un agente propio, sigue la [guía de integración](INTEGRACION.md).
 
 ## Usar como librería

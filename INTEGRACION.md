@@ -157,7 +157,7 @@ with telemetry.run(controller.run_id, controller.contract.contract_id):
     ...
 ```
 
-La telemetría observa las comprobaciones y correlaciona los registros; la decisión que permite o bloquea una herramienta se toma sincrónicamente. Para ver spans en consola y un agente Pydantic AI instrumentado, ejecuta [el ejemplo de pruebas](PRUEBAS.md).
+La telemetría observa las comprobaciones y correlaciona los registros; la decisión que permite o bloquea una herramienta se toma sincrónicamente. Para ver spans en consola y un agente Pydantic AI instrumentado, ejecuta [el ejemplo del README](README.md#probar-la-integración).
 
 ## Alcance actual
 
