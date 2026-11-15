@@ -1,0 +1,29 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vogtcon"
+version = "0.1.0"
+description = "Deterministic contracts and runtime governance for agents."
+readme = "README.md"
+authors = [{name = "Jorge Carlos Urteaga Reyesvera"}]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.10,<3", "PyYAML>=6,<7", "opentelemetry-api>=1,<2"]
+
+[project.optional-dependencies]
+pydantic-ai = ["pydantic-ai-slim>=1,<3"]
+
+[project.urls]
+Repository = "https://github.com/CarlosUrteaga/vogtcon"
+
+[dependency-groups]
+test = ["opentelemetry-sdk>=1,<2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

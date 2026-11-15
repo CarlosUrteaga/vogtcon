@@ -1,0 +1,23 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 2
+contract_id: example.note_agent
+approved_agent_configurations:
+  - pydantic-note-agent-v1
+declared_tools:
+  - save_note
+response_schema:
+  required_fields:
+    - status
+memory_policy: none
+validation_phases:
+  - pre_execution
+  - runtime
+  - post_execution
+runtime_rules:
+  - tool.declared_only
+  - note.public_requires_approval
+postconditions:
+  - response.schema_complete
+contract_fingerprint: sha256:c99458bd47cc91fb4c34942316cd1b3337dedccf83744185f08d8486325a3a0d

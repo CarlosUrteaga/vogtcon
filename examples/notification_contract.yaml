@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+contract_id: example.notification
+mode: guarded
+approved_agent_configurations:
+  - notification-agent-v1
+declared_tools:
+  - send_notification
+response_schema:
+  required_fields:
+    - status
+memory_policy: none
+validation_phases:
+  - pre_execution
+  - runtime
+  - post_execution
+runtime_rules:
+  - tool.declared_only
+  - sensitive_requires_approval
+postconditions:
+  - response.schema_complete
+agent_feedback:
+  advisory_warning_visibility: false
+  guarded_denial_style: minimal
+  strict_replanning_after_violation: false
+contract_fingerprint: notification-contract-v1
