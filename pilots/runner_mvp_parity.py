@@ -4,7 +4,7 @@
 """Semantic parity comparator and governed benchmark runner (Milestone Runner MVP).
 
 Read-only with respect to ``src/vogtcon/`` and the benchmark
-repository. Implements Stage 0-3 of ``MILESTONE_RUNNER_MVP_SPEC.md`` using
+repository. Implements the exploratory runner parity stages using
 explicit Unit of Work, attempt/feedback tracker, and adapter patterns.
 """
 

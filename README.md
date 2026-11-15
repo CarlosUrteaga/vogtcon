@@ -122,15 +122,11 @@ La telemetría también es opcional. Pasa `TelemetryObserver` al controlador y m
 
 El paquete conserva `no_contract` como control experimental, además de `advisory`, `guarded` y `strict`. `guarded` bloquea una acción y permite una nueva propuesta; `strict` aborta por violaciones pre/runtime. No hay todavía CLI de producto, adaptador al benchmark dentro del paquete, ledger distribuido ni Governor con LLM. La integración con un proveedor LLM real no forma parte de las pruebas automáticas.
 
-El [reporte del Stage 5](STAGE_5_REPORT.md) documenta un piloto exploratorio con
-`S-001`, `S-013` y `S-016` en los cuatro modos. El arnés
+El piloto exploratorio incluye `S-001`, `S-013` y `S-016` en los cuatro modos. El arnés
 `pilots/benchmark_probe.py` conserva su selección predeterminada de cuatro runs;
 `--scenarios` y `--modes` permiten la selección de 12. Las discrepancias entre
 el manifest y el checkout impiden presentar ese piloto como una comparación
 histórica congelada.
-
-Para retomar el desarrollo, consulta el [estado breve del proyecto](PROJECT_CONTEXT.md)
-y la [especificación propuesta del siguiente milestone](MILESTONE_RUNNER_MVP_SPEC.md).
 
 Ejecuta la suite local con:
 
