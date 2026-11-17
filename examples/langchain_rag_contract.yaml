@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 2
+contract_id: example.langchain_rag_brief
+approved_agent_configurations:
+  - langchain-rag-brief-agent-v1
+declared_tools:
+  - publish_brief
+response_schema:
+  required_fields:
+    - status
+    - published
+    - brief_path
+    - citation_ids
+    - verified_output
+memory_policy: none
+validation_phases:
+  - pre_execution
+  - runtime
+  - post_execution
+runtime_rules:
+  - tool.declared_only
+  - brief.citations_retrieved
+  - brief.approval_required
+postconditions:
+  - response.schema_complete
+contract_fingerprint: sha256:07fc31e8b8092cefb6622b46f28423a49fef00f6bc30fd1e030f882723b177bf

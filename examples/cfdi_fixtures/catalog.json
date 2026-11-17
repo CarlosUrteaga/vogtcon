@@ -1,0 +1,621 @@
+{
+  "uses": {
+    "G01": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "G02": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "616",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "G03": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I01": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I02": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I03": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I04": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I05": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I06": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I07": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "I08": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "606",
+        "612",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D01": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D02": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D03": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D04": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D05": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D06": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D07": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D08": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D09": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "D10": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605",
+        "606",
+        "608",
+        "611",
+        "612",
+        "614",
+        "607",
+        "615",
+        "625"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "S01": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "605",
+        "606",
+        "608",
+        "610",
+        "611",
+        "612",
+        "614",
+        "616",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "607",
+        "615",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "CP01": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "regimes": [
+        "601",
+        "603",
+        "605",
+        "606",
+        "608",
+        "610",
+        "611",
+        "612",
+        "614",
+        "616",
+        "620",
+        "621",
+        "622",
+        "623",
+        "624",
+        "607",
+        "615",
+        "625",
+        "626"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "CN01": {
+      "person_types": [
+        "fisica"
+      ],
+      "regimes": [
+        "605"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    }
+  },
+  "regimes": {
+    "601": {
+      "person_types": [
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "603": {
+      "person_types": [
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "605": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "606": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "607": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "608": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "610": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "611": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "612": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "614": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "615": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "616": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "620": {
+      "person_types": [
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "621": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "622": {
+      "person_types": [
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "623": {
+      "person_types": [
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "624": {
+      "person_types": [
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "625": {
+      "person_types": [
+        "fisica"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    },
+    "626": {
+      "person_types": [
+        "fisica",
+        "moral"
+      ],
+      "valid_from": "2022-01-01",
+      "valid_until": null
+    }
+  }
+}

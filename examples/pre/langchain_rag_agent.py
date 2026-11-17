@@ -1,0 +1,491 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+"""Baseline LangChain RAG agent WITHOUT vogtcon governance (Pre-vogtcon).
+
+Uses LangChain's create_agent, offline HuggingFace embeddings, and an in-memory
+vector store, calling publish_brief directly without contract or gate checks.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import re
+from typing import Any
+
+from langchain.agents import create_agent
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_huggingface import HuggingFaceEmbeddings
+
+# Suppress verbose offline tokenizer / embedding notices
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+
+CORPUS_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "rag_corpus" / "manifest.json"
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_REVISION = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+
+INLINE_CITATION_PATTERN = re.compile(r"\[(doc-[A-Za-z0-9_-]+)\]")
+
+
+def load_frozen_corpus(
+    manifest_path: Path = CORPUS_MANIFEST_PATH,
+) -> tuple[dict[str, Any], list[Document]]:
+    """Load and verify corpus documents against manifest SHA-256 digests."""
+    manifest_file = manifest_path.resolve()
+    if not manifest_file.exists():
+        raise ValueError(f"Corpus manifest does not exist: {manifest_file}")
+
+    manifest_data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    documents: list[Document] = []
+
+    for entry in manifest_data.get("documents", []):
+        filename = entry.get("file")
+        if not filename:
+            raise ValueError(f"Corpus entry missing 'file' field: {entry}")
+        doc_path = manifest_file.parent / filename
+        if not doc_path.exists():
+            raise ValueError(f"Corpus document file not found: {doc_path}")
+
+        content_bytes = doc_path.read_bytes()
+        digest = hashlib.sha256(content_bytes).hexdigest()
+        expected = entry.get("sha256")
+        if digest != expected:
+            raise ValueError(
+                f"SHA-256 mismatch for {filename}: expected {expected}, got {digest}"
+            )
+
+        metadata = {
+            "doc_id": entry["doc_id"],
+            "title": entry.get("title", ""),
+            "source_url": entry.get("source_url", ""),
+            "license": entry.get("license", ""),
+            "revision": entry.get("revision", ""),
+            "sha256": digest,
+        }
+        documents.append(
+            Document(
+                page_content=content_bytes.decode("utf-8"),
+                metadata=metadata,
+            )
+        )
+
+    return manifest_data, documents
+
+
+def default_local_embeddings() -> HuggingFaceEmbeddings:
+    """Return offline HuggingFace embeddings backed by local cached files."""
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_kwargs={"local_files_only": True},
+    )
+
+
+def build_vector_store(
+    documents: Sequence[Document],
+    embeddings: Embeddings | None = None,
+) -> InMemoryVectorStore:
+    """Index verified documents in an in-memory vector store."""
+    emb = embeddings or default_local_embeddings()
+    vector_store = InMemoryVectorStore(embedding=emb)
+    vector_store.add_documents(documents=list(documents))
+    return vector_store
+
+
+@dataclass(slots=True)
+class LocalBriefPublisher:
+    """Direct file publisher without governance checks."""
+
+    output_dir: Path
+    run_id: str
+    corpus_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.corpus_metadata and CORPUS_MANIFEST_PATH.exists():
+            manifest_data = json.loads(CORPUS_MANIFEST_PATH.read_text(encoding="utf-8"))
+            self.corpus_metadata = {
+                doc["doc_id"]: doc for doc in manifest_data.get("documents", [])
+            }
+
+    def __call__(self, arguments: dict[str, Any]) -> tuple[Path, str]:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        brief_path = self.output_dir / f"{self.run_id}-brief.md"
+        title = str(arguments.get("title", "Technical Brief"))
+        claims = list(arguments.get("claims", []))
+        citation_ids = list(arguments.get("citation_ids", []))
+
+        lines = [
+            f"# {title}",
+            "",
+            "## Claims",
+        ]
+        for claim in claims:
+            lines.append(f"- {claim}")
+        lines.append("")
+        lines.append("## Citations")
+        for cid in citation_ids:
+            meta = self.corpus_metadata.get(cid)
+            if meta:
+                meta_parts = []
+                if "title" in meta:
+                    meta_parts.append(meta["title"])
+                if "source_url" in meta:
+                    meta_parts.append(meta["source_url"])
+                if "license" in meta:
+                    meta_parts.append(f"License: {meta['license']}")
+                meta_str = f" - {', '.join(meta_parts)}" if meta_parts else ""
+            else:
+                meta_str = ""
+            lines.append(f"- [{cid}]{meta_str}")
+        lines.append("")
+        content = "\n".join(lines)
+        brief_path.write_text(content, encoding="utf-8")
+        brief_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return brief_path, brief_sha256
+
+
+@dataclass(frozen=True, slots=True)
+class PreRagRunResult:
+    """Outcome of one ungoverned LangChain RAG run."""
+
+    run_id: str
+    agent_output: str | None
+    published: bool
+    brief_path: Path | None
+    brief_sha256: str | None
+    citation_ids: list[str]
+    final_record: dict[str, Any]
+
+
+@dataclass(slots=True)
+class _PreRagDeps:
+    """Dependencies for one ungoverned RAG agent run."""
+
+    run_id: str
+    vector_store: InMemoryVectorStore
+    publish_tool: Callable[[dict[str, Any]], tuple[Path, str]]
+    emit_console: bool
+    published: list[tuple[Path, str, list[str]]]
+
+
+def _chat_result(msg: AIMessage) -> ChatResult:
+    return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+def _tool_call_result(name: str, args: dict[str, Any], call_id: str) -> ChatResult:
+    return _chat_result(
+        AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+    )
+
+
+def _extract_retrieved_ids(retrieve_msgs: Sequence[ToolMessage]) -> list[str]:
+    if not retrieve_msgs:
+        return []
+    content = retrieve_msgs[-1].content
+    text = content if isinstance(content, str) else str(content)
+    return list(dict.fromkeys(INLINE_CITATION_PATTERN.findall(text)))
+
+
+class ScriptedRagChatModel(BaseChatModel):
+    """Deterministic chat model implementing the same 5 scenarios."""
+
+    scenario: str = "case_a_approved_publish"
+    responder: Callable[[list[BaseMessage]], AIMessage | str] | None = None
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if self.responder is not None:
+            res = self.responder(messages)
+            msg = AIMessage(content=res) if isinstance(res, str) else res
+            return _chat_result(msg)
+
+        tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+        retrieve_msgs = [m for m in tool_messages if m.name == "retrieve_context"]
+        publish_msgs = [m for m in tool_messages if m.name == "publish_brief"]
+        call_id = f"call_{len(tool_messages) + 1}"
+
+        if self.scenario == "case_a_approved_publish":
+            if not retrieve_msgs:
+                return _tool_call_result(
+                    "retrieve_context",
+                    {"query": "¿Qué evidencia muestra que una herramienta fue bloqueada antes de causar un efecto?"},
+                    call_id,
+                )
+            if not publish_msgs:
+                retrieved_ids = _extract_retrieved_ids(retrieve_msgs)
+                preferred = [cid for cid in retrieved_ids if cid != "doc-gov-004"]
+                selected = (preferred or retrieved_ids)[:2] or ["doc-gov-001", "doc-gov-002"]
+                claims = [
+                    f"La puerta síncrona bloquea antes del efecto y registra el evento sin tool_completed [{cid}]."
+                    for cid in selected
+                ]
+                return _tool_call_result(
+                    "publish_brief",
+                    {
+                        "title": "Evidencia de Bloqueo Síncrono",
+                        "claims": claims,
+                        "citation_ids": selected,
+                    },
+                    call_id,
+                )
+            return _chat_result(
+                AIMessage(content="Brief técnico publicado exitosamente con citas verificadas.")
+            )
+
+        if self.scenario in ("case_b_invalid_citation", "case_b_empty_citation"):
+            if not retrieve_msgs:
+                return _tool_call_result(
+                    "retrieve_context",
+                    {"query": "arquitectura de puerta sincrona"},
+                    call_id,
+                )
+            if not publish_msgs:
+                bad_citations = [] if self.scenario == "case_b_empty_citation" else ["doc-inexistente-999"]
+                return _tool_call_result(
+                    "publish_brief",
+                    {
+                        "title": "Brief con Cita Inválida",
+                        "claims": ["Afirmación no respaldada [doc-inexistente-999]."],
+                        "citation_ids": bad_citations,
+                    },
+                    call_id,
+                )
+            return _chat_result(
+                AIMessage(content="Brief publicado sin bloqueo.")
+            )
+
+        if self.scenario == "case_c_unapproved":
+            if not retrieve_msgs:
+                return _tool_call_result(
+                    "retrieve_context",
+                    {"query": "incidente texto no confiable doc-gov-004 prompt injection"},
+                    call_id,
+                )
+            if not publish_msgs:
+                retrieved_ids = _extract_retrieved_ids(retrieve_msgs)
+                selected = (
+                    [cid for cid in retrieved_ids if cid == "doc-gov-004"]
+                    or retrieved_ids[:1]
+                    or ["doc-gov-004"]
+                )
+                claims = [
+                    f"Análisis de incidente con instrucciones no confiables tratadas como dato [{cid}]."
+                    for cid in selected
+                ]
+                return _tool_call_result(
+                    "publish_brief",
+                    {
+                        "title": "Análisis de Incidente Prompt Injection",
+                        "claims": claims,
+                        "citation_ids": selected,
+                    },
+                    call_id,
+                )
+            return _chat_result(
+                AIMessage(content="Brief publicado sin verificación de aprobación.")
+            )
+
+        if self.scenario == "case_d_replan_after_block":
+            if not retrieve_msgs:
+                return _tool_call_result(
+                    "retrieve_context",
+                    {"query": "registro jsonl y trazas opentelemetry"},
+                    call_id,
+                )
+            if not publish_msgs:
+                return _tool_call_result(
+                    "publish_brief",
+                    {
+                        "title": "Auditoría y Trazas",
+                        "claims": ["Afirmación no respaldada [doc-inexistente-999]."],
+                        "citation_ids": ["doc-inexistente-999"],
+                    },
+                    call_id,
+                )
+            pub_content = str(publish_msgs[-1].content)
+            if len(publish_msgs) == 1 and "blocked by Governor" in pub_content:
+                retrieved_ids = _extract_retrieved_ids(retrieve_msgs)
+                selected = (
+                    [cid for cid in retrieved_ids if cid == "doc-gov-003"]
+                    or retrieved_ids[:1]
+                    or ["doc-gov-003"]
+                )
+                claims = [
+                    f"Registro estructurado en formato JSONL y correlación OpenTelemetry [{cid}]."
+                    for cid in selected
+                ]
+                return _tool_call_result(
+                    "publish_brief",
+                    {
+                        "title": "Auditoría y Trazas (Corregido)",
+                        "claims": claims,
+                        "citation_ids": selected,
+                    },
+                    call_id,
+                )
+            return _chat_result(
+                AIMessage(content="Brief publicado en el primer intento sin corrección.")
+            )
+
+        if self.scenario == "case_e_insufficient_evidence":
+            if not retrieve_msgs:
+                return _tool_call_result(
+                    "retrieve_context",
+                    {"query": "receta culinaria pastel de chocolate"},
+                    call_id,
+                )
+            return _chat_result(AIMessage(content="evidencia insuficiente"))
+
+        return _chat_result(AIMessage(content="done"))
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> ScriptedRagChatModel:
+        return self
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-rag-chat"
+
+
+def run_rag_brief(
+    *,
+    run_id: str,
+    model: BaseChatModel,
+    vector_store: InMemoryVectorStore,
+    output_dir: Path | None = None,
+    publish_tool: Callable[[dict[str, Any]], tuple[Path, str]] | None = None,
+    emit_console: bool = False,
+    user_query: str = "Genera un brief técnico a partir de las fuentes verificadas.",
+) -> PreRagRunResult:
+    """Execute a single ungoverned LangChain RAG run (Pre-vogtcon baseline)."""
+    actual_output_dir = output_dir or Path("/tmp/vogtcon-rag-pre")
+    actual_publish_tool = (
+        publish_tool if publish_tool is not None else LocalBriefPublisher(actual_output_dir, run_id)
+    )
+    published_list: list[tuple[Path, str, list[str]]] = []
+
+    deps = _PreRagDeps(
+        run_id=run_id,
+        vector_store=vector_store,
+        publish_tool=actual_publish_tool,
+        emit_console=emit_console,
+        published=published_list,
+    )
+
+    @tool
+    def retrieve_context(query: str) -> str:
+        """Retrieve relevant reference documents from the verified corpus."""
+        retrieved_docs = deps.vector_store.similarity_search(query, k=3)
+        snippets = []
+        for doc in retrieved_docs:
+            cid = doc.metadata.get("doc_id", "unknown")
+            title = doc.metadata.get("title", "Untitled")
+            snippets.append(f"[{cid}] {title} (UNTRUSTED DATA):\n{doc.page_content}")
+        return "\n\n".join(snippets) if snippets else "No documents found."
+
+    @tool
+    def publish_brief(title: str, claims: list[str], citation_ids: list[str]) -> str:
+        """Publish a technical brief directly without governance checks."""
+        arguments = {"title": title, "claims": claims, "citation_ids": citation_ids}
+        published_path, published_sha256 = deps.publish_tool(arguments)
+        deps.published.append((published_path, published_sha256, list(citation_ids)))
+        record = {
+            "event": "tool_executed_ungoverned",
+            "run_id": deps.run_id,
+            "published": True,
+            "brief_path": str(published_path),
+            "citation_ids": list(citation_ids),
+        }
+        if deps.emit_console:
+            print(json.dumps(record, ensure_ascii=False))
+        return f"published brief at {published_path}"
+
+    agent = create_agent(model, [retrieve_context, publish_brief])
+    agent_result = agent.invoke({"messages": [HumanMessage(content=user_query)]})
+    messages = agent_result.get("messages", []) if isinstance(agent_result, dict) else []
+    agent_output = (
+        messages[-1].content if messages and hasattr(messages[-1], "content") else None
+    )
+
+    if deps.published:
+        brief_path, brief_sha256, verified_citations = deps.published[-1]
+        published = True
+    else:
+        brief_path = None
+        brief_sha256 = None
+        verified_citations = []
+        published = False
+
+    final_record = {
+        "event": "pre_agent_result",
+        "run_id": run_id,
+        "published": published,
+        "brief_path": str(brief_path) if brief_path else None,
+        "brief_sha256": brief_sha256,
+        "citation_ids": verified_citations,
+        "agent_output": agent_output,
+    }
+    if emit_console:
+        print(json.dumps(final_record, ensure_ascii=False))
+
+    return PreRagRunResult(
+        run_id=run_id,
+        agent_output=agent_output,
+        published=published,
+        brief_path=brief_path,
+        brief_sha256=brief_sha256,
+        citation_ids=verified_citations,
+        final_record=final_record,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run the baseline LangChain RAG agent WITHOUT vogtcon offline"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("/tmp/vogtcon-rag-pre"),
+        help="Directory to write generated brief markdown files",
+    )
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    _, corpus_docs = load_frozen_corpus(CORPUS_MANIFEST_PATH)
+    vector_store = build_vector_store(corpus_docs)
+
+    for run_id, scenario in (
+        ("rag-case-a-approved", "case_a_approved_publish"),
+        ("rag-case-b-invalid-citation", "case_b_invalid_citation"),
+        ("rag-case-c-unapproved", "case_c_unapproved"),
+        ("rag-case-d-replan", "case_d_replan_after_block"),
+        ("rag-case-e-insufficient-evidence", "case_e_insufficient_evidence"),
+    ):
+        run_rag_brief(
+            run_id=run_id,
+            model=ScriptedRagChatModel(scenario=scenario),
+            vector_store=vector_store,
+            output_dir=args.output_dir,
+            emit_console=True,
+        )
