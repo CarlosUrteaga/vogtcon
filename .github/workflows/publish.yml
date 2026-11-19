@@ -4,41 +4,156 @@
 name: Publish Python distributions
 
 on:
+  pull_request:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distributions-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  tests:
+    name: Distribution test suite
+    uses: ./.github/workflows/ci.yml
+
   build-and-test:
+    needs: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      expected-distributions: ${{ steps.manifest.outputs.expected }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - uses: astral-sh/setup-uv@v6
-      - name: Install test dependencies
-        run: uv sync --locked --extra pydantic-ai --group test
-      - name: Run tests
-        run: PYDANTIC_AI_NO_BANNER=1 uv run --no-sync python -m unittest discover -s tests -p 'test*.py' -q
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Record tested revision
+        run: |
+          git rev-parse HEAD
+          git rev-parse 'HEAD^{tree}'
+
       - name: Build sdist and wheel
-        run: uv build
-      - uses: actions/upload-artifact@v4
+        run: uv build --out-dir dist
+
+      - name: Record independent distribution hashes
+        id: manifest
+        run: |
+          expected=$(python .github/scripts/verify_distributions.py manifest --directory dist)
+          printf 'expected=%s\n' "$expected" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        id: upload
         with:
           name: python-package-distributions
           path: dist/
+          if-no-files-found: error
+
+      - name: Record build evidence
+        env:
+          EXPECTED_DISTRIBUTIONS: ${{ steps.manifest.outputs.expected }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          {
+            printf '### Built distributions\n\n'
+            printf 'Commit: `%s`\n\n' "$(git rev-parse HEAD)"
+            printf 'Tree: `%s`\n\n' "$(git rev-parse 'HEAD^{tree}')"
+            printf 'Artifact ID: `%s`\n\n' "$ARTIFACT_ID"
+            printf 'Artifact SHA-256: `%s`\n\n' "$ARTIFACT_DIGEST"
+            printf 'Per-file SHA-256 (job outputs):\n\n```json\n%s\n```\n' "$EXPECTED_DISTRIBUTIONS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify-distributions:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact-id: ${{ needs.build-and-test.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.build-and-test.outputs.artifact-id }}
+          path: dist/
+          digest-mismatch: error
+
+      - name: Verify downloaded distribution hashes
+        env:
+          EXPECTED_DISTRIBUTIONS: ${{ needs.build-and-test.outputs.expected-distributions }}
+        run: |
+          python .github/scripts/verify_distributions.py check \
+            --directory dist --expected-json "$EXPECTED_DISTRIBUTIONS"
+
+      - name: Check distribution metadata and description
+        run: uvx --from twine==7.0.0 twine check --strict dist/*
+
+      - name: Test downloaded wheel as isolated consumer
+        run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          wheels=(dist/*.whl)
+          wheel_path=$(realpath "${wheels[0]}")
+          uv venv --python "$(command -v python)" "$scratch/venv"
+          uv pip install --python "$scratch/venv/bin/python" "$wheel_path"
+          mkdir "$scratch/consumer"
+          cp tests/wheel_consumer.py examples/notification_contract.yaml \
+            examples/notification_contract_v2.yaml "$scratch/consumer/"
+          (cd "$scratch/consumer" && env -u PYTHONPATH "$scratch/venv/bin/python" -I \
+            wheel_consumer.py notification_contract.yaml notification_contract_v2.yaml)
+
+      - name: Rebuild downloaded sdist and test its wheel
+        run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          sdists=(dist/*.tar.gz)
+          uv build --wheel "${sdists[0]}" --out-dir "$scratch/rebuilt"
+          wheels=("$scratch/rebuilt/"*.whl)
+          uv venv --python "$(command -v python)" "$scratch/venv"
+          uv pip install --python "$scratch/venv/bin/python" "${wheels[0]}"
+          mkdir "$scratch/consumer"
+          cp tests/wheel_consumer.py examples/notification_contract.yaml \
+            examples/notification_contract_v2.yaml "$scratch/consumer/"
+          (cd "$scratch/consumer" && env -u PYTHONPATH "$scratch/venv/bin/python" -I \
+            wheel_consumer.py notification_contract.yaml notification_contract_v2.yaml)
+
+      - name: Record verification scope
+        run: |
+          printf '%s\n' \
+            '### Verified distributions' \
+            'Build, native transfer integrity, independent file hashes, metadata, isolated wheel consumption and sdist rebuild passed.' \
+            'PyPI OIDC authentication and acceptance of a new version were not tested by these verification jobs.' \
+            >> "$GITHUB_STEP_SUMMARY"
 
   publish-to-pypi:
-    needs: build-and-test
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-distributions]
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/vogtcon
     permissions:
+      contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: python-package-distributions
+          artifact-ids: ${{ needs.verify-distributions.outputs.artifact-id }}
           path: dist/
+          digest-mismatch: error
       - uses: pypa/gh-action-pypi-publish@release/v1
