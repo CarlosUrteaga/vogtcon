@@ -8,7 +8,13 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from vogtcon import EnforcementPolicy, ExecutionContext, WorkflowController, load_contract
+from vogtcon import (
+    ActionProposal,
+    EnforcementPolicy,
+    ExecutionContext,
+    WorkflowController,
+    load_contract,
+)
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "notification_agent.py"
 SPEC = importlib.util.spec_from_file_location("notification_agent", EXAMPLE)
@@ -29,6 +35,393 @@ def context(approved: bool, agent_fp: str = "notification-agent-v1") -> Executio
 
 
 class NotificationExampleTests(unittest.TestCase):
+    def _v2_trusted_context(self, contract, *, approved=False):
+        return ExecutionContext(
+            state={"approval_granted": approved},
+            available_tools=["send_notification"],
+            observed_agent_fingerprint="notification-agent-v1",
+            observed_contract_fingerprint=contract.contract_fingerprint,
+        )
+
+    def test_v2_guarded_two_blocks_keep_same_run_and_zero_sends(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        begin_context = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        controllers = []
+        outcomes = []
+        events = []
+        finish_contexts = []
+        tool_calls = []
+        original_begin = WorkflowController.begin
+        original_execute = WorkflowController.execute
+        original_finish = WorkflowController.finish
+        original_tool = notification_agent.InMemoryNotificationTool.__call__
+
+        class ScriptedAgent:
+            def __init__(self):
+                self.decisions = []
+                self.proposals = []
+
+            def receive(self, decision):
+                events.append("receive_feedback")
+                self.decisions.append(decision)
+
+            def propose(self, message, *, sensitive):
+                if self.proposals:
+                    self_test.assertEqual(
+                        [v.rule for v in self.decisions[-1].violations],
+                        ["sensitive_requires_approval"],
+                    )
+                    events.append("second_proposal")
+                else:
+                    events.append("first_proposal")
+                proposal = ActionProposal(
+                    tool_name="send_notification",
+                    arguments={
+                        "message": message,
+                        "sensitive": sensitive,
+                        "approval_granted": True,
+                    },
+                )
+                self.proposals.append(proposal)
+                return proposal
+
+        self_test = self
+        agent = ScriptedAgent()
+
+        def begin(controller, ctx):
+            controllers.append(controller)
+            events.append("begin")
+            return original_begin(controller, ctx)
+
+        def execute(controller, proposal, ctx, send):
+            context_snapshot = ctx.model_copy(deep=True).model_dump()
+            outcome = original_execute(controller, proposal, ctx, send)
+            events.append("execute")
+            outcomes.append({
+                "outcome": outcome,
+                "state": controller.state,
+                "context": ctx,
+                "context_snapshot": context_snapshot,
+                "contract": controller.contract.model_dump(),
+                "run_id": controller.run_id,
+                "controller": controller,
+                "sink": list(tool.sent),
+            })
+            return outcome
+
+        def finish(controller, ctx, response):
+            events.append("finish")
+            finish_contexts.append(ctx)
+            return original_finish(controller, ctx, response)
+
+        def invoke(instance, proposal):
+            tool_calls.append(proposal)
+            events.append("tool")
+            return original_tool(instance, proposal)
+
+        def on_blocked(decision):
+            events.append("feedback")
+            agent.receive(decision)
+            return agent.propose("secret", sensitive=True)
+
+        def context_provider():
+            events.append("host_context")
+            return self._v2_trusted_context(contract)
+
+        with patch.object(WorkflowController, "begin", autospec=True, side_effect=begin), \
+             patch.object(WorkflowController, "execute", autospec=True, side_effect=execute), \
+             patch.object(WorkflowController, "finish", autospec=True, side_effect=finish), \
+             patch.object(notification_agent, "NotificationAgent", return_value=agent), \
+             patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=invoke):
+            result = notification_agent.run_notification(
+                run_id="v2-two-blocks", context=begin_context, message="secret", sensitive=True,
+                tool=tool, contract=contract, policy=EnforcementPolicy(mode="guarded"),
+                on_blocked=on_blocked, context_provider=context_provider,
+            )
+
+        self.assertEqual(len(controllers), 1)
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual([x["outcome"].decision.decision for x in outcomes], ["block", "block"])
+        self.assertEqual([x["outcome"].executed for x in outcomes], [False, False])
+        self.assertEqual([x["state"] for x in outcomes], ["active", "active"])
+        self.assertEqual([x["sink"] for x in outcomes], [[], []])
+        self.assertIsNot(outcomes[0]["context"], outcomes[1]["context"])
+        self.assertEqual([x["context_snapshot"]["state"] for x in outcomes], [
+            {"approval_granted": False}, {"approval_granted": False},
+        ])
+        self.assertEqual(begin_context.state, {"approval_granted": False})
+        self.assertEqual([x["contract"] for x in outcomes], [contract.model_dump()] * 2)
+        self.assertTrue(all(x["controller"] is controllers[0] for x in outcomes))
+        self.assertEqual([x["run_id"] for x in outcomes], ["v2-two-blocks"] * 2)
+        self.assertIs(finish_contexts[0], outcomes[-1]["context"])
+        self.assertEqual(
+            [v.rule for v in outcomes[0]["outcome"].decision.violations],
+            ["sensitive_requires_approval"],
+        )
+        self.assertEqual(agent.decisions, [outcomes[0]["outcome"].decision])
+        self.assertEqual(len(agent.proposals), 2)
+        self.assertTrue(all(p.arguments["approval_granted"] for p in agent.proposals))
+        self.assertEqual(events, [
+            "begin", "first_proposal", "host_context", "execute", "feedback",
+            "receive_feedback", "second_proposal", "host_context", "execute", "finish",
+        ])
+        self.assertEqual(len(tool_calls), 0)
+        self.assertEqual(tool.sent, [])
+        self.assertEqual(result.runtime, outcomes[-1]["outcome"])
+
+    def test_v2_guarded_host_approval_allows_only_second_attempt(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        begin_context = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        controllers = []
+        outcomes = []
+        events = []
+        finish_contexts = []
+        tool_calls = []
+        original_begin = WorkflowController.begin
+        original_execute = WorkflowController.execute
+        original_finish = WorkflowController.finish
+        original_tool = notification_agent.InMemoryNotificationTool.__call__
+        host_state = {"approval_granted": False}
+
+        class ScriptedAgent:
+            def __init__(self):
+                self.decisions = []
+                self.proposals = []
+
+            def receive(self, decision):
+                events.append("receive_feedback")
+                self.decisions.append(decision)
+
+            def propose(self, message, *, sensitive):
+                if self.proposals:
+                    self_test.assertEqual(
+                        [v.rule for v in self.decisions[-1].violations],
+                        ["sensitive_requires_approval"],
+                    )
+                    events.append("second_proposal")
+                else:
+                    events.append("first_proposal")
+                proposal = ActionProposal(
+                    tool_name="send_notification",
+                    arguments={
+                        "message": message,
+                        "sensitive": sensitive,
+                        "approval_granted": True,
+                    },
+                )
+                self.proposals.append(proposal)
+                return proposal
+
+        self_test = self
+        agent = ScriptedAgent()
+
+        def begin(controller, ctx):
+            controllers.append(controller)
+            events.append("begin")
+            return original_begin(controller, ctx)
+
+        def execute(controller, proposal, ctx, send):
+            context_snapshot = ctx.model_copy(deep=True).model_dump()
+            outcome = original_execute(controller, proposal, ctx, send)
+            outcomes.append({
+                "outcome": outcome, "state": controller.state, "context": ctx,
+                "context_snapshot": context_snapshot,
+                "contract": controller.contract.model_dump(), "run_id": controller.run_id,
+                "controller": controller, "sink": list(tool.sent),
+            })
+            events.append("execute")
+            return outcome
+
+        def invoke(instance, proposal):
+            tool_calls.append(proposal)
+            events.append("tool")
+            return original_tool(instance, proposal)
+
+        def context_provider():
+            events.append("host_context")
+            return self._v2_trusted_context(contract, approved=host_state["approval_granted"])
+
+        def on_blocked(decision):
+            events.append("feedback")
+            agent.receive(decision)
+            host_state["approval_granted"] = True
+            return agent.propose("secret", sensitive=True)
+
+        def finish(controller, ctx, response):
+            events.append("finish")
+            finish_contexts.append(ctx)
+            return original_finish(controller, ctx, response)
+
+        with patch.object(WorkflowController, "begin", autospec=True, side_effect=begin), \
+             patch.object(WorkflowController, "execute", autospec=True, side_effect=execute), \
+             patch.object(WorkflowController, "finish", autospec=True, side_effect=finish), \
+             patch.object(notification_agent, "NotificationAgent", return_value=agent), \
+             patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=invoke):
+            result = notification_agent.run_notification(
+                run_id="v2-host-approval", context=begin_context, message="secret", sensitive=True,
+                tool=tool, contract=contract, policy=EnforcementPolicy(mode="guarded"),
+                on_blocked=on_blocked, context_provider=context_provider,
+            )
+
+        self.assertEqual(len(controllers), 1)
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual([x["outcome"].decision.decision for x in outcomes], ["block", "allow"])
+        self.assertEqual([x["outcome"].executed for x in outcomes], [False, True])
+        self.assertEqual([x["state"] for x in outcomes], ["active", "active"])
+        self.assertEqual([x["sink"] for x in outcomes], [[], ["secret"]])
+        self.assertIsNot(outcomes[0]["context"], outcomes[1]["context"])
+        self.assertEqual([x["context_snapshot"]["state"] for x in outcomes], [
+            {"approval_granted": False}, {"approval_granted": True},
+        ])
+        self.assertEqual(host_state, {"approval_granted": True})
+        self.assertEqual(begin_context.state, {"approval_granted": False})
+        self.assertEqual([x["contract"] for x in outcomes], [contract.model_dump()] * 2)
+        self.assertTrue(all(x["controller"] is controllers[0] for x in outcomes))
+        self.assertEqual([x["run_id"] for x in outcomes], ["v2-host-approval"] * 2)
+        self.assertIs(finish_contexts[0], outcomes[-1]["context"])
+        self.assertEqual(
+            [v.rule for v in outcomes[0]["outcome"].decision.violations],
+            ["sensitive_requires_approval"],
+        )
+        self.assertEqual(agent.decisions, [outcomes[0]["outcome"].decision])
+        self.assertEqual(len(agent.proposals), 2)
+        self.assertTrue(all(p.arguments["approval_granted"] for p in agent.proposals))
+        self.assertEqual(events, [
+            "begin", "first_proposal", "host_context", "execute", "feedback",
+            "receive_feedback", "second_proposal", "host_context", "tool", "execute",
+            "finish",
+        ])
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool.sent, ["secret"])
+        self.assertEqual(result.runtime, outcomes[-1]["outcome"])
+
+    def test_v2_guarded_callback_none_keeps_one_blocked_attempt(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        trusted = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        original_execute = WorkflowController.execute
+        outcomes = []
+
+        def execute(controller, *args):
+            outcome = original_execute(controller, *args)
+            outcomes.append((outcome, controller.state, list(tool.sent)))
+            return outcome
+
+        callback = unittest.mock.Mock(return_value=None)
+        with patch.object(WorkflowController, "execute", autospec=True, side_effect=execute):
+            result = notification_agent.run_notification(
+                run_id="v2-no-retry", context=trusted, message="secret", sensitive=True,
+                tool=tool, contract=contract, policy=EnforcementPolicy(mode="guarded"),
+                on_blocked=callback,
+            )
+        callback.assert_called_once()
+        self.assertEqual([(o.decision.decision, o.executed, state, sent) for o, state, sent in outcomes], [("block", False, "active", [])])
+        self.assertEqual(result.runtime, outcomes[0][0])
+        self.assertEqual(tool.sent, [])
+
+    def test_v2_guarded_callback_only_runs_after_block(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        callback = unittest.mock.Mock(return_value=None)
+        for mode, sensitive, approved, expected_state in (
+            ("guarded", False, False, "finished"),
+            ("strict", True, False, "aborted"),
+        ):
+            with self.subTest(mode=mode):
+                trusted = self._v2_trusted_context(contract, approved=approved)
+                tool = notification_agent.InMemoryNotificationTool()
+                callback.reset_mock()
+                result = notification_agent.run_notification(
+                    run_id=f"v2-no-callback-{mode}", context=trusted, message="secret",
+                    sensitive=sensitive, tool=tool, contract=contract,
+                    policy=EnforcementPolicy(mode=mode), on_blocked=callback,
+                )
+                callback.assert_not_called()
+                self.assertEqual(result.state, expected_state)
+                self.assertEqual(tool.sent, ["secret"] if not sensitive else [])
+
+    def test_v2_guarded_second_attempt_tool_error_propagates_after_effect(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        trusted = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        original_tool = notification_agent.InMemoryNotificationTool.__call__
+        failure = RuntimeError("second send response lost")
+        attempts = []
+        execute_count = 0
+        original_execute = WorkflowController.execute
+
+        def execute(controller, *args):
+            nonlocal execute_count
+            execute_count += 1
+            return original_execute(controller, *args)
+
+        def fail_after_send(instance, proposal):
+            original_tool(instance, proposal)
+            attempts.append(proposal.arguments["message"])
+            raise failure
+
+        def approve(decision):
+            trusted.state["approval_granted"] = True
+            return ActionProposal(
+                tool_name="send_notification", arguments={"message": "secret", "sensitive": True},
+            )
+
+        callback = unittest.mock.Mock(side_effect=approve)
+        with patch.object(WorkflowController, "execute", autospec=True, side_effect=execute), \
+             patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=fail_after_send):
+            with self.assertRaises(RuntimeError) as caught:
+                notification_agent.run_notification(
+                    run_id="v2-second-error", context=trusted, message="secret", sensitive=True,
+                    tool=tool, contract=contract, policy=EnforcementPolicy(mode="guarded"),
+                    on_blocked=callback, context_provider=lambda: trusted,
+                )
+        self.assertIs(caught.exception, failure)
+        callback.assert_called_once()
+        self.assertEqual(execute_count, 2)
+        self.assertEqual(attempts, ["secret"])
+        self.assertEqual(tool.sent, ["secret"])
+
+    def test_v2_guarded_callback_and_second_context_provider_errors_propagate(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        for failure_point in ("callback", "context_provider"):
+            with self.subTest(failure_point=failure_point):
+                trusted = self._v2_trusted_context(contract)
+                tool = notification_agent.InMemoryNotificationTool()
+                failure = RuntimeError(f"{failure_point} failed")
+                execute_count = 0
+                original_execute = WorkflowController.execute
+
+                def execute(controller, *args):
+                    nonlocal execute_count
+                    execute_count += 1
+                    return original_execute(controller, *args)
+
+                def callback(decision):
+                    if failure_point == "callback":
+                        raise failure
+                    return ActionProposal(tool_name="send_notification", arguments={"message": "secret", "sensitive": True})
+
+                provider_calls = 0
+                def context_provider():
+                    nonlocal provider_calls
+                    provider_calls += 1
+                    if failure_point == "context_provider" and provider_calls == 2:
+                        raise failure
+                    return trusted
+
+                with patch.object(WorkflowController, "execute", autospec=True, side_effect=execute):
+                    with self.assertRaises(RuntimeError) as caught:
+                        notification_agent.run_notification(
+                            run_id=f"v2-{failure_point}-error", context=trusted, message="secret",
+                            sensitive=True, tool=tool, contract=contract,
+                            policy=EnforcementPolicy(mode="guarded"), on_blocked=callback,
+                            context_provider=context_provider,
+                        )
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(execute_count, 1)
+                self.assertEqual(tool.sent, [])
+
     def test_begin_precedes_first_proposal(self):
         original_begin = WorkflowController.begin
         original_propose = notification_agent.NotificationAgent.propose
