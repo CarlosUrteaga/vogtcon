@@ -213,6 +213,101 @@ class NotificationExampleTests(unittest.TestCase):
         )
         self.assertEqual(Governor().evaluate(req).decision, "block")
 
+    def test_v2_dispatch_matrix_ignores_agent_approval_claim(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        original_propose = notification_agent.NotificationAgent.propose
+        original_execute = WorkflowController.execute
+        original_tool = notification_agent.InMemoryNotificationTool.__call__
+
+        for mode, decision, executed, state in (
+            ("no_contract", "allow", True, "active"),
+            ("advisory", "allow_with_warning", True, "active"),
+            ("guarded", "block", False, "active"),
+            ("strict", "abort", False, "aborted"),
+        ):
+            with self.subTest(mode=mode):
+                trusted = ExecutionContext(
+                    state={"approval_granted": False},
+                    available_tools=["send_notification"],
+                    observed_agent_fingerprint="notification-agent-v1",
+                    observed_contract_fingerprint=contract.contract_fingerprint,
+                )
+                tool = notification_agent.InMemoryNotificationTool()
+                calls = {"propose": 0, "execute": 0, "tool": 0}
+                after_attempt = []
+
+                def propose(agent, message, *, sensitive):
+                    calls["propose"] += 1
+                    proposal = original_propose(agent, message, sensitive=sensitive)
+                    proposal.arguments["approval_granted"] = True
+                    return proposal
+
+                def execute(controller, proposal, ctx, send):
+                    calls["execute"] += 1
+                    self.assertEqual(controller.run_id, f"dispatch-{mode}")
+                    self.assertIs(ctx, trusted)
+                    self.assertIs(send, tool)
+                    self.assertEqual(proposal.tool_name, "send_notification")
+                    self.assertEqual(proposal.arguments, {
+                        "message": "secret", "sensitive": True, "approval_granted": True,
+                    })
+                    outcome = original_execute(controller, proposal, ctx, send)
+                    # Snapshot before returning to run_notification, which may finish.
+                    after_attempt.append((outcome, controller.state, calls["tool"], list(tool.sent)))
+                    return outcome
+
+                def invoke(instance, proposal):
+                    calls["tool"] += 1
+                    return original_tool(instance, proposal)
+
+                with patch.object(notification_agent.NotificationAgent, "propose", autospec=True, side_effect=propose), \
+                     patch.object(WorkflowController, "execute", autospec=True, side_effect=execute), \
+                     patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=invoke):
+                    result = notification_agent.run_notification(
+                        run_id=f"dispatch-{mode}", context=trusted, message="secret",
+                        sensitive=True, tool=tool, contract=contract,
+                        policy=EnforcementPolicy(mode=mode),
+                    )
+
+                self.assertEqual(result.pre.violations, [])
+                self.assertEqual(result.runtime.decision.decision, decision)
+                self.assertEqual(result.runtime.executed, executed)
+                self.assertEqual(result.runtime.result, "sent" if executed else None)
+                expected_sent = ["secret"] if executed else []
+                self.assertEqual(after_attempt, [(result.runtime, state, int(executed), expected_sent)])
+                self.assertEqual(calls, {"propose": 1, "execute": 1, "tool": int(executed)})
+                self.assertEqual(tool.sent, expected_sent)
+                self.assertEqual(trusted.state, {"approval_granted": False})
+
+    def test_v2_tool_exception_propagates_after_possible_effect(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        trusted = ExecutionContext(
+            state={"approval_granted": True},
+            available_tools=["send_notification"],
+            observed_agent_fingerprint="notification-agent-v1",
+            observed_contract_fingerprint=contract.contract_fingerprint,
+        )
+        tool = notification_agent.InMemoryNotificationTool()
+        original_tool = notification_agent.InMemoryNotificationTool.__call__
+        failure = RuntimeError("lost response after send")
+
+        def fail_after_send(instance, proposal):
+            original_tool(instance, proposal)
+            raise failure
+
+        with patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=fail_after_send) as send:
+            with self.assertRaises(RuntimeError) as caught:
+                notification_agent.run_notification(
+                    run_id="dispatch-error", context=trusted, message="secret",
+                    sensitive=True, tool=tool, contract=contract,
+                    policy=EnforcementPolicy(mode="guarded"),
+                )
+
+        self.assertIs(caught.exception, failure)
+        send.assert_called_once()
+        # A failed return cannot establish that the external effect did not occur.
+        self.assertEqual(tool.sent, ["secret"])
+
     def test_guarded_pre_fingerprint_failure_preserves_historical_continuation(self):
         tool = notification_agent.InMemoryNotificationTool()
         original_propose = notification_agent.NotificationAgent.propose
