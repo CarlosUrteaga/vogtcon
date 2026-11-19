@@ -23,7 +23,7 @@ jobs:
         run: PYDANTIC_AI_NO_BANNER=1 uv run --no-sync python -m unittest discover -s tests -p 'test*.py' -q
       - name: Build sdist and wheel
         run: uv build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
