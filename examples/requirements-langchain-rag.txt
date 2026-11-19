@@ -16,6 +16,6 @@ sentence-transformers==4.1.0
 transformers==4.49.0
 huggingface-hub==0.36.2
 tokenizers==0.21.4
-torch==2.2.2
+torch==2.13.0
 numpy==1.26.4
 opentelemetry-sdk==1.45.2
