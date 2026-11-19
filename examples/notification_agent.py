@@ -14,6 +14,9 @@ from pathlib import Path
 
 from vogtcon import (
     ActionProposal,
+    AgentContract,
+    ContractRulesV2,
+    EnforcementPolicy,
     ExecutionContext,
     GovernanceDecision,
     Governor,
@@ -60,10 +63,14 @@ def run_notification(
     message: str,
     sensitive: bool,
     tool: InMemoryNotificationTool,
+    contract: AgentContract | ContractRulesV2 | None = None,
+    policy: EnforcementPolicy | None = None,
 ) -> NotificationRun:
     """Run one proposal through all applicable synchronous checkpoints."""
-    contract = load_contract(CONTRACT_PATH).contract
-    controller = WorkflowController(Governor(), run_id, contract)
+    selected_contract = (
+        load_contract(CONTRACT_PATH).contract if contract is None else contract
+    )
+    controller = WorkflowController(Governor(), run_id, selected_contract, policy=policy)
     pre = controller.begin(context)
     if controller.state != "active":
         return NotificationRun(pre, None, None, controller.state)
