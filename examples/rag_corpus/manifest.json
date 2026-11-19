@@ -1,0 +1,44 @@
+{
+  "corpus_id": "vogtcon-rag-acceptance-v1",
+  "frozen_at": "2026-11-15",
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "embedding_revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+  "documents": [
+    {
+      "doc_id": "doc-gov-001",
+      "title": "Arquitectura de puerta sincrona en WorkflowController",
+      "file": "doc_001_gate_architecture.md",
+      "source_url": "https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/rag_corpus/doc_001_gate_architecture.md",
+      "license": "Apache-2.0",
+      "revision": "1.0.0",
+      "sha256": "d308fc901428c7a1a23cbc4cb5e2335eff54935a6fcd2471049ab528407ba1a6"
+    },
+    {
+      "doc_id": "doc-gov-002",
+      "title": "Contexto confiable aportado por el host",
+      "file": "doc_002_trusted_context.md",
+      "source_url": "https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/rag_corpus/doc_002_trusted_context.md",
+      "license": "Apache-2.0",
+      "revision": "1.0.0",
+      "sha256": "73164b090b64aa9b84317aee18afc8d28162ffb3b45cdae34468297d826dcb75"
+    },
+    {
+      "doc_id": "doc-gov-003",
+      "title": "Registro JSONL y correlacion de trazas OpenTelemetry",
+      "file": "doc_003_audit_and_traces.md",
+      "source_url": "https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/rag_corpus/doc_003_audit_and_traces.md",
+      "license": "Apache-2.0",
+      "revision": "1.0.0",
+      "sha256": "7316c433338ea709c156a0d39f47216cfcc7c41cb886aaf63c5ae194c3d62a3f"
+    },
+    {
+      "doc_id": "doc-gov-004",
+      "title": "Nota de incidente con texto no confiable (prompt injection)",
+      "file": "doc_004_untrusted_instructions.md",
+      "source_url": "https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/rag_corpus/doc_004_untrusted_instructions.md",
+      "license": "Apache-2.0",
+      "revision": "1.0.0",
+      "sha256": "bb4f464135d5d7637262685d744fe56fc7cb331ff099aa63ffbca7a7555610d0"
+    }
+  ]
+}

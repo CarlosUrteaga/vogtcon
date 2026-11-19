@@ -1,0 +1,12 @@
+{
+  "source_url": "http://omawww.sat.gob.mx/tramitesyservicios/Paginas/documentos/catCFDI_V_4_20261106.xls",
+  "retrieved_on": "2026-11-15",
+  "source_sha256": "6249e37275ce164a1c4ac44e726dcd60858dac5c5604ff6c9ab06005a9199e1a",
+  "catalog_sha256": "a68da1c118d98b2cc94977c8b2aac01732cba9c9f22d868f5fcf3fcea25a7e75",
+  "sheets": [
+    "c_UsoCFDI",
+    "c_RegimenFiscal"
+  ],
+  "extraction": "Rows 7 onward (1-based). Columns A,C,D,E,F; additionally G for c_UsoCFDI. Excel dates converted to ISO. Numeric codes converted to integer strings. Descriptions omitted. xlrd==2.0.2.",
+  "scope": "Complete code rows of these two sheets only; no full fiscal validation."
+}

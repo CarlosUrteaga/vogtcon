@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera; SPDX-License-Identifier: Apache-2.0. Synthetic fixture, not a valid stamped invoice. -->
+<cfdi:Comprobante xmlns:cfdi="http://www.sat.gob.mx/cfd/4" xmlns:tfd="http://www.sat.gob.mx/TimbreFiscalDigital" Version="4.0" Fecha="2026-11-01T12:00:00" TipoDeComprobante="I" MetodoPago="PUE" Moneda="MXN" Total="100.00">
+  <cfdi:Emisor Rfc="BBB010101BBB" RegimenFiscal="601"/>
+  <cfdi:Receptor Rfc="AAA010101AAA" RegimenFiscalReceptor="601" UsoCFDI="G03"/>
+  <cfdi:Conceptos><cfdi:Concepto Descripcion="Servicio sintetico" Importe="100.00"/></cfdi:Conceptos>
+  <cfdi:Complemento><tfd:TimbreFiscalDigital UUID="00000000-0000-4000-8000-000000000004"/></cfdi:Complemento>
+</cfdi:Comprobante>

@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 2
+contract_id: example.cfdi_reconciliation
+approved_agent_configurations:
+- cfdi-agent-v1
+declared_tools:
+- mark_reconciled
+response_schema:
+  required_fields:
+  - status
+  - ledger_rows
+  - findings
+memory_policy: none
+validation_phases:
+- pre_execution
+- runtime
+- post_execution
+runtime_rules:
+- tool.declared_only
+- cfdi.exact_match_required
+postconditions:
+- response.schema_complete
+contract_fingerprint: sha256:ea515b6ccaccaa5f534d2c8a6d9560b29ea620613a45b197d81d424d2f73e58f

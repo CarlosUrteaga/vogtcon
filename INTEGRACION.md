@@ -159,6 +159,172 @@ with telemetry.run(controller.run_id, controller.contract.contract_id):
 
 La telemetría observa las comprobaciones y correlaciona los registros; la decisión que permite o bloquea una herramienta se toma sincrónicamente. Para ver spans en consola y un agente Pydantic AI instrumentado, ejecuta [el ejemplo del README](README.md#probar-la-integración).
 
+## Integración con LangChain (create_agent)
+
+El patrón probado en [langchain_rag_agent.py](examples/langchain_rag_agent.py), [langchain_rag_contract.yaml](examples/langchain_rag_contract.yaml) y el corpus de referencia [examples/rag_corpus/](examples/rag_corpus/) muestra cómo gobernar agentes basados en LangChain (`create_agent`) sin requerir adaptadores propietarios:
+
+- **Herramientas de solo lectura fuera de la puerta**: `retrieve_context` consulta el almacén vectorial sin modificar el mundo exterior y anota los identificadores observados (`retrieved_doc_ids`) directamente en la copia del host de `ExecutionContext.state`. El modelo nunca tiene acceso de escritura a este estado.
+- **Herramientas con efectos a través de la puerta**: `publish_brief` canaliza toda escritura con efectos externos a través de `WorkflowController.execute(ActionProposal(...), context, tool)`. Si el Governor bloquea o aborta la acción, la función subyacente nunca se ejecuta.
+- **Reglas basadas en estado confiable**: Las reglas personalizadas `brief.citations_retrieved` y `brief.approval_required` registradas en `RuleCatalog` validan exclusivamente contra `ExecutionContext.state` (hechos verificados por el host), nunca contra argumentos o afirmaciones generadas por el modelo.
+
+### Patrón mínimo de conexión
+
+```python
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
+from vogtcon import (
+    ActionProposal,
+    EnforcementPolicy,
+    ExecutionContext,
+    RuleCatalog,
+    WorkflowController,
+)
+
+# 1. Reglas personalizadas registradas en el catálogo
+rules = RuleCatalog(
+    runtime_rules={
+        "brief.citations_retrieved": brief_citations_retrieved,
+        "brief.approval_required": brief_approval_required,
+    }
+)
+
+# 2. Inicialización del controlador por corrida
+controller = WorkflowController.from_contract_path(
+    "examples/langchain_rag_contract.yaml",
+    run_id="rag-run-001",
+    policy=EnforcementPolicy(mode="guarded"),
+    rule_catalog=rules,
+)
+
+# 3. Estado confiable mantenido por la aplicación host
+context = ExecutionContext(
+    state={"approval_granted": True, "retrieved_doc_ids": []},
+    available_tools=["publish_brief"],
+    observed_agent_fingerprint="langchain-rag-brief-agent-v1",
+    observed_contract_fingerprint=controller.contract.contract_fingerprint,
+)
+controller.begin(context)
+
+# 4. Herramienta de lectura: registra IDs en el host fuera de la puerta
+@tool
+def retrieve_context(query: str) -> str:
+    docs = vector_store.similarity_search(query, k=3)
+    for doc in docs:
+        cid = doc.metadata.get("doc_id")
+        if cid and cid not in context.state["retrieved_doc_ids"]:
+            context.state["retrieved_doc_ids"].append(cid)
+    return "\n\n".join(f"[{d.metadata['doc_id']}] {d.page_content}" for d in docs)
+
+# 5. Herramienta con efectos: interceptada síncronamente por el Governor
+@tool
+def publish_brief(title: str, claims: list[str], citation_ids: list[str]) -> str:
+    proposal = ActionProposal(
+        tool_name="publish_brief",
+        arguments={"title": title, "claims": claims, "citation_ids": citation_ids},
+    )
+    outcome = controller.execute(proposal, context, host_publish_sink)
+    if not outcome.executed:
+        return f"blocked by Governor: {', '.join(v.rule for v in outcome.decision.violations)}"
+    return f"published at {outcome.result[0]}"
+
+# 6. Ejecutar agente LangChain y verificar postcondición
+agent = create_agent(model, [retrieve_context, publish_brief])
+agent.invoke({"messages": [HumanMessage(content="Genera un brief técnico.")]})
+if controller.state == "active":
+    controller.finish(context, {"status": "published", "published": True, ...})
+```
+
+### Entorno probado y ejecución offline
+
+Las dependencias exactas probadas (registradas en [requirements-langchain-rag.txt](examples/requirements-langchain-rag.txt)) son:
+
+- `vogtcon==0.1.0`
+- `langchain==1.5.0`
+- `langchain-core==1.8.1`
+- `langchain-huggingface==1.2.3`
+- `langgraph==1.2.22`
+- `sentence-transformers==4.1.0`
+- `transformers==4.49.0`
+- `huggingface-hub==0.36.2`
+- `tokenizers==0.21.4`
+- `torch==2.2.2`
+- `numpy==1.26.4`
+- `opentelemetry-sdk==1.45.2`
+- Python: CPython 3.12.11 (macosx_x86_64)
+- Modelo de embeddings: `sentence-transformers/all-MiniLM-L6-v2` (revisión `c9745ed1d9f207416be6d2e6f8de32d1f16199bf`)
+
+Para ejecutar el ejemplo gobernado completamente offline:
+
+```sh
+HF_HUB_OFFLINE=1 .venv/bin/python examples/langchain_rag_agent.py
+```
+
+## Conciliación CFDI con Pydantic AI
+
+El [consumidor CFDI](examples/cfdi_agent.py) usa un `Agent` con
+`output_type=ReconciliationReport`, datos sintéticos y `FunctionModel` sin proveedor.
+El host extrae los XML, comprueba el catálogo congelado y calcula los pares candidatos
+de factura/movimiento bancario. El agente recibe solamente esos hallazgos minimizados.
+
+La herramienta `mark_reconciled` pasa por `WorkflowController.execute` antes de
+escribir. La regla propia `cfdi.exact_match_required` consulta `allowed_pairs` y
+`ledger_pairs` en el estado del host. Tras una escritura, el host actualiza los pares
+consumidos para impedir otra conciliación de la misma factura o movimiento. El YAML
+y la regla están en el consumidor; la biblioteca no contiene reglas del SAT.
+
+Instala primero `vogtcon` desde PyPI (`pip install vogtcon==0.1.0`), su wheel local o checkout y luego las dependencias
+del consumidor. Desde la raíz del proyecto:
+
+```sh
+uv pip install --python .venv/bin/python -r examples/requirements-cfdi.txt
+PYDANTIC_AI_NO_BANNER=1 .venv/bin/python examples/cfdi_agent.py --output-dir /tmp/cfdi-demo
+PYDANTIC_AI_NO_BANNER=1 .venv/bin/python -m unittest discover -s tests -p 'test_cfdi_agent.py' -q
+sh tests/smoke_cfdi_consumer.sh        # verificación con wheel local
+sh tests/smoke_pypi_consumer.sh        # verificación con vogtcon==0.1.0 desde PyPI
+```
+
+La demostración crea una subcarpeta nueva por ejecución y muestra JSONL de decisiones,
+`action_index`, `trace_id` y resultados comprobados leyendo el libro local. Bajo
+`guarded`, A escribe una fila; B–E intentan escribir y quedan bloqueados; F y la
+variante de versión incorrecta se rechazan antes del agente. `--mode advisory`,
+`--mode strict` y `--mode no_contract` permiten comparar políticas con los mismos datos.
+Las filas permitidas sin respaldo en el host llevan `authorized_by_host: false`.
+
+Para procesar un lote propio, pasa los tres archivos/directorios de entrada juntos:
+
+```sh
+PYDANTIC_AI_NO_BANNER=1 .venv/bin/python examples/cfdi_agent.py \
+  --xml-dir /ruta/al/lote/xml \
+  --profile /ruta/al/lote/profile.json \
+  --bank /ruta/al/lote/bank.csv \
+  --output-dir /tmp/cfdi-lote
+```
+
+El perfil tiene `receiver_rfc`, `person_type` (`fisica` o `moral`) y `fiscal_regime`.
+El CSV lleva las columnas `transaction_id,date,amount_mxn,description`, en ese orden;
+fecha `YYYY-MM-DD` e importes de egresos negativos, sin separadores de miles. La carpeta
+se lee sin recursión. Se valida todo el lote antes de iniciar el agente: un XML inválido
+o un identificador duplicado rechaza el lote sin escrituras. Todos los XML válidos
+comparten controlador y libro; si dos facturas compiten por el mismo movimiento,
+ambas pasan a revisión por ambigüedad. En este modo se proponen solo los candidatos
+del host, sin forzar intentos adversarios como en la demostración A–F. Sigue siendo
+un modelo programado local; no envía datos a un LLM. Usa primero datos sintéticos y
+consulta el alcance del parser en la documentación de fixtures.
+
+Para conectar otro modelo, llama `run_reconciliation(..., model=tu_modelo)` con las
+rutas de entrada, `run_id`, ruta del libro, política, recorder y telemetry. La salida
+tipada también se contrasta con los hechos del host: un esquema válido no demuestra
+que la conciliación sea verdadera. En esta iteración se exige conservar esos
+hallazgos exactamente; no se evalúa generación libre de explicaciones. El ejemplo
+no instrumenta llamadas al modelo; sus spans son de gobernanza y herramienta.
+
+El libro es una demostración para un proceso secuencial. Para múltiples workers
+se necesita almacenamiento transaccional con unicidad y bloqueo. Las escrituras
+ya realizadas no se revierten si falla la salida final del agente, tampoco en `strict`.
+No se demuestra aquí un buffer de commit/descarte tras postcheck. Consulta el
+[reporte CFDI](examples/REPORTE_CFDI_SAT.md) y la [procedencia de fixtures](examples/cfdi_fixtures/README.md).
+
 ## Alcance actual
 
 La biblioteca incluye una puerta determinista, contratos v1 y v2, reglas propias, registro local y observación OpenTelemetry. No incluye todavía un CLI de producto, un adaptador automático para cualquier framework de agentes ni un Governor basado en LLM. La integración requiere conectar explícitamente cada herramienta con efectos a la puerta. Los contratos v1 históricos conservan `mode` dentro del YAML; con v2 el modo se pasa mediante `EnforcementPolicy` por corrida.

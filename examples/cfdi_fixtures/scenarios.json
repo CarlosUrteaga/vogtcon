@@ -1,0 +1,37 @@
+{
+  "A": {
+    "xml": "A.xml",
+    "bank": "A.csv",
+    "expected_status": "matched"
+  },
+  "B": {
+    "xml": "B.xml",
+    "bank": "B.csv",
+    "expected_status": "mismatch"
+  },
+  "C": {
+    "xml": "C.xml",
+    "bank": "C.csv",
+    "expected_status": "mismatch"
+  },
+  "D": {
+    "xml": "D.xml",
+    "bank": "D.csv",
+    "expected_status": "ambiguous"
+  },
+  "E": {
+    "xml": "E.xml",
+    "bank": "E.csv",
+    "expected_status": "needs_review"
+  },
+  "F": {
+    "xml": "F.xml",
+    "bank": "A.csv",
+    "expected_status": "input_error"
+  },
+  "F_VERSION": {
+    "xml": "F_VERSION.xml",
+    "bank": "A.csv",
+    "expected_status": "input_error"
+  }
+}

@@ -10,15 +10,30 @@ El repositorio público, la distribución en PyPI y el import de Python se llama
 Para empezar con una prueba local, sigue la sección [Probar la integración](#probar-la-integración).
 Para incorporarlo a un agente propio, sigue la [guía de integración](INTEGRACION.md).
 
-## Usar como librería
+## Instalación y uso como librería
 
-Instala el paquete con `uv pip install .` desde este proyecto, o construye el
-wheel con `uv build` e instala ese archivo `.whl` con `pip`. Pydantic AI es opcional;
-se necesita el extra `pydantic-ai` solo para `examples/custom_agent.py`.
+Requiere **Python ≥ 3.11**.
 
-El siguiente ejemplo usa [un contrato YAML v2](examples/notification_contract_v2.yaml)
-y una herramienta propia. El contexto proviene de la aplicación anfitriona, no
-de los argumentos que proponga el agente:
+Para desarrollo local y ejecución de los ejemplos incluidos:
+
+```bash
+# Con uv (recomendado para desarrollo en este repo):
+uv sync --extra pydantic-ai --group test
+
+# O mediante pip en modo editable:
+python -m pip install -e ".[pydantic-ai]"
+```
+
+Si el paquete se consume como distribución publicada en PyPI:
+
+```bash
+python -m pip install vogtcon
+# Extra opcional si se conecta con Pydantic AI:
+python -m pip install "vogtcon[pydantic-ai]"
+```
+
+> [!IMPORTANT]
+> El ejemplo siguiente asume que se ejecuta desde la raíz del repositorio clonado para tener acceso a [`examples/notification_contract_v2.yaml`](examples/notification_contract_v2.yaml). Si integras `vogtcon` en un proyecto independiente, reemplaza esa ruta por la de tu propio contrato YAML.
 
 ```python
 from vogtcon import (
@@ -59,34 +74,59 @@ if controller.state == "active":
 assert sent == []  # guarded bloqueó la acción sensible sin aprobación
 ```
 
-En v2, el YAML contiene las reglas y su fingerprint, mientras que
-`EnforcementPolicy` fija el modo para cada ejecución. El mismo contrato puede
-usarse con `no_contract`, `advisory`, `guarded` o `strict` sin cambiar su
-identidad. Hay que pasar la política explícitamente; la ausencia de política
-en v2 es un error de configuración. Los contratos históricos v1, como
-[notification_contract.yaml](examples/notification_contract.yaml), mantienen
-su `mode` dentro del YAML y siguen aceptando la misma API sin `policy=`.
-En `no_contract`, el registro conserva ese modo y no evalúa reglas: una lista
-vacía de infracciones en ese modo no significa que las reglas pasaron.
+### Ciclo de vida y flujo de ejecución
 
-`load_contract` devuelve un `ContractDocument`: `.contract` es la vista tipada y
-`.original` conserva el documento parseado. `Governor` evalúa reglas sin ejecutar
-herramientas; `RuleCatalog` añade reglas propias. La fábrica
-`WorkflowController.from_contract_path` usa el mismo catálogo al cargar y
-evaluar el contrato, y crea un controlador determinista por corrida. La
-construcción directa de `WorkflowController` sigue disponible para inyectar un
-`Governor` con evaluador propio. `WorkflowController` gestiona pre, runtime y
-post; `GovernedToolExecutor` ofrece solo el check y la invocación runtime si la
-aplicación ya gestiona el ciclo. `RunRecorder` es el protocolo para persistir
-eventos; `JsonlDecisionLog` es su implementación local. `TelemetryObserver`
-recibe un proveedor OpenTelemetry configurado por la aplicación y relaciona
-spans con los registros mediante `trace_id` y `span_id`.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as Host App
+    participant Gov as WorkflowController
+    participant Tool as Herramienta con efectos
 
-`pre` y `post` contienen violaciones, pero no una decisión de herramienta.
-Consulta `controller.state` antes de seguir: en modo `strict`, una violación
-pre/runtime aborta; en `guarded`, un bloqueo runtime permite proponer otra
-acción. La llamada a la herramienta ocurre únicamente si la decisión runtime
-es `allow` o `allow_with_warning`.
+    Host->>Gov: begin(context)
+    opt controller.state == "active"
+        Host->>Gov: execute(proposal, context, tool)
+        alt allow / allow_with_warning
+            Gov->>Tool: Invocación de la herramienta
+            Tool-->>Gov: Resultado de la herramienta
+            Gov-->>Host: outcome (executed=True)
+        else block (guarded)
+            Gov-->>Host: outcome (executed=False; reintento permitido)
+        else abort (strict / infracción)
+            Gov-->>Host: outcome (corrida abortada)
+        end
+        opt controller.state == "active"
+            Host->>Gov: finish(context, response)
+        end
+    end
+```
+
+### Modos de ejecución (`EnforcementPolicy`)
+
+En v2, el YAML contiene las reglas y su fingerprint, mientras que `EnforcementPolicy` fija el modo para cada corrida (la ausencia de política en v2 es un error de configuración). Los contratos históricos v1, como [`examples/notification_contract.yaml`](examples/notification_contract.yaml), mantienen su modo dentro del YAML y siguen aceptando la misma API sin `policy=`.
+
+| Modo | Regla infringida en runtime | Qué hace la aplicación / controlador |
+| :--- | :--- | :--- |
+| `no_contract` | No se evalúan reglas | Control experimental. El registro depende de que se configure un recorder; cero violaciones no implica cumplimiento. |
+| `advisory` | `allow_with_warning`; se invoca la herramienta | Advierte en el registro o salida y continúa la ejecución. |
+| `guarded` | `block`; no se invoca la herramienta | La corrida permanece en estado `active`; permite devolver el bloqueo al agente como feedback para recibir otra propuesta. |
+| `strict` | `abort`; no se invoca la herramienta | Termina la corrida; el estado pasa a `aborted` y no se llama a `finish`. |
+
+> [!NOTE]
+> Consulta siempre `controller.state` tras `begin` y cada `execute`. La llamada a `finish` solo es válida si la corrida continúa `active`. Si `finish` detecta una infracción en modo `strict`, el estado pasa a `failed_post`: se reporta el fallo, pero no se revierten efectos externos ya realizados.
+
+### Componentes clave
+
+| Componente | Responsabilidad |
+| :--- | :--- |
+| **Contrato YAML v2** | Declara identidad, herramientas declaradas, reglas runtime y condiciones de salida sin acoplar el modo. |
+| **`EnforcementPolicy`** | Fija la política (`no_contract`, `advisory`, `guarded`, `strict`) por corrida. Obligatoria en contratos v2. |
+| **`ExecutionContext`** | Hechos aportados exclusivamente por la aplicación host (roles, aprobaciones, fingerprints observados). |
+| **`WorkflowController`** | Orquesta el ciclo (`begin`, `execute`, `finish`) y gestiona el estado determinista de la ejecución. |
+| **`JsonlDecisionLog`** | Persistencia local síncrona de decisiones antes de ejecutar una herramienta (fail-safe). |
+| **`TelemetryObserver`** | Observabilidad OpenTelemetry opcional; correlaciona spans mediante `trace_id`. No autoriza. |
+
+Para extender contratos con reglas personalizadas (`RuleCatalog`), construir evaluadores propios o usar `GovernedToolExecutor` cuando la aplicación ya gestiona el ciclo, consulta la [guía de integración](INTEGRACION.md).
 
 ## Probar la integración
 
@@ -117,6 +157,11 @@ La salida del modelo se conserva como `untrusted_agent_output` para inspección.
 El registro es opcional: pasa `JsonlDecisionLog(path)` al controlador. La decisión se sincroniza en disco antes de invocar una herramienta; si falla esa escritura, la herramienta no se llama. Una excepción posterior a la invocación se registra como resultado incierto. Este JSONL local está pensado para una ejecución secuencial en un proceso; no promete transacciones distribuidas ni escritura concurrente.
 
 La telemetría también es opcional. Pasa `TelemetryObserver` al controlador y mantén `with telemetry.run(run_id, contract_id)` alrededor de las tres fases. La aplicación configura el SDK/exporter de OpenTelemetry. El ejemplo activa la instrumentación nativa de Pydantic AI sin capturar prompts, argumentos ni respuestas completos; los eventos JSONL y spans comparten `trace_id`. Una caída del exporter no cambia permisos. Las trazas observan el trabajo, pero la autorización se comprueba sincrónicamente antes del efecto.
+
+### Otros ejemplos en el repositorio
+
+- **LangChain RAG ([examples/langchain_rag_agent.py](examples/langchain_rag_agent.py)):** Demuestra que el núcleo de `vogtcon` es agnóstico del framework. Gobierna un agente `create_agent` de LangChain con embeddings offline de HuggingFace y un vector store en memoria bajo checkpoints pre, runtime y post. Requiere instalar [`examples/requirements-langchain-rag.txt`](examples/requirements-langchain-rag.txt).
+- **Consumo offline de CFDI ([examples/cfdi_agent.py](examples/cfdi_agent.py)):** Demostración de negocio con un ledger local gobernado para conciliar transacciones sintéticas y facturas de forma determinista y offline. **No es un validador fiscal ni consulta al SAT**; procesa hechos locales bajo políticas de la aplicación. Requiere instalar [`examples/requirements-cfdi.txt`](examples/requirements-cfdi.txt).
 
 ## Estado y límites
 

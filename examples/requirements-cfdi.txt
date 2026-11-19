@@ -1,0 +1,7 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+# Install the vogtcon wheel separately until the package is published on PyPI.
+pydantic-ai-slim==2.68.0
+pydantic==2.14.3
+defusedxml==0.7.1
+opentelemetry-sdk==1.45.2

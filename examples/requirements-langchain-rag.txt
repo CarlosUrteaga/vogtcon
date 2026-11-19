@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tested environment for examples/langchain_rag_agent.py
+# Git commit: 4696a33cc5acdca8dd7fed0494ce43d45d04460e
+# Python: CPython 3.12.11 (macosx_x86_64; torch 2.2.2 requires Python <=3.12 and numpy<2 on macOS x86_64)
+# Embedding model: sentence-transformers/all-MiniLM-L6-v2
+# Embedding revision: c9745ed1d9f207416be6d2e6f8de32d1f16199bf
+
+vogtcon==0.1.0
+langchain==1.5.0
+langchain-core==1.8.1
+langchain-huggingface==1.2.3
+langgraph==1.2.22
+sentence-transformers==4.1.0
+transformers==4.49.0
+huggingface-hub==0.36.2
+tokenizers==0.21.4
+torch==2.2.2
+numpy==1.26.4
+opentelemetry-sdk==1.45.2
