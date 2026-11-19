@@ -83,6 +83,110 @@ assert controller.state == "finished"
 
 En esta demostración, el fingerprint observado se toma del contrato cargado para simplificar. En una integración real, la aplicación debe obtener la identidad observada de una fuente de despliegue confiable e independiente. Un fingerprint enviado por el agente no prueba su identidad. El resultado final que se presenta al usuario también debe basarse en `outcome.executed` y en los efectos confirmados, no solo en lo que el modelo afirme.
 
+## Continuación autorizada, registro y cierre
+
+Desde la raíz de este checkout, ejecuta el ejemplo siguiente con `.venv/bin/python -`. Usa el consumidor de notificaciones incluido, el contrato v2, un destino en memoria y un archivo JSONL temporal. No requiere un LLM. Cada corrida mantiene su propio controlador, contrato y `run_id`; el host actualiza la aprobación después del primer bloqueo.
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from vogtcon import (
+    EnforcementPolicy,
+    ExecutionContext,
+    JsonlDecisionLog,
+    load_contract,
+)
+from examples.notification_agent import (
+    InMemoryNotificationTool,
+    NotificationAgent,
+    run_notification,
+)
+
+contract = load_contract("examples/notification_contract_v2.yaml").contract
+
+for approve_after_block in (False, True):
+    run_id = f"notification-{approve_after_block}"
+    host = {"approval_granted": False}
+    destination = InMemoryNotificationTool()
+    attempts = []
+
+    def trusted_context():
+        return ExecutionContext(
+            state={"approval_granted": host["approval_granted"]},
+            available_tools=["send_notification"],
+            observed_agent_fingerprint="notification-agent-v1",
+            observed_contract_fingerprint=contract.contract_fingerprint,
+        )
+
+    def on_blocked(decision):
+        # block significa que execute no invocó la herramienta.
+        attempts.append({
+            "decision": decision.decision,
+            "executed": False,
+            "sent_after_attempt": list(destination.sent),
+        })
+        if approve_after_block:
+            host["approval_granted"] = True
+        return NotificationAgent().propose("Hola", sensitive=True)
+
+    with TemporaryDirectory() as directory:
+        log_path = Path(directory) / "decisions.jsonl"
+        result = run_notification(
+            run_id=run_id,
+            context=trusted_context(),
+            message="Hola",
+            sensitive=True,
+            tool=destination,
+            contract=contract,
+            policy=EnforcementPolicy(mode="guarded"),
+            on_blocked=on_blocked,
+            context_provider=trusted_context,
+            recorder=JsonlDecisionLog(log_path),
+        )
+
+        # runtime informa el último intento; el destino confirma el efecto real.
+        attempts.append({
+            "decision": result.runtime.decision.decision,
+            "executed": result.runtime.executed,
+            "sent_after_attempt": list(destination.sent),
+        })
+        expected_decisions = ["block", "allow"] if approve_after_block else ["block", "block"]
+        expected_sent = [[], ["Hola"]] if approve_after_block else [[], []]
+        assert [item["decision"] for item in attempts] == expected_decisions
+        assert [item["sent_after_attempt"] for item in attempts] == expected_sent
+        assert [item["executed"] for item in attempts] == (
+            [False, True] if approve_after_block else [False, False]
+        )
+        assert result.post is not None and result.post.violations == []
+        assert result.state == "finished"
+
+        events = JsonlDecisionLog(log_path).read()
+        assert all(event.run_id == run_id for event in events)
+        if approve_after_block:
+            assert [event.event_type for event in events] == [
+                "decision", "decision", "decision", "tool_completed", "decision",
+            ]
+            assert [event.decision for event in events] == [
+                None, "block", "allow", None, None,
+            ]
+            assert [event.action_index for event in events] == [None, 1, 2, 2, None]
+            assert events[1].violation_rules == ["sensitive_requires_approval"]
+            assert events[3].execution_status == "completed"
+        else:
+            assert [event.event_type for event in events] == [
+                "decision", "decision", "decision", "decision",
+            ]
+            assert [event.decision for event in events] == [
+                None, "block", "block", None,
+            ]
+            assert not any(event.event_type == "tool_completed" for event in events)
+
+        print(run_id, attempts, result.state, len(events))
+```
+
+La primera corrida termina en `block → block` y confirma cero envíos después de ambos intentos. La segunda recibe aprobación del host y termina en `block → allow`, con un envío registrado tras el segundo intento. En ambos casos el último evento es la decisión post y la corrida queda `finished`. El JSONL acredita decisiones y orden; `destination.sent` acredita los efectos observados por la aplicación. El `run_ledger` opcional de `run_notification` se entrega a `finish` como resumen del host cuando el contrato lo exige; ese resumen no reemplaza los eventos ni la comprobación del destino.
+
 ## Elegir el modo y gestionar el flujo
 
 | Modo | Regla infringida en runtime | Qué hace la aplicación |

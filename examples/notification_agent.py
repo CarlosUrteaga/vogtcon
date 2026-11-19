@@ -21,6 +21,7 @@ from vogtcon import (
     ExecutionContext,
     GovernanceDecision,
     Governor,
+    RunRecorder,
     ToolExecutionOutcome,
     WorkflowController,
     load_contract,
@@ -68,6 +69,8 @@ def run_notification(
     policy: EnforcementPolicy | None = None,
     on_blocked: Callable[[GovernanceDecision], ActionProposal | None] | None = None,
     context_provider: Callable[[], ExecutionContext] | None = None,
+    recorder: RunRecorder | None = None,
+    run_ledger: dict[str, object] | None = None,
 ) -> NotificationRun:
     """Run up to two proposals through synchronous checkpoints.
 
@@ -75,12 +78,16 @@ def run_notification(
     before each dispatch; the original context is retained for ``begin`` and as
     the fallback when no provider is supplied. After an actual block decision,
     ``on_blocked`` receives that decision at most once and may return one retry.
-    ``runtime`` reports the last performed attempt.
+    ``recorder`` observes run events, and ``run_ledger`` is forwarded to the
+    post-execution check when the active run reaches ``finish``. ``runtime``
+    reports the last performed attempt.
     """
     selected_contract = (
         load_contract(CONTRACT_PATH).contract if contract is None else contract
     )
-    controller = WorkflowController(Governor(), run_id, selected_contract, policy=policy)
+    controller = WorkflowController(
+        Governor(), run_id, selected_contract, recorder=recorder, policy=policy
+    )
     pre = controller.begin(context)
     if controller.state != "active":
         return NotificationRun(pre, None, None, controller.state)
@@ -106,7 +113,7 @@ def run_notification(
     if controller.state != "active":
         return NotificationRun(pre, runtime, None, controller.state)
     response = {"status": "sent" if runtime.executed else "blocked"}
-    post = controller.finish(last_context, response)
+    post = controller.finish(last_context, response, run_ledger)
     return NotificationRun(pre, runtime, post, controller.state)
 
 

@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
+import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -12,6 +15,7 @@ from vogtcon import (
     ActionProposal,
     EnforcementPolicy,
     ExecutionContext,
+    JsonlDecisionLog,
     WorkflowController,
     load_contract,
 )
@@ -43,6 +47,21 @@ class NotificationExampleTests(unittest.TestCase):
             observed_contract_fingerprint=contract.contract_fingerprint,
         )
 
+    def _v2_contract_requiring_ledger(self, contract):
+        document = contract.model_dump()
+        document["postconditions"] = [
+            *document["postconditions"], "run_ledger.required",
+        ]
+        document.pop("contract_fingerprint")
+        canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+        document["contract_fingerprint"] = "sha256:" + hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notification_contract_v2_ledger.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            return load_contract(path).contract
+
     def test_v2_guarded_two_blocks_keep_same_run_and_zero_sends(self):
         contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
         begin_context = self._v2_trusted_context(contract)
@@ -51,11 +70,15 @@ class NotificationExampleTests(unittest.TestCase):
         outcomes = []
         events = []
         finish_contexts = []
+        finish_calls = []
         tool_calls = []
         original_begin = WorkflowController.begin
         original_execute = WorkflowController.execute
         original_finish = WorkflowController.finish
         original_tool = notification_agent.InMemoryNotificationTool.__call__
+        record_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(record_dir.cleanup)
+        recorder = JsonlDecisionLog(Path(record_dir.name) / "events.jsonl")
 
         class ScriptedAgent:
             def __init__(self):
@@ -110,10 +133,11 @@ class NotificationExampleTests(unittest.TestCase):
             })
             return outcome
 
-        def finish(controller, ctx, response):
+        def finish(controller, ctx, response, run_ledger=None):
             events.append("finish")
             finish_contexts.append(ctx)
-            return original_finish(controller, ctx, response)
+            finish_calls.append((controller.state, response, run_ledger))
+            return original_finish(controller, ctx, response, run_ledger)
 
         def invoke(instance, proposal):
             tool_calls.append(proposal)
@@ -138,6 +162,7 @@ class NotificationExampleTests(unittest.TestCase):
                 run_id="v2-two-blocks", context=begin_context, message="secret", sensitive=True,
                 tool=tool, contract=contract, policy=EnforcementPolicy(mode="guarded"),
                 on_blocked=on_blocked, context_provider=context_provider,
+                recorder=recorder,
             )
 
         self.assertEqual(len(controllers), 1)
@@ -155,6 +180,8 @@ class NotificationExampleTests(unittest.TestCase):
         self.assertTrue(all(x["controller"] is controllers[0] for x in outcomes))
         self.assertEqual([x["run_id"] for x in outcomes], ["v2-two-blocks"] * 2)
         self.assertIs(finish_contexts[0], outcomes[-1]["context"])
+        self.assertEqual(len(finish_calls), 1)
+        self.assertEqual(finish_calls, [("active", {"status": "blocked"}, None)])
         self.assertEqual(
             [v.rule for v in outcomes[0]["outcome"].decision.violations],
             ["sensitive_requires_approval"],
@@ -169,6 +196,16 @@ class NotificationExampleTests(unittest.TestCase):
         self.assertEqual(len(tool_calls), 0)
         self.assertEqual(tool.sent, [])
         self.assertEqual(result.runtime, outcomes[-1]["outcome"])
+        logged = recorder.read()
+        self.assertEqual([event.event_type for event in logged], [
+            "decision", "decision", "decision", "decision",
+        ])
+        self.assertEqual([event.phase for event in logged], [
+            "pre_execution", "runtime", "runtime", "post_execution",
+        ])
+        self.assertEqual([event.decision for event in logged], [None, "block", "block", None])
+        self.assertTrue(all(event.run_id == "v2-two-blocks" for event in logged))
+        self.assertEqual([event.action_index for event in logged], [None, 1, 2, None])
 
     def test_v2_guarded_host_approval_allows_only_second_attempt(self):
         contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
@@ -178,12 +215,16 @@ class NotificationExampleTests(unittest.TestCase):
         outcomes = []
         events = []
         finish_contexts = []
+        finish_calls = []
         tool_calls = []
         original_begin = WorkflowController.begin
         original_execute = WorkflowController.execute
         original_finish = WorkflowController.finish
         original_tool = notification_agent.InMemoryNotificationTool.__call__
         host_state = {"approval_granted": False}
+        record_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(record_dir.cleanup)
+        recorder = JsonlDecisionLog(Path(record_dir.name) / "events.jsonl")
 
         class ScriptedAgent:
             def __init__(self):
@@ -249,10 +290,11 @@ class NotificationExampleTests(unittest.TestCase):
             host_state["approval_granted"] = True
             return agent.propose("secret", sensitive=True)
 
-        def finish(controller, ctx, response):
+        def finish(controller, ctx, response, run_ledger=None):
             events.append("finish")
             finish_contexts.append(ctx)
-            return original_finish(controller, ctx, response)
+            finish_calls.append((controller.state, response, run_ledger))
+            return original_finish(controller, ctx, response, run_ledger)
 
         with patch.object(WorkflowController, "begin", autospec=True, side_effect=begin), \
              patch.object(WorkflowController, "execute", autospec=True, side_effect=execute), \
@@ -262,7 +304,7 @@ class NotificationExampleTests(unittest.TestCase):
             result = notification_agent.run_notification(
                 run_id="v2-host-approval", context=begin_context, message="secret", sensitive=True,
                 tool=tool, contract=contract, policy=EnforcementPolicy(mode="guarded"),
-                on_blocked=on_blocked, context_provider=context_provider,
+                on_blocked=on_blocked, context_provider=context_provider, recorder=recorder,
             )
 
         self.assertEqual(len(controllers), 1)
@@ -281,6 +323,8 @@ class NotificationExampleTests(unittest.TestCase):
         self.assertTrue(all(x["controller"] is controllers[0] for x in outcomes))
         self.assertEqual([x["run_id"] for x in outcomes], ["v2-host-approval"] * 2)
         self.assertIs(finish_contexts[0], outcomes[-1]["context"])
+        self.assertEqual(len(finish_calls), 1)
+        self.assertEqual(finish_calls, [("active", {"status": "sent"}, None)])
         self.assertEqual(
             [v.rule for v in outcomes[0]["outcome"].decision.violations],
             ["sensitive_requires_approval"],
@@ -296,6 +340,131 @@ class NotificationExampleTests(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool.sent, ["secret"])
         self.assertEqual(result.runtime, outcomes[-1]["outcome"])
+        logged = recorder.read()
+        self.assertEqual([event.event_type for event in logged], [
+            "decision", "decision", "decision", "tool_completed", "decision",
+        ])
+        self.assertEqual([event.phase for event in logged], [
+            "pre_execution", "runtime", "runtime", "runtime", "post_execution",
+        ])
+        self.assertEqual([event.decision for event in logged], [
+            None, "block", "allow", None, None,
+        ])
+        self.assertEqual([event.action_index for event in logged], [None, 1, 2, 2, None])
+        self.assertTrue(all(event.run_id == "v2-host-approval" for event in logged))
+        self.assertTrue(all(event.contract_id == contract.contract_id for event in logged))
+        self.assertTrue(all(event.mode == "guarded" for event in logged))
+        self.assertEqual(logged[1].violation_rules, ["sensitive_requires_approval"])
+        self.assertEqual(logged[3].execution_status, "completed")
+        self.assertEqual(sum(event.event_type == "tool_completed" for event in logged), 1)
+
+    def test_v2_finish_without_ledger_closes_once_and_rejects_late_calls(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        trusted = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        controllers = []
+        finish_calls = []
+        original_begin = WorkflowController.begin
+        original_finish = WorkflowController.finish
+
+        def begin(controller, context):
+            controllers.append(controller)
+            return original_begin(controller, context)
+
+        def finish(controller, context, response, run_ledger=None):
+            finish_calls.append((response, run_ledger, controller.state))
+            return original_finish(controller, context, response, run_ledger)
+
+        with patch.object(WorkflowController, "begin", autospec=True, side_effect=begin), \
+             patch.object(WorkflowController, "finish", autospec=True, side_effect=finish):
+            result = notification_agent.run_notification(
+                run_id="v2-finish-once", context=trusted, message="notice",
+                sensitive=False, tool=tool, contract=contract,
+                policy=EnforcementPolicy(mode="guarded"),
+            )
+
+        self.assertEqual(result.state, "finished")
+        self.assertEqual(result.post.violations, [])
+        self.assertEqual(finish_calls, [({"status": "sent"}, None, "active")])
+        self.assertEqual(tool.sent, ["notice"])
+        self.assertEqual(len(controllers), 1)
+        with self.assertRaisesRegex(RuntimeError, "Run is not active"):
+            controllers[0].execute(
+                ActionProposal(tool_name="send_notification", arguments={"message": "again"}),
+                trusted,
+                tool,
+            )
+        with self.assertRaisesRegex(RuntimeError, "Run is not active"):
+            controllers[0].finish(trusted, {"status": "sent"})
+        self.assertEqual(tool.sent, ["notice"])
+
+    def test_v2_required_ledger_post_failure_keeps_effect_and_rejects_late_calls(self):
+        loaded_contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        contract = self._v2_contract_requiring_ledger(loaded_contract)
+        trusted = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        controllers = []
+        original_begin = WorkflowController.begin
+
+        def begin(controller, context):
+            controllers.append(controller)
+            return original_begin(controller, context)
+
+        with patch.object(WorkflowController, "begin", autospec=True, side_effect=begin):
+            result = notification_agent.run_notification(
+                run_id="v2-required-ledger", context=trusted, message="notice",
+                sensitive=False, tool=tool, contract=contract,
+                policy=EnforcementPolicy(mode="strict"),
+            )
+
+        self.assertEqual([violation.rule for violation in result.post.violations], [
+            "run_ledger.required",
+        ])
+        self.assertEqual(result.state, "failed_post")
+        self.assertEqual(tool.sent, ["notice"])
+        self.assertTrue(result.runtime.executed)
+        with self.assertRaisesRegex(RuntimeError, "Run is not active"):
+            controllers[0].execute(
+                ActionProposal(tool_name="send_notification", arguments={"message": "again"}),
+                trusted,
+                tool,
+            )
+        with self.assertRaisesRegex(RuntimeError, "Run is not active"):
+            controllers[0].finish(trusted, {"status": "again"})
+        self.assertEqual(tool.sent, ["notice"])
+
+    def test_v2_host_ledger_is_forwarded_at_finish_and_recorded(self):
+        loaded_contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        contract = self._v2_contract_requiring_ledger(loaded_contract)
+        trusted = self._v2_trusted_context(contract)
+        tool = notification_agent.InMemoryNotificationTool()
+        ledger = {"run_id": "v2-ledger-forwarded"}
+        record_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(record_dir.cleanup)
+        recorder = JsonlDecisionLog(Path(record_dir.name) / "events.jsonl")
+        finish_arguments = []
+        original_finish = WorkflowController.finish
+
+        def finish(controller, context, response, run_ledger=None):
+            finish_arguments.append(run_ledger)
+            return original_finish(controller, context, response, run_ledger)
+
+        with patch.object(WorkflowController, "finish", autospec=True, side_effect=finish):
+            result = notification_agent.run_notification(
+                run_id="v2-ledger-forwarded", context=trusted, message="notice",
+                sensitive=False, tool=tool, contract=contract,
+                policy=EnforcementPolicy(mode="guarded"),
+                recorder=recorder, run_ledger=ledger,
+            )
+
+        self.assertEqual(finish_arguments, [ledger])
+        self.assertEqual(result.post.violations, [])
+        self.assertEqual(result.state, "finished")
+        self.assertEqual(tool.sent, ["notice"])
+        self.assertEqual([event.phase for event in recorder.read()], [
+            "pre_execution", "runtime", "runtime", "post_execution",
+        ])
+        self.assertTrue(all(event.run_id == "v2-ledger-forwarded" for event in recorder.read()))
 
     def test_v2_guarded_callback_none_keeps_one_blocked_attempt(self):
         contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
@@ -526,10 +695,12 @@ class NotificationExampleTests(unittest.TestCase):
                 )
                 calls = {"begin": 0, "execute": 0, "finish": 0, "propose": 0, "tool": 0}
                 states = []
+                controllers = []
                 tool = notification_agent.InMemoryNotificationTool()
 
                 def begin(controller, ctx):
                     calls["begin"] += 1
+                    controllers.append(controller)
                     result = original_begin(controller, ctx)
                     states.append(controller.state)
                     return result
@@ -567,6 +738,17 @@ class NotificationExampleTests(unittest.TestCase):
                 self.assertIsNone(result.runtime)
                 self.assertIsNone(result.post)
                 self.assertEqual(calls, {"begin": 1, "execute": 0, "finish": 0, "propose": 0, "tool": 0})
+                self.assertEqual(tool.sent, [])
+                with self.assertRaisesRegex(RuntimeError, "Run is not active"):
+                    controllers[0].execute(
+                        ActionProposal(
+                            tool_name="send_notification", arguments={"message": "again"},
+                        ),
+                        trusted,
+                        tool,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "Run is not active"):
+                    controllers[0].finish(trusted, {"status": "again"})
                 self.assertEqual(tool.sent, [])
 
     def test_contract_loads_and_example_has_no_benchmark_import(self):
