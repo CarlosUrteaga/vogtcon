@@ -17,12 +17,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      validated: ${{ steps.release.outputs.validated }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Validate release identity and main ancestry
+        id: release
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          python .github/scripts/validate_release.py \
+            --event-name "$RELEASE_EVENT" --ref "$RELEASE_REF" \
+            --github-output "$GITHUB_OUTPUT"
+
   tests:
     name: Distribution test suite
     uses: ./.github/workflows/ci.yml
 
   build-and-test:
-    needs: tests
+    needs: [tests, validate-release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -141,8 +164,9 @@ jobs:
   publish-to-pypi:
     if: >-
       github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/tags/v')
-    needs: [verify-distributions]
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.validate-release.outputs.validated == 'true'
+    needs: [verify-distributions, validate-release]
     runs-on: ubuntu-latest
     environment:
       name: pypi
