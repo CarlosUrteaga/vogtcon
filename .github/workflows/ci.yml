@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: core and CFDI (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra pydantic-ai --group test
+
+      - name: Install CFDI consumer dependencies
+        run: uv pip install -r examples/requirements-cfdi.txt
+
+      - name: Run core and CFDI tests
+        env:
+          PYDANTIC_AI_NO_BANNER: "1"
+        run: |
+          uv run --no-sync python - <<'PYTHON'
+          import unittest
+          from pathlib import Path
+
+          loader = unittest.TestLoader()
+          # RAG has its own job with Python 3.12 and a prepared embedding model.
+          suite = unittest.TestSuite(
+              loader.discover("tests", pattern=path.name)
+              for path in sorted(Path("tests").glob("test*.py"))
+              if path.name != "test_langchain_rag_agent.py"
+          )
+          result = unittest.TextTestRunner(verbosity=1).run(suite)
+          raise SystemExit(not result.wasSuccessful())
+          PYTHON
+
+      - name: Test installed wheel as external consumer
+        if: matrix.python-version == '3.13'
+        run: bash tests/smoke_wheel_consumer.sh
+
+  rag:
+    name: LangChain RAG (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYDANTIC_AI_NO_BANNER: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          # The example pins torch 2.2.2 and numpy 1.26.4 (Python <= 3.12).
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install project and test dependencies
+        run: uv sync --locked --extra pydantic-ai --group test
+
+      - name: Install CPU-only PyTorch and RAG consumer dependencies
+        run: |
+          uv pip install --index-url https://download.pytorch.org/whl/cpu torch==2.2.2
+          uv pip install -r examples/requirements-langchain-rag.txt
+
+      - name: Prepare pinned embedding model for offline tests
+        run: |
+          uv run --no-sync python - <<'PYTHON'
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              "sentence-transformers/all-MiniLM-L6-v2",
+              revision="c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+              # Match the example's model_name to load this local directory.
+              local_dir="sentence-transformers/all-MiniLM-L6-v2",
+              allow_patterns=["*.json", "*.txt", "*.safetensors"],
+          )
+          PYTHON
+
+      - name: Run RAG integration tests offline
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: uv run --no-sync python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
