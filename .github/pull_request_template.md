@@ -3,6 +3,7 @@ Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
 SPDX-License-Identifier: Apache-2.0
 
 INSTRUCTIONS FOR CONTRIBUTORS AND CODING AGENTS
+- Write the PR title and description in English, including headings, tables, checklists, and validation notes.
 - Be factual and concise. This PR should make it easy to compare the original intent with the actual outcome.
 - Record the plan before implementation in an issue, comment, or versioned document. Link the original version (prefer a permalink or commit SHA). Keep later revisions separate.
 - If no plan existed before implementation, say so. Never present a retrospective plan as the original.
