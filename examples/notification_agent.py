@@ -28,12 +28,13 @@ from vogtcon import (
 )
 
 CONTRACT_PATH = Path(__file__).with_name("notification_contract.yaml")
+NOTIFICATION_TOOL_NAME = "send_notification"
 
 
 class NotificationAgent:
     def propose(self, message: str, *, sensitive: bool) -> ActionProposal:
         return ActionProposal(
-            tool_name="send_notification",
+            tool_name=NOTIFICATION_TOOL_NAME,
             arguments={"message": message, "sensitive": sensitive},
         )
 
@@ -81,6 +82,7 @@ def run_notification(
     ``recorder`` observes run events, and ``run_ledger`` is forwarded to the
     post-execution check when the active run reaches ``finish``. ``runtime``
     reports the last performed attempt.
+    A proposal for another tool raises ``ValueError`` before its checkpoint.
     """
     selected_contract = (
         load_contract(CONTRACT_PATH).contract if contract is None else contract
@@ -97,6 +99,8 @@ def run_notification(
 
     def dispatch(action: ActionProposal) -> ToolExecutionOutcome[str]:
         nonlocal last_context
+        if action.tool_name != NOTIFICATION_TOOL_NAME:
+            raise ValueError(f"Unsupported notification dispatch tool: {action.tool_name!r}")
         trusted_context = context_provider() if context_provider is not None else context
         last_context = trusted_context
         return controller.execute(action, trusted_context, tool)
@@ -121,7 +125,7 @@ if __name__ == "__main__":
     for approved in (False, True):
         runtime_context = ExecutionContext(
             state={"approval_granted": approved},
-            available_tools=["send_notification"],
+            available_tools=[NOTIFICATION_TOOL_NAME],
             observed_agent_fingerprint="notification-agent-v1",
             observed_contract_fingerprint="notification-contract-v1",
         )

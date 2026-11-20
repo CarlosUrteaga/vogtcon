@@ -62,6 +62,72 @@ class NotificationExampleTests(unittest.TestCase):
             path.write_text(json.dumps(document), encoding="utf-8")
             return load_contract(path).contract
 
+    def test_v2_initial_foreign_tool_raises_before_checkpoint_and_send(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        foreign = ActionProposal(
+            tool_name="archive_notification",
+            arguments={"message": "notice", "sensitive": False},
+        )
+        for mode in ("no_contract", "advisory", "guarded", "strict"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                tool = notification_agent.InMemoryNotificationTool()
+                recorder = JsonlDecisionLog(Path(directory) / "events.jsonl")
+                with patch.object(notification_agent.NotificationAgent, "propose", return_value=foreign), \
+                     patch.object(WorkflowController, "execute", autospec=True, side_effect=WorkflowController.execute) as execute, \
+                     patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=notification_agent.InMemoryNotificationTool.__call__) as invoke:
+                    with self.assertRaisesRegex(ValueError, "dispatch.*archive_notification"):
+                        notification_agent.run_notification(
+                            run_id=f"foreign-first-{mode}",
+                            context=self._v2_trusted_context(contract, approved=True),
+                            message="notice", sensitive=False, tool=tool,
+                            contract=contract, policy=EnforcementPolicy(mode=mode),
+                            recorder=recorder,
+                        )
+
+                execute.assert_not_called()
+                invoke.assert_not_called()
+                self.assertEqual(tool.sent, [])
+                logged = recorder.read()
+                self.assertEqual([event.event_type for event in logged], ["decision"])
+                self.assertEqual([event.phase for event in logged], ["pre_execution"])
+                self.assertEqual([event.action_index for event in logged], [None])
+
+    def test_v2_guarded_foreign_retry_preserves_block_without_checkpoint_or_send(self):
+        contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
+        tool = notification_agent.InMemoryNotificationTool()
+        foreign = ActionProposal(
+            tool_name="archive_notification",
+            arguments={"message": "notice", "sensitive": False},
+        )
+        callback = unittest.mock.Mock(return_value=foreign)
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = JsonlDecisionLog(Path(directory) / "events.jsonl")
+            with patch.object(WorkflowController, "execute", autospec=True, side_effect=WorkflowController.execute) as execute, \
+                 patch.object(notification_agent.InMemoryNotificationTool, "__call__", autospec=True, side_effect=notification_agent.InMemoryNotificationTool.__call__) as invoke:
+                with self.assertRaisesRegex(ValueError, "dispatch.*archive_notification"):
+                    notification_agent.run_notification(
+                        run_id="foreign-retry", context=self._v2_trusted_context(contract),
+                        message="secret", sensitive=True, tool=tool, contract=contract,
+                        policy=EnforcementPolicy(mode="guarded"), on_blocked=callback,
+                        recorder=recorder,
+                    )
+
+            execute.assert_called_once()
+            callback.assert_called_once()
+            blocked = callback.call_args.args[0]
+            self.assertEqual(blocked.decision, "block")
+            self.assertEqual([v.rule for v in blocked.violations], ["sensitive_requires_approval"])
+            invoke.assert_not_called()
+            self.assertEqual(tool.sent, [])
+            logged = recorder.read()
+            self.assertEqual([event.event_type for event in logged], ["decision", "decision"])
+            self.assertEqual([event.phase for event in logged], ["pre_execution", "runtime"])
+            self.assertEqual([event.decision for event in logged], [None, "block"])
+            self.assertEqual([event.action_index for event in logged], [None, 1])
+            self.assertTrue(all(event.run_id == "foreign-retry" for event in logged))
+            self.assertEqual(logged[1].tool_name, "send_notification")
+            self.assertEqual(logged[1].violation_rules, ["sensitive_requires_approval"])
+
     def test_v2_guarded_two_blocks_keep_same_run_and_zero_sends(self):
         contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
         begin_context = self._v2_trusted_context(contract)
@@ -206,6 +272,9 @@ class NotificationExampleTests(unittest.TestCase):
         self.assertEqual([event.decision for event in logged], [None, "block", "block", None])
         self.assertTrue(all(event.run_id == "v2-two-blocks" for event in logged))
         self.assertEqual([event.action_index for event in logged], [None, 1, 2, None])
+        self.assertEqual([event.tool_name for event in logged if event.phase == "runtime"], [
+            "send_notification", "send_notification",
+        ])
 
     def test_v2_guarded_host_approval_allows_only_second_attempt(self):
         contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract
@@ -265,9 +334,11 @@ class NotificationExampleTests(unittest.TestCase):
 
         def execute(controller, proposal, ctx, send):
             context_snapshot = ctx.model_copy(deep=True).model_dump()
+            proposal_snapshot = proposal.model_copy(deep=True)
             outcome = original_execute(controller, proposal, ctx, send)
             outcomes.append({
                 "outcome": outcome, "state": controller.state, "context": ctx,
+                "proposal": proposal_snapshot,
                 "context_snapshot": context_snapshot,
                 "contract": controller.contract.model_dump(), "run_id": controller.run_id,
                 "controller": controller, "sink": list(tool.sent),
@@ -276,7 +347,8 @@ class NotificationExampleTests(unittest.TestCase):
             return outcome
 
         def invoke(instance, proposal):
-            tool_calls.append(proposal)
+            self.assertIs(instance, tool)
+            tool_calls.append(proposal.model_copy(deep=True))
             events.append("tool")
             return original_tool(instance, proposal)
 
@@ -337,7 +409,7 @@ class NotificationExampleTests(unittest.TestCase):
             "receive_feedback", "second_proposal", "host_context", "tool", "execute",
             "finish",
         ])
-        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls, [outcomes[1]["proposal"]])
         self.assertEqual(tool.sent, ["secret"])
         self.assertEqual(result.runtime, outcomes[-1]["outcome"])
         logged = recorder.read()
@@ -357,6 +429,9 @@ class NotificationExampleTests(unittest.TestCase):
         self.assertEqual(logged[1].violation_rules, ["sensitive_requires_approval"])
         self.assertEqual(logged[3].execution_status, "completed")
         self.assertEqual(sum(event.event_type == "tool_completed" for event in logged), 1)
+        self.assertEqual([event.tool_name for event in logged if event.phase == "runtime"], [
+            tool_calls[0].tool_name,
+        ] * 3)
 
     def test_v2_finish_without_ledger_closes_once_and_rejects_late_calls(self):
         contract = load_contract(EXAMPLE.with_name("notification_contract_v2.yaml")).contract

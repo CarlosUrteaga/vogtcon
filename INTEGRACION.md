@@ -105,10 +105,20 @@ from examples.notification_agent import (
 
 contract = load_contract("examples/notification_contract_v2.yaml").contract
 
+class ObservedNotificationTool(InMemoryNotificationTool):
+    def __init__(self):
+        super().__init__()
+        self.received = []
+
+    def __call__(self, proposal):
+        # Evidencia del host: copia de lo recibido por la función de envío.
+        self.received.append(proposal.model_copy(deep=True))
+        return super().__call__(proposal)
+
 for approve_after_block in (False, True):
     run_id = f"notification-{approve_after_block}"
     host = {"approval_granted": False}
-    destination = InMemoryNotificationTool()
+    destination = ObservedNotificationTool()
     attempts = []
 
     def trusted_context():
@@ -163,6 +173,11 @@ for approve_after_block in (False, True):
 
         events = JsonlDecisionLog(log_path).read()
         assert all(event.run_id == run_id for event in events)
+        runtime_decisions = [
+            event for event in events
+            if event.event_type == "decision" and event.phase == "runtime"
+        ]
+        assert [event.tool_name for event in runtime_decisions] == ["send_notification"] * 2
         if approve_after_block:
             assert [event.event_type for event in events] == [
                 "decision", "decision", "decision", "tool_completed", "decision",
@@ -173,6 +188,15 @@ for approve_after_block in (False, True):
             assert [event.action_index for event in events] == [None, 1, 2, 2, None]
             assert events[1].violation_rules == ["sensitive_requires_approval"]
             assert events[3].execution_status == "completed"
+            assert len(destination.received) == 1
+            received = destination.received[0]
+            allowed, completed = runtime_decisions[1], events[3]
+            assert (allowed.run_id, allowed.action_index) == (
+                completed.run_id, completed.action_index,
+            ) == (run_id, 2)
+            assert received.tool_name == allowed.tool_name == completed.tool_name == "send_notification"
+            assert received.arguments == {"message": "Hola", "sensitive": True}
+            assert destination.sent == [received.arguments["message"]]
         else:
             assert [event.event_type for event in events] == [
                 "decision", "decision", "decision", "decision",
@@ -181,11 +205,15 @@ for approve_after_block in (False, True):
                 None, "block", "block", None,
             ]
             assert not any(event.event_type == "tool_completed" for event in events)
+            assert [event.action_index for event in events] == [None, 1, 2, None]
+            assert destination.received == []
 
         print(run_id, attempts, result.state, len(events))
 ```
 
-La primera corrida termina en `block → block` y confirma cero envíos después de ambos intentos. La segunda recibe aprobación del host y termina en `block → allow`, con un envío registrado tras el segundo intento. En ambos casos el último evento es la decisión post y la corrida queda `finished`. El JSONL acredita decisiones y orden; `destination.sent` acredita los efectos observados por la aplicación. El `run_ledger` opcional de `run_notification` se entrega a `finish` como resumen del host cuando el contrato lo exige; ese resumen no reemplaza los eventos ni la comprobación del destino.
+La primera corrida termina en `block → block` y confirma cero invocaciones y envíos después de ambos intentos. La segunda recibe aprobación del host y termina en `block → allow`, con un envío registrado tras el segundo intento. La decisión permitida y el único `tool_completed` comparten `(run_id, action_index=2)` y el nombre `send_notification`. En ambos casos el último evento es la decisión post y la corrida queda `finished`.
+
+El JSONL acredita decisiones y orden; sus nombres proceden de las propuestas y no demuestran por sí solos qué función se invocó. El host instala `ObservedNotificationTool`, que copia los argumentos recibidos al entrar en la función de envío; `destination.received` permite contrastarlos con la notificación propuesta y `destination.sent` confirma el mensaje escrito. Esta observación corresponde al destino en memoria del ejemplo. El `run_ledger` opcional de `run_notification` se entrega a `finish` como resumen del host cuando el contrato lo exige; ese resumen no reemplaza los eventos ni la comprobación del destino.
 
 ## Elegir el modo y gestionar el flujo
 
