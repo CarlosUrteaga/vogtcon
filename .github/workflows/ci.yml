@@ -109,7 +109,7 @@ jobs:
             --no-deps \
             --no-build-isolation \
             -e .
-          uv run --python .venv-rag/bin/python -c "import vogtcon; assert 'src/vogtcon' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
+          .venv-rag/bin/python -c "import vogtcon; assert 'src/vogtcon' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
           uv pip check --python .venv-rag/bin/python
 
       - name: Audit RAG dependencies with pip-audit
@@ -161,7 +161,7 @@ jobs:
           uv pip uninstall --python .venv-rag/bin/python vogtcon
           uv pip install --python .venv-rag/bin/python --no-deps dist/*.whl
           uv pip check --python .venv-rag/bin/python
-          uv run --python .venv-rag/bin/python -c "import vogtcon; assert 'site-packages' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
+          .venv-rag/bin/python -c "import vogtcon; assert 'site-packages' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
           uv run --python .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
 
   rag-container:
