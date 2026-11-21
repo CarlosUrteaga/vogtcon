@@ -271,8 +271,8 @@ Los resultados observados y verificados en GitHub Actions (Workflow CI, Runs [44
 
 | Trabajo / Job | Entorno | Duración | Estado | Evidencia y Hallazgos |
 | :--- | :--- | :--- | :--- | :--- |
-| **LangChain RAG (Python 3.12)** | `ubuntu-latest` (Linux x86_64), Python 3.12, PyTorch CPU | 1m 14s | ✅ Aprobado | Consistencia `--check` verificada; backend de construcción `setuptools>=77.0.3` instalado; `pip-audit --strict` reportó **0 vulnerabilidades**; 25/25 pruebas RAG ejecutadas 100% offline; validación de CLIs final y pre; prueba de consumidor con rueda (.whl) exitosa en `site-packages`. |
-| **LangChain RAG Linux Container (AMD64)** | `ubuntu-latest`, Docker Buildx `linux/amd64` | 2m 39s | ✅ Aprobado | Construcción reproducible con digest inmutable `sha256:0f0861...`; usuario sin privilegios `appuser` (UID 1001); `uv pip check` en verde; suite completa de 25 pruebas ejecutada con `--network none`; validación de briefs exportados en volumen `/out`. |
+| **LangChain RAG (Python 3.12)** | `ubuntu-latest` (Linux x86_64), Python 3.12, PyTorch CPU | 1m 14s | ✅ Aprobado | Consistencia `--check` verificada; backend de construcción `setuptools>=77.0.3` instalado; `pip-audit --strict` reportó **0 vulnerabilidades**; 27/27 pruebas RAG ejecutadas 100% offline; validación de CLIs final y pre; prueba de consumidor con rueda (.whl) exitosa en `site-packages`. |
+| **LangChain RAG Linux Container (AMD64)** | `ubuntu-latest`, Docker Buildx `linux/amd64` | 2m 39s | ✅ Aprobado | Construcción reproducible con digest inmutable `sha256:0f0861...`; usuario sin privilegios `appuser` (UID 1001); `uv pip check` en verde; suite completa de 27 pruebas ejecutada con `--network none`; validación de briefs exportados en volumen `/out`. |
 | **core and CFDI (Python 3.11, 3.12, 3.13)** | `ubuntu-latest`, matrices 3.11, 3.12, 3.13 | 1m 05s | ✅ Aprobado | Suite central de pruebas de `vogtcon` intacta y en verde en todas las versiones soportadas; prueba de consumidor externo de rueda (`tests/smoke_wheel_consumer.sh`) aprobada en Python 3.13. |
 
 #### Conciliación de Vulnerabilidades de Dependabot
@@ -292,3 +292,24 @@ En relación con las 26 alertas de seguridad de la línea base de Dependabot:
    - Alerta #18 [BAJA] `GHSA-x3gm-94wq-g975` (`torch <= 2.6.0`)
 
    Estas 4 vulnerabilidades se sitúan **fuera de los rangos de versiones afectados publicados** bajo `torch==2.15.0+cpu` y `transformers==5.23.0`, sin atribuirles un parche formal no confirmado. Su cierre formal definitivo queda sujeto a la reevaluación automatizada de Dependabot una vez que los cambios se integren a `main` (el reporte limpio de `pip-audit` no sustituye dicha reevaluación de Dependabot en GitHub).
+
+### 6.5. Validación Real en macOS Intel con Contenedor (Colima + Docker)
+
+Se ejecutó la validación física en el equipo local macOS Intel (`Darwin x86_64`) utilizando **Colima (v0.10.3)** y el motor **Docker (v29.10.0)** (`mountType: virtiofs` compartiendo `$HOME`):
+
+1. **Construcción de imagen inmutable:** La imagen `vogtcon-rag:latest` se construyó exitosamente a partir de [examples/Dockerfile.rag](Dockerfile.rag) sobre plataforma `linux/amd64`.
+2. **Suite de pruebas completa offline:**
+   ```bash
+   bash scripts/run_rag.sh --container test
+   ```
+   Resultado: **27/27 pruebas aprobadas** (18 de integración RAG gobernada + 9 de seguridad, manifiesto y plataforma) ejecutadas en 23.9s bajo aislamiento de red estricto (`--network none`).
+3. **Resolución de ruta relativa y montaje de volumen (`governed`):**
+   ```bash
+   bash scripts/run_rag.sh --container --output-dir rel-governed governed
+   ```
+   Resultado: Código de salida 0; resolución automática de la ruta relativa `rel-governed` a ruta física absoluta del host en `-v <abs_path>:/out`; generación de briefs markdown (`rag-case-a-approved-brief.md`, `rag-case-d-replan-brief.md`) verificada en el host macOS con permisos de usuario intactos.
+4. **Resolución de ruta relativa y montaje de volumen (`pre`):**
+   ```bash
+   bash scripts/run_rag.sh --container --output-dir rel-pre pre
+   ```
+   Resultado: Código de salida 0; generación de los 4 briefs del agente sin gobernanza (`rag-case-a-approved-brief.md`, `rag-case-b-invalid-citation-brief.md`, `rag-case-c-unapproved-brief.md`, `rag-case-d-replan-brief.md`) verificada en el host macOS dentro de `rel-pre/`.

@@ -32,10 +32,11 @@ from vogtcon import (
     load_contract,
 )
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "langchain_rag_agent.py"
-PRE_EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "pre" / "langchain_rag_agent.py"
-RUN_RAG_SH = Path(__file__).resolve().parents[1] / "scripts" / "run_rag.sh"
-PREPARE_RAG_MODEL = Path(__file__).resolve().parents[1] / "scripts" / "prepare_rag_model.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE = REPO_ROOT / "examples" / "langchain_rag_agent.py"
+PRE_EXAMPLE = REPO_ROOT / "examples" / "pre" / "langchain_rag_agent.py"
+RUN_RAG_SH = REPO_ROOT / "scripts" / "run_rag.sh"
+PREPARE_RAG_MODEL = REPO_ROOT / "scripts" / "prepare_rag_model.py"
 
 SPEC = importlib.util.spec_from_file_location("langchain_rag_agent", EXAMPLE)
 assert SPEC is not None and SPEC.loader is not None
@@ -870,6 +871,137 @@ class RagSnapshotAndPlatformSecurityTests(unittest.TestCase):
                 self.assertEqual(res.returncode, 2, msg=f"run_rag.sh {cmd} did not exit 2: {res.stderr}")
                 self.assertIn("Native RAG execution is not supported on macOS Intel", res.stderr)
                 self.assertIn("scripts/run_rag.sh --container", res.stderr)
+
+    def test_compile_rag_requirements_check_seeds_temp_files_before_uv_compile(self) -> None:
+        compile_script = REPO_ROOT / "scripts" / "compile_rag_requirements.sh"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shim_dir = Path(tmpdir) / "bin"
+            shim_dir.mkdir()
+            uv_shim = shim_dir / "uv"
+            log_file = Path(tmpdir) / "uv_calls.json"
+
+            uv_shim_code = f"""#!/usr/bin/env python3
+import sys, json
+from pathlib import Path
+
+log_file = Path({repr(str(log_file))})
+if "--version" in sys.argv:
+    print("uv 0.8.23")
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[1] == "pip" and sys.argv[2] == "compile":
+    out_idx = sys.argv.index("-o")
+    out_path = Path(sys.argv[out_idx + 1])
+    record = {{
+        "in_file": sys.argv[3],
+        "out_file": str(out_path),
+        "out_exists": out_path.exists(),
+        "out_size": len(out_path.read_bytes()) if out_path.exists() else 0,
+    }}
+    calls = []
+    if log_file.exists():
+        calls = json.loads(log_file.read_text())
+    calls.append(record)
+    log_file.write_text(json.dumps(calls))
+    sys.exit(0)
+
+sys.exit(0)
+"""
+            uv_shim.write_text(uv_shim_code, encoding="utf-8")
+            uv_shim.chmod(0o755)
+
+            new_env = os.environ.copy()
+            new_env["PATH"] = f"{shim_dir}:{new_env.get('PATH', '')}"
+
+            res = subprocess.run(
+                ["bash", str(compile_script), "--check"],
+                env=new_env,
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(res.returncode, 0, msg=f"compile check failed: {res.stderr}\n{res.stdout}")
+            self.assertIn("Lockfile check passed", res.stdout)
+
+            self.assertTrue(log_file.exists(), "uv shim was not invoked")
+            calls = json.loads(log_file.read_text())
+            self.assertEqual(len(calls), 2, f"Expected 2 pip compile calls, got {calls}")
+            for call in calls:
+                self.assertTrue(call["out_exists"], f"Output file was not seeded before compile: {call}")
+                self.assertGreater(call["out_size"], 0, f"Seeded output file was empty: {call}")
+
+    def test_run_rag_sh_resolves_relative_output_dir_to_absolute_volume_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "work"
+            work_dir.mkdir()
+            shim_dir = Path(tmpdir) / "bin"
+            shim_dir.mkdir()
+            docker_shim = shim_dir / "docker"
+            log_file = Path(tmpdir) / "docker_calls.jsonl"
+
+            docker_shim_code = f"""#!/usr/bin/env python3
+import sys, json
+from pathlib import Path
+
+log_file = Path({repr(str(log_file))})
+with open(log_file, "a", encoding="utf-8") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+
+if len(sys.argv) > 2 and sys.argv[1] == "image" and sys.argv[2] == "inspect":
+    sys.exit(0)
+
+sys.exit(0)
+"""
+            docker_shim.write_text(docker_shim_code, encoding="utf-8")
+            docker_shim.chmod(0o755)
+
+            new_env = os.environ.copy()
+            new_env["PATH"] = f"{shim_dir}:{new_env.get('PATH', '')}"
+
+            # 1. Test missing argument to --output-dir exits 1
+            missing_arg_res = subprocess.run(
+                ["bash", str(RUN_RAG_SH), "--container", "--output-dir"],
+                env=new_env,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(missing_arg_res.returncode, 1)
+            self.assertIn("--output-dir requires a directory argument", missing_arg_res.stderr)
+
+            # 2. Test relative output dir with governed
+            gov_res = subprocess.run(
+                ["bash", str(RUN_RAG_SH), "--container", "--output-dir", "rel_gov_dir", "governed"],
+                env=new_env,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(gov_res.returncode, 0, msg=f"governed container launch failed: {gov_res.stderr}")
+
+            # 3. Test relative output dir with pre
+            pre_res = subprocess.run(
+                ["bash", str(RUN_RAG_SH), "--container", "--output-dir", "rel_pre_dir", "pre"],
+                env=new_env,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(pre_res.returncode, 0, msg=f"pre container launch failed: {pre_res.stderr}")
+
+            calls = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+            run_calls = [c for c in calls if c and c[0] == "run"]
+            self.assertEqual(len(run_calls), 2)
+
+            expected_gov_mount = f"{(work_dir / 'rel_gov_dir').resolve()}:/out"
+            expected_pre_mount = f"{(work_dir / 'rel_pre_dir').resolve()}:/out"
+
+            gov_v_idx = run_calls[0].index("-v")
+            pre_v_idx = run_calls[1].index("-v")
+            self.assertEqual(run_calls[0][gov_v_idx + 1], expected_gov_mount)
+            self.assertEqual(run_calls[1][pre_v_idx + 1], expected_pre_mount)
+            self.assertTrue(run_calls[0][gov_v_idx + 1].startswith("/"))
+            self.assertTrue(run_calls[1][pre_v_idx + 1].startswith("/"))
 
 
 if __name__ == "__main__":

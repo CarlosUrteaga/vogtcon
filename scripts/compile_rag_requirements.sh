@@ -35,6 +35,11 @@ for arg in "$@"; do
 done
 
 if [ "$CHECK_MODE" -eq 1 ]; then
+    if [ ! -f "$RAG_TXT" ] || [ ! -f "$BUILD_TXT" ]; then
+        echo "Error: Committed lockfiles $RAG_TXT and $BUILD_TXT must exist for --check mode." >&2
+        exit 1
+    fi
+
     TMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -42,6 +47,10 @@ if [ "$CHECK_MODE" -eq 1 ]; then
     TMP_BUILD_TXT="$TMP_DIR/requirements-rag-build.txt"
     NORM_RAG_TXT="$TMP_DIR/normalized-rag.txt"
     NORM_BUILD_TXT="$TMP_DIR/normalized-build.txt"
+
+    # Seed temporary output files from committed lockfiles before uv pip compile runs
+    cp "$RAG_TXT" "$TMP_RAG_TXT"
+    cp "$BUILD_TXT" "$TMP_BUILD_TXT"
 
     uv pip compile "$RAG_IN" \
         --python-version 3.12 \

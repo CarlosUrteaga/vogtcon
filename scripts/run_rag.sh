@@ -38,6 +38,11 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --output-dir)
+            if [ $# -lt 2 ]; then
+                echo "Error: --output-dir requires a directory argument." >&2
+                show_help
+                exit 1
+            fi
             OUTPUT_DIR="$2"
             shift 2
             ;;
@@ -87,6 +92,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
 
 if [ "$USE_CONTAINER" -eq 1 ]; then
     RUNTIME=""
