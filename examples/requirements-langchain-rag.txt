@@ -345,10 +345,12 @@ langgraph-sdk==0.4.14 \
     --hash=sha256:13eb1fee92504d87c1f0f43c8e213e7ba0a46bd23a07e3198e413d48efac5833 \
     --hash=sha256:d47a6755890ae537aa80613a3138680ac77f5d256a2d3953af95a96328e6964d
     # via langgraph
-langsmith==0.15.1 \
-    --hash=sha256:8257beb14033ed94550a37e24b836d204b57b79f91bf6620491b66600d26b546 \
-    --hash=sha256:9d8ddba87cd4812cbbf10f90aea63f82280a1df7cd8f6bfc446f83b23b62c246
-    # via langchain-core
+langsmith==0.16.0 \
+    --hash=sha256:8111f149c720bc838ee16104d9eec59fe9379d67015dbce00b4fd2dcd910ca69 \
+    --hash=sha256:edd738910a595751218299c9791099db1b5c63ae6dc21ca68009dbfb6344524a
+    # via
+    #   -r examples/requirements-langchain-rag.in
+    #   langchain-core
 markdown-it-py==4.3.0 \
     --hash=sha256:7aa1511a46c39138de78d9eba92ce47e63124d8003fc98b3a351909e04239efa \
     --hash=sha256:91a58fa5b72c71a40cf7177250fd767480d7a2bb3ac426ccfb76fb90305fdaaa
