@@ -8,11 +8,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import tempfile
 from typing import Any
 import unittest
+from unittest.mock import MagicMock, patch
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from opentelemetry.sdk.trace import TracerProvider
@@ -30,7 +32,12 @@ from vogtcon import (
     load_contract,
 )
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "langchain_rag_agent.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE = REPO_ROOT / "examples" / "langchain_rag_agent.py"
+PRE_EXAMPLE = REPO_ROOT / "examples" / "pre" / "langchain_rag_agent.py"
+RUN_RAG_SH = REPO_ROOT / "scripts" / "run_rag.sh"
+PREPARE_RAG_MODEL = REPO_ROOT / "scripts" / "prepare_rag_model.py"
+
 SPEC = importlib.util.spec_from_file_location("langchain_rag_agent", EXAMPLE)
 assert SPEC is not None and SPEC.loader is not None
 langchain_rag_agent = importlib.util.module_from_spec(SPEC)
@@ -64,6 +71,11 @@ def make_context(
 class LangChainRagAgentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if sys.platform == "darwin" and platform.machine() in ("x86_64", "AMD64"):
+            raise unittest.SkipTest(
+                "LangChainRagAgentTests requires a supported RAG platform (Linux x86_64). "
+                "Skipping full vector store integration tests on macOS Intel."
+            )
         os.environ["HF_HUB_OFFLINE"] = "1"
         _, cls.corpus_docs = langchain_rag_agent.load_frozen_corpus()
         cls.real_vector_store = langchain_rag_agent.build_vector_store(cls.corpus_docs)
@@ -630,6 +642,366 @@ class LangChainRagAgentTests(unittest.TestCase):
             ]
             for snippet in forbidden_snippets:
                 self.assertNotIn(snippet, result.stdout)
+
+
+class RagSnapshotAndPlatformSecurityTests(unittest.TestCase):
+    """Test offline model snapshot manifest validation, pickle rejection, and fail-fast platform guard."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.model_dir = Path(self.temp_dir.name)
+        spec = importlib.util.spec_from_file_location("prepare_rag_model", PREPARE_RAG_MODEL)
+        assert spec is not None and spec.loader is not None
+        self.prepare_rag_model = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.prepare_rag_model)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _create_mock_snapshot(self, files: dict[str, bytes] | None = None) -> dict[str, bytes]:
+        if files is None:
+            files = {
+                "config.json": b'{"architectures": ["BertModel"]}',
+                "tokenizer.json": b'{"version": "1.0"}',
+                "vocab.txt": b"test\nvocab\n",
+                "model.safetensors": b"MOCK_SAFETENSORS_WEIGHTS_DATA",
+            }
+        for rel_name, data in files.items():
+            file_path = self.model_dir / rel_name
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(data)
+        return files
+
+    def test_prepare_and_verify_snapshot_success_and_manifest_schema(self) -> None:
+        self._create_mock_snapshot()
+        manifest = self.prepare_rag_model.create_snapshot_manifest(
+            self.model_dir,
+            model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+            revision=langchain_rag_agent.EMBEDDING_REVISION,
+        )
+        self.assertEqual(manifest["manifest_version"], 1)
+        self.assertEqual(manifest["model_name"], langchain_rag_agent.EMBEDDING_MODEL_NAME)
+        self.assertEqual(manifest["revision"], langchain_rag_agent.EMBEDDING_REVISION)
+        self.assertIn("files", manifest)
+        self.assertIn("model.safetensors", manifest["files"])
+
+        verified = langchain_rag_agent.verify_prepared_embedding_snapshot(
+            self.model_dir,
+            expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+            expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+        )
+        self.assertEqual(verified["model_name"], langchain_rag_agent.EMBEDDING_MODEL_NAME)
+
+    def test_snapshot_missing_or_without_manifest_rejected(self) -> None:
+        non_existent = self.model_dir / "non_existent_subdir"
+        with self.assertRaises(FileNotFoundError):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                non_existent,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        self._create_mock_snapshot()
+        with self.assertRaisesRegex(ValueError, "Snapshot manifest missing"):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                self.model_dir,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        self.prepare_rag_model.create_snapshot_manifest(
+            self.model_dir,
+            model_name="wrong/model-name",
+            revision=langchain_rag_agent.EMBEDDING_REVISION,
+        )
+        with self.assertRaisesRegex(ValueError, "Snapshot model_name mismatch"):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                self.model_dir,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        self.prepare_rag_model.create_snapshot_manifest(
+            self.model_dir,
+            model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+            revision="wrong-revision",
+        )
+        with self.assertRaisesRegex(ValueError, "Snapshot revision mismatch"):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                self.model_dir,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+    def test_snapshot_byte_alteration_and_unlisted_extra_file_rejected(self) -> None:
+        self._create_mock_snapshot()
+        self.prepare_rag_model.create_snapshot_manifest(
+            self.model_dir,
+            model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+            revision=langchain_rag_agent.EMBEDDING_REVISION,
+        )
+
+        safetensors_file = self.model_dir / "model.safetensors"
+        safetensors_file.write_bytes(b"MOCK_SAFETENSORS_WEIGHTS_DATX")
+        with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                self.model_dir,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        safetensors_file.write_bytes(b"TAMPERED_SHORT")
+        with self.assertRaisesRegex(ValueError, "File size mismatch"):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                self.model_dir,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        safetensors_file.write_bytes(b"MOCK_SAFETENSORS_WEIGHTS_DATA")
+        (self.model_dir / "unlisted.json").write_text('{"extra": true}', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Unlisted file found in model directory"):
+            langchain_rag_agent.verify_prepared_embedding_snapshot(
+                self.model_dir,
+                expected_model=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                expected_revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+    def test_snapshot_pickle_weights_or_missing_safetensors_rejected(self) -> None:
+        self._create_mock_snapshot()
+        pickle_file = self.model_dir / "pytorch_model.bin"
+        pickle_file.write_bytes(b"FAKE_PICKLE_WEIGHTS")
+        with self.assertRaisesRegex(ValueError, "Forbidden weight format"):
+            self.prepare_rag_model.create_snapshot_manifest(
+                self.model_dir,
+                model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        pickle_file.unlink()
+        pt_file = self.model_dir / "model.pt"
+        pt_file.write_bytes(b"FAKE_PT_WEIGHTS")
+        with self.assertRaisesRegex(ValueError, "Forbidden weight format"):
+            self.prepare_rag_model.create_snapshot_manifest(
+                self.model_dir,
+                model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+        pt_file.unlink()
+        (self.model_dir / "model.safetensors").unlink()
+        with self.assertRaisesRegex(ValueError, "Model snapshot must contain at least one .safetensors file"):
+            self.prepare_rag_model.create_snapshot_manifest(
+                self.model_dir,
+                model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+                revision=langchain_rag_agent.EMBEDDING_REVISION,
+            )
+
+    def test_default_local_embeddings_enforces_offline_cpu_and_nested_safetensors_kwargs(self) -> None:
+        self._create_mock_snapshot()
+        self.prepare_rag_model.create_snapshot_manifest(
+            self.model_dir,
+            model_name=langchain_rag_agent.EMBEDDING_MODEL_NAME,
+            revision=langchain_rag_agent.EMBEDDING_REVISION,
+        )
+
+        mock_embeddings_cls = MagicMock()
+        with patch.object(langchain_rag_agent, "check_rag_platform", return_value=None):
+            with patch.dict("sys.modules", {"langchain_huggingface": MagicMock(HuggingFaceEmbeddings=mock_embeddings_cls)}):
+                langchain_rag_agent.default_local_embeddings(model_dir=self.model_dir)
+
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
+        self.assertEqual(os.environ.get("TRANSFORMERS_OFFLINE"), "1")
+        mock_embeddings_cls.assert_called_once_with(
+            model_name=str(self.model_dir.resolve()),
+            model_kwargs={
+                "device": "cpu",
+                "local_files_only": True,
+                "trust_remote_code": False,
+                "revision": langchain_rag_agent.EMBEDDING_REVISION,
+                "model_kwargs": {
+                    "use_safetensors": True,
+                    "local_files_only": True,
+                    "trust_remote_code": False,
+                },
+            },
+        )
+
+    def test_check_rag_platform_and_cli_fail_fast_on_macos_intel(self) -> None:
+        if sys.platform == "darwin" and platform.machine() in ("x86_64", "AMD64"):
+            with self.assertRaises(RuntimeError) as cm:
+                langchain_rag_agent.check_rag_platform()
+            self.assertIn("Native RAG execution is not supported on macOS Intel", str(cm.exception))
+        else:
+            with patch("sys.platform", "darwin"), patch("platform.machine", return_value="x86_64"):
+                with self.assertRaises(RuntimeError) as cm:
+                    langchain_rag_agent.check_rag_platform()
+                self.assertIn("Native RAG execution is not supported on macOS Intel", str(cm.exception))
+
+        if sys.platform == "darwin" and platform.machine() in ("x86_64", "AMD64"):
+            for script_path in (EXAMPLE, PRE_EXAMPLE):
+                res = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 2, msg=f"{script_path} did not exit with code 2: {res.stderr}")
+                self.assertIn("Native RAG execution is not supported on macOS Intel", res.stderr)
+                self.assertIn("scripts/run_rag.sh --container", res.stderr)
+
+                v_res = subprocess.run(
+                    [sys.executable, "-v", str(script_path)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(v_res.returncode, 2)
+                import_log = v_res.stderr.lower()
+                self.assertNotIn("import 'torch'", import_log)
+                self.assertNotIn("import 'transformers'", import_log)
+                self.assertNotIn("import 'sentence_transformers'", import_log)
+
+    def test_run_rag_sh_rejects_native_macos_intel_with_container_instructions(self) -> None:
+        if sys.platform == "darwin" and platform.machine() in ("x86_64", "AMD64"):
+            for cmd in ("test", "governed", "pre"):
+                res = subprocess.run(
+                    ["bash", str(RUN_RAG_SH), cmd],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res.returncode, 2, msg=f"run_rag.sh {cmd} did not exit 2: {res.stderr}")
+                self.assertIn("Native RAG execution is not supported on macOS Intel", res.stderr)
+                self.assertIn("scripts/run_rag.sh --container", res.stderr)
+
+    def test_compile_rag_requirements_check_seeds_temp_files_before_uv_compile(self) -> None:
+        compile_script = REPO_ROOT / "scripts" / "compile_rag_requirements.sh"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shim_dir = Path(tmpdir) / "bin"
+            shim_dir.mkdir()
+            uv_shim = shim_dir / "uv"
+            log_file = Path(tmpdir) / "uv_calls.json"
+
+            uv_shim_code = f"""#!/usr/bin/env python3
+import sys, json
+from pathlib import Path
+
+log_file = Path({repr(str(log_file))})
+if "--version" in sys.argv:
+    print("uv 0.8.23")
+    sys.exit(0)
+
+if len(sys.argv) > 2 and sys.argv[1] == "pip" and sys.argv[2] == "compile":
+    out_idx = sys.argv.index("-o")
+    out_path = Path(sys.argv[out_idx + 1])
+    record = {{
+        "in_file": sys.argv[3],
+        "out_file": str(out_path),
+        "out_exists": out_path.exists(),
+        "out_size": len(out_path.read_bytes()) if out_path.exists() else 0,
+    }}
+    calls = []
+    if log_file.exists():
+        calls = json.loads(log_file.read_text())
+    calls.append(record)
+    log_file.write_text(json.dumps(calls))
+    sys.exit(0)
+
+sys.exit(0)
+"""
+            uv_shim.write_text(uv_shim_code, encoding="utf-8")
+            uv_shim.chmod(0o755)
+
+            new_env = os.environ.copy()
+            new_env["PATH"] = f"{shim_dir}:{new_env.get('PATH', '')}"
+
+            res = subprocess.run(
+                ["bash", str(compile_script), "--check"],
+                env=new_env,
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            self.assertEqual(res.returncode, 0, msg=f"compile check failed: {res.stderr}\n{res.stdout}")
+            self.assertIn("Lockfile check passed", res.stdout)
+
+            self.assertTrue(log_file.exists(), "uv shim was not invoked")
+            calls = json.loads(log_file.read_text())
+            self.assertEqual(len(calls), 2, f"Expected 2 pip compile calls, got {calls}")
+            for call in calls:
+                self.assertTrue(call["out_exists"], f"Output file was not seeded before compile: {call}")
+                self.assertGreater(call["out_size"], 0, f"Seeded output file was empty: {call}")
+
+    def test_run_rag_sh_resolves_relative_output_dir_to_absolute_volume_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "work"
+            work_dir.mkdir()
+            shim_dir = Path(tmpdir) / "bin"
+            shim_dir.mkdir()
+            docker_shim = shim_dir / "docker"
+            log_file = Path(tmpdir) / "docker_calls.jsonl"
+
+            docker_shim_code = f"""#!/usr/bin/env python3
+import sys, json
+from pathlib import Path
+
+log_file = Path({repr(str(log_file))})
+with open(log_file, "a", encoding="utf-8") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+
+if len(sys.argv) > 2 and sys.argv[1] == "image" and sys.argv[2] == "inspect":
+    sys.exit(0)
+
+sys.exit(0)
+"""
+            docker_shim.write_text(docker_shim_code, encoding="utf-8")
+            docker_shim.chmod(0o755)
+
+            new_env = os.environ.copy()
+            new_env["PATH"] = f"{shim_dir}:{new_env.get('PATH', '')}"
+
+            # 1. Test missing argument to --output-dir exits 1
+            missing_arg_res = subprocess.run(
+                ["bash", str(RUN_RAG_SH), "--container", "--output-dir"],
+                env=new_env,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(missing_arg_res.returncode, 1)
+            self.assertIn("--output-dir requires a directory argument", missing_arg_res.stderr)
+
+            # 2. Test relative output dir with governed
+            gov_res = subprocess.run(
+                ["bash", str(RUN_RAG_SH), "--container", "--output-dir", "rel_gov_dir", "governed"],
+                env=new_env,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(gov_res.returncode, 0, msg=f"governed container launch failed: {gov_res.stderr}")
+
+            # 3. Test relative output dir with pre
+            pre_res = subprocess.run(
+                ["bash", str(RUN_RAG_SH), "--container", "--output-dir", "rel_pre_dir", "pre"],
+                env=new_env,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(pre_res.returncode, 0, msg=f"pre container launch failed: {pre_res.stderr}")
+
+            calls = [json.loads(line) for line in log_file.read_text().splitlines() if line.strip()]
+            run_calls = [c for c in calls if c and c[0] == "run"]
+            self.assertEqual(len(run_calls), 2)
+
+            expected_gov_mount = f"{(work_dir / 'rel_gov_dir').resolve()}:/out"
+            expected_pre_mount = f"{(work_dir / 'rel_pre_dir').resolve()}:/out"
+
+            gov_v_idx = run_calls[0].index("-v")
+            pre_v_idx = run_calls[1].index("-v")
+            self.assertEqual(run_calls[0][gov_v_idx + 1], expected_gov_mount)
+            self.assertEqual(run_calls[1][pre_v_idx + 1], expected_pre_mount)
+            self.assertTrue(run_calls[0][gov_v_idx + 1].startswith("/"))
+            self.assertTrue(run_calls[1][pre_v_idx + 1].startswith("/"))
 
 
 if __name__ == "__main__":

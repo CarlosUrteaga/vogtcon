@@ -1,0 +1,4 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+# Build backend required for installing vogtcon under --no-build-isolation
+setuptools>=77.0.3

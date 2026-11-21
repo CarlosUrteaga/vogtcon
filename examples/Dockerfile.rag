@@ -1,0 +1,62 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+# Linux x86_64 reference environment for Vogtcon LangChain RAG
+FROM --platform=linux/amd64 python:3.12-slim-bookworm@sha256:0f086103b026048cc50cb5da25ec435c023c5241a83fc44daea593377abc61c4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    VOGTCON_RAG_MODEL_DIR=/opt/vogtcon-rag-model \
+    PATH="/opt/vogtcon-rag-venv/bin:$PATH"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv==0.8.23
+
+RUN useradd -m -u 1001 -s /bin/bash appuser && \
+    mkdir -p /opt/vogtcon-rag-venv /opt/vogtcon-rag-model /out /app && \
+    chown -R appuser:appuser /opt/vogtcon-rag-venv /opt/vogtcon-rag-model /out /app
+
+WORKDIR /app
+
+RUN uv venv /opt/vogtcon-rag-venv --python python3.12
+
+COPY examples/requirements-langchain-rag.txt /app/examples/
+COPY examples/requirements-rag-build.txt /app/examples/
+
+RUN uv pip install --python /opt/vogtcon-rag-venv/bin/python \
+    --require-hashes \
+    --only-binary :all: \
+    --torch-backend cpu \
+    -r /app/examples/requirements-langchain-rag.txt
+
+RUN uv pip install --python /opt/vogtcon-rag-venv/bin/python \
+    --require-hashes \
+    --only-binary :all: \
+    -r /app/examples/requirements-rag-build.txt
+
+COPY . /app
+
+RUN uv pip install --python /opt/vogtcon-rag-venv/bin/python \
+    --no-deps \
+    --no-build-isolation \
+    .
+
+RUN uv pip check --python /opt/vogtcon-rag-venv/bin/python
+
+RUN /opt/vogtcon-rag-venv/bin/python scripts/prepare_rag_model.py \
+    --output-dir /opt/vogtcon-rag-model \
+    --corpus-manifest /app/examples/rag_corpus/manifest.json
+
+RUN chown -R appuser:appuser /opt/vogtcon-rag-venv /opt/vogtcon-rag-model /out /app
+
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+USER appuser
+VOLUME ["/out"]
+
+CMD ["python", "examples/langchain_rag_agent.py", "--output-dir", "/out"]

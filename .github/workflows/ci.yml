@@ -78,36 +78,134 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          # The example pins torch 2.2.2 and numpy 1.26.4 (Python <= 3.12).
           python-version: "3.12"
 
       - uses: astral-sh/setup-uv@v7
         with:
+          version: "0.8.23"
           enable-cache: true
 
-      - name: Install project and test dependencies
-        run: uv sync --locked --extra pydantic-ai --group test
+      - name: Verify RAG requirements lockfiles are in sync
+        run: bash scripts/compile_rag_requirements.sh --check
 
-      - name: Install CPU-only PyTorch and RAG consumer dependencies
+      - name: Create RAG virtual environment
+        run: uv venv .venv-rag --python 3.12
+
+      - name: Install RAG locked dependencies
         run: |
-          uv pip install --index-url https://download.pytorch.org/whl/cpu torch==2.2.2
-          uv pip install -r examples/requirements-langchain-rag.txt
+          uv pip install --python .venv-rag/bin/python \
+            --require-hashes \
+            --only-binary :all: \
+            --torch-backend cpu \
+            -r examples/requirements-langchain-rag.txt
+
+      - name: Install build backend and editable checkout
+        run: |
+          uv pip install --python .venv-rag/bin/python \
+            --require-hashes \
+            --only-binary :all: \
+            -r examples/requirements-rag-build.txt
+          uv pip install --python .venv-rag/bin/python \
+            --no-deps \
+            --no-build-isolation \
+            -e .
+          .venv-rag/bin/python -c "import vogtcon; assert 'src/vogtcon' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
+          uv pip check --python .venv-rag/bin/python
+
+      - name: Audit RAG dependencies with pip-audit
+        run: |
+          uv venv .venv-audit --python 3.12
+          uv pip install --python .venv-audit/bin/python pip-audit==2.9.0
+          uv pip freeze --python .venv-rag/bin/python > rag-installed-packages.txt
+          sed -E 's/\+cpu$//' rag-installed-packages.txt | grep -v -E '^(-e |vogtcon==)' > rag-audit-requirements.txt
+          .venv-audit/bin/pip-audit --strict --no-deps -r rag-audit-requirements.txt --format json --output rag-pip-audit.json
+
+      - name: Upload pip-audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-pip-audit
+          path: |
+            rag-pip-audit.json
+            rag-installed-packages.txt
+            rag-audit-requirements.txt
 
       - name: Prepare pinned embedding model for offline tests
         run: |
-          uv run --no-sync python - <<'PYTHON'
-          from huggingface_hub import snapshot_download
-
-          snapshot_download(
-              "sentence-transformers/all-MiniLM-L6-v2",
-              revision="c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
-              # Match the example's model_name to load this local directory.
-              local_dir="sentence-transformers/all-MiniLM-L6-v2",
-              allow_patterns=["*.json", "*.txt", "*.safetensors"],
-          )
-          PYTHON
+          .venv-rag/bin/python scripts/prepare_rag_model.py \
+            --output-dir sentence-transformers/all-MiniLM-L6-v2
 
       - name: Run RAG integration tests offline
         env:
           HF_HUB_OFFLINE: "1"
-        run: uv run --no-sync python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+          TRANSFORMERS_OFFLINE: "1"
+        run: .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+
+      - name: Validate governed and pre RAG CLIs
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          .venv-rag/bin/python examples/langchain_rag_agent.py --output-dir /tmp/ci-rag-briefs --log /tmp/ci-rag-events.jsonl
+          test -f /tmp/ci-rag-briefs/rag-case-a-approved-brief.md
+          test -f /tmp/ci-rag-events.jsonl
+          .venv-rag/bin/python examples/pre/langchain_rag_agent.py --output-dir /tmp/ci-rag-pre-briefs
+          test -f /tmp/ci-rag-pre-briefs/rag-case-a-approved-brief.md
+
+      - name: Test installed wheel as consumer in RAG environment
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          uv build --wheel --out-dir dist/
+          uv pip uninstall --python .venv-rag/bin/python vogtcon
+          uv pip install --python .venv-rag/bin/python --no-deps dist/*.whl
+          uv pip check --python .venv-rag/bin/python
+          .venv-rag/bin/python -c "import vogtcon; assert 'site-packages' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
+          .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+
+  rag-container:
+    name: LangChain RAG Linux Container (AMD64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build RAG container image
+        run: docker build --platform linux/amd64 -f examples/Dockerfile.rag -t vogtcon-rag:ci .
+
+      - name: Verify non-root user and pip check in container
+        run: |
+          USER_NAME=$(docker run --rm vogtcon-rag:ci whoami)
+          echo "Container running as user: $USER_NAME"
+          [ "$USER_NAME" != "root" ]
+          docker run --rm vogtcon-rag:ci uv pip check
+
+      - name: Run RAG test suite in container with network disabled
+        run: |
+          docker run --rm --network none \
+            -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            vogtcon-rag:ci \
+            python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+
+      - name: Run governed RAG CLI in container with output volume
+        run: |
+          mkdir -p /tmp/container-out-gov
+          docker run --rm --network none \
+            -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            -v /tmp/container-out-gov:/out \
+            vogtcon-rag:ci \
+            python examples/langchain_rag_agent.py --output-dir /out --log /out/events.jsonl
+          test -f /tmp/container-out-gov/rag-case-a-approved-brief.md
+          test -f /tmp/container-out-gov/events.jsonl
+
+      - name: Run pre RAG CLI in container with output volume
+        run: |
+          mkdir -p /tmp/container-out-pre
+          docker run --rm --network none \
+            -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            -v /tmp/container-out-pre:/out \
+            vogtcon-rag:ci \
+            python examples/pre/langchain_rag_agent.py --output-dir /out
+          test -f /tmp/container-out-pre/rag-case-a-approved-brief.md

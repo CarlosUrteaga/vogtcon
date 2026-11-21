@@ -205,7 +205,111 @@ Y el archivo corregido publicado en el intento 2 del Caso D (`/tmp/vogtcon-rag-f
 
 ---
 
-## 5. Pruebas de Regresión y Entorno
+## 5. Registro Histórico de Validación (Hito 2 - macOS x86_64, Obsoleto)
 
-- **Entorno probado:** `CPython 3.12.11` (`macosx_x86_64`), `langchain==1.5.0`, `langchain-core==1.8.1`, `langchain-huggingface==1.2.3`, `sentence-transformers==4.1.0`, `transformers==4.49.0`, `torch==2.2.2`, `numpy==1.26.4`, `sentence-transformers/all-MiniLM-L6-v2` (revisión `c9745ed1d9f207416be6d2e6f8de32d1f16199bf`).
-- **Tests:** `161` pruebas en verde en `tests/` (`143` existentes + `18` en [tests/test_langchain_rag_agent.py](../tests/test_langchain_rag_agent.py), incluyendo modos `advisory`, `strict`, contrabando de citas, *prompt injection* y `tool_error`) y `sh tests/smoke_wheel_consumer.sh` en verde.
+> [!NOTE]
+> Este registro se conserva únicamente como referencia histórica del entorno original de Hito 2. Ese entorno utilizaba `torch==2.2.2` sobre macOS Intel, el cual presenta 26 vulnerabilidades conocidas y fue reemplazado por el entorno seguro de referencia Linux x86_64 (Sección 6).
+
+- **Entorno histórico probado:** `CPython 3.12.11` (`macosx_x86_64`), `langchain==1.5.0`, `langchain-core==1.8.1`, `langchain-huggingface==1.2.3`, `sentence-transformers==4.1.0`, `transformers==4.49.0`, `torch==2.2.2`, `numpy==1.26.4`, `sentence-transformers/all-MiniLM-L6-v2` (revisión `c9745ed1d9f207416be6d2e6f8de32d1f16199bf`).
+- **Tests históricos:** `161` pruebas en verde en `tests/` (`143` existentes + `18` en [tests/test_langchain_rag_agent.py](../tests/test_langchain_rag_agent.py), incluyendo modos `advisory`, `strict`, contrabando de citas, *prompt injection* y `tool_error`) y `sh tests/smoke_wheel_consumer.sh` en verde.
+
+---
+
+## 6. Entorno Seguro de Referencia RAG (Linux x86_64, PyTorch CPU y Contenedor Intel)
+
+### 6.1. Justificación y Decisión de Plataforma
+
+La consulta de seguridad de Dependabot reveló 26 alertas abiertas asociadas al stack RAG original (`torch==2.2.2` y `transformers==4.49.0`), incluyendo la vulnerabilidad crítica [GHSA-53q9-r3pm-6pq6](https://github.com/advisories/GHSA-53q9-r3pm-6pq6) en PyTorch (`<2.6.0`) y vulnerabilidades subsecuentes (`<2.13.0`).
+
+Dado que PyTorch [descontinuó los binarios oficiales para macOS x86_64](https://dev-discuss.pytorch.org/t/pytorch-macos-x86-builds-deprecation-starting-january-2024/1690) tras la versión 2.2.2, actualizar PyTorch a versiones seguras (≥2.13.0 / `2.15.0+cpu`) no es compatible de forma nativa en macOS Intel. Por ello:
+1. **Entorno de referencia obligatorio:** Linux `x86_64`, CPython 3.12, PyTorch CPU (`torch==2.15.0+cpu`), con resolución completa y reproducible de dependencias directas y transitivas con hashes SHA-256 (`examples/requirements-langchain-rag.txt`).
+2. **Stack acoplado HuggingFace:** `transformers==5.23.0`, `sentence-transformers==5.6.0`, `huggingface-hub==1.33.0`, `tokenizers==0.23.3`, `numpy==1.26.4`.
+3. **macOS Intel (Darwin x86_64):** Detección temprana (`check_rag_platform()`) antes de cualquier importación de librerías ML. Ejecución mediante contenedor `linux/amd64` ([examples/Dockerfile.rag](Dockerfile.rag)) o máquina Linux remota vía [scripts/run_rag.sh](../scripts/run_rag.sh).
+4. **Aislamiento del núcleo de Vogtcon:** `vogtcon` se instala sin dependencias en el entorno RAG (`--no-deps`), garantizando que la librería base siga libre de dependencias ML en `pyproject.toml` y `uv.lock`.
+
+### 6.2. Preparación y Validación Criptográfica del Modelo
+
+Para garantizar operación 100% offline y prevenir ejecución remota de código en deserialización de checkpoints:
+- El script [scripts/prepare_rag_model.py](../scripts/prepare_rag_model.py) descarga de forma estricta únicamente archivos `*.json`, `*.txt` y `*.safetensors`, excluyendo y rechazando cualquier peso serializado con Pickle (`.bin`, `.pt`, `.pth`, `.pkl`).
+- Genera el inventario criptográfico `vogtcon_snapshot_manifest.json` con tamaño en bytes y digest SHA-256 de cada archivo del snapshot.
+- La función `verify_prepared_embedding_snapshot()` valida dicho manifiesto y los archivos en disco antes de inicializar `HuggingFaceEmbeddings`.
+- La carga exige explícitamente CPU, archivos locales y Safetensors mediante `model_kwargs={"use_safetensors": True, "local_files_only": True, "trust_remote_code": False}` anidado.
+
+### 6.3. Comandos de Reproducción y Validación
+
+#### En Linux x86_64 (o CI):
+```bash
+# Verificar consistencia de los lockfiles compilados con hashes
+bash scripts/compile_rag_requirements.sh --check
+
+# Preparar snapshot verificado
+python scripts/prepare_rag_model.py --output-dir sentence-transformers/all-MiniLM-L6-v2
+
+# Ejecutar suite de pruebas RAG offline
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+
+# Ejecutar CLIs
+python examples/langchain_rag_agent.py --output-dir /tmp/vogtcon-rag-final --log /tmp/vogtcon-rag-final.jsonl
+python examples/pre/langchain_rag_agent.py --output-dir /tmp/vogtcon-rag-pre
+```
+
+#### En macOS Intel mediante contenedor:
+```bash
+# Ejecutar suite de pruebas en contenedor linux/amd64 sin red
+bash scripts/run_rag.sh --container test
+
+# Ejecutar ejemplo gobernado con salida en /tmp/vogtcon-rag-output
+bash scripts/run_rag.sh --container governed
+
+# Ejecutar ejemplo pre con salida en /tmp/vogtcon-rag-output
+bash scripts/run_rag.sh --container pre
+```
+
+### 6.4. Resultados de Verificación en CI (GitHub Actions)
+
+Los resultados observados y verificados en GitHub Actions (Workflow CI, Runs [44847723175](https://github.com/CarlosUrteaga/vogtcon/actions/runs/44847723175) y [44848376776](https://github.com/CarlosUrteaga/vogtcon/actions/runs/44848376776)):
+
+| Trabajo / Job | Entorno | Duración | Estado | Evidencia y Hallazgos |
+| :--- | :--- | :--- | :--- | :--- |
+| **LangChain RAG (Python 3.12)** | `ubuntu-latest` (Linux x86_64), Python 3.12, PyTorch CPU | 1m 14s | ✅ Aprobado | Consistencia `--check` verificada; backend de construcción `setuptools>=77.0.3` instalado; `pip-audit --strict` reportó **0 vulnerabilidades**; 27/27 pruebas RAG ejecutadas 100% offline; validación de CLIs final y pre; prueba de consumidor con rueda (.whl) exitosa en `site-packages`. |
+| **LangChain RAG Linux Container (AMD64)** | `ubuntu-latest`, Docker Buildx `linux/amd64` | 2m 39s | ✅ Aprobado | Construcción reproducible con digest inmutable `sha256:0f0861...`; usuario sin privilegios `appuser` (UID 1001); `uv pip check` en verde; suite completa de 27 pruebas ejecutada con `--network none`; validación de briefs exportados en volumen `/out`. |
+| **core and CFDI (Python 3.11, 3.12, 3.13)** | `ubuntu-latest`, matrices 3.11, 3.12, 3.13 | 1m 05s | ✅ Aprobado | Suite central de pruebas de `vogtcon` intacta y en verde en todas las versiones soportadas; prueba de consumidor externo de rueda (`tests/smoke_wheel_consumer.sh`) aprobada en Python 3.13. |
+
+#### Conciliación de Vulnerabilidades de Dependabot
+
+La auditoría estricta de dependencias con `pip-audit` (`pip-audit --strict --no-deps -r rag-audit-requirements.txt --format json`) sobre el entorno virtual Linux de referencia congelado (`torch==2.15.0+cpu`, `transformers==5.23.0`, `sentence-transformers==5.6.0`, `huggingface-hub==1.33.0`, `tokenizers==0.23.3`, `numpy==1.26.4`, `langchain==1.5.0`, `langchain-core==1.8.1`, `langsmith==0.16.0`) reportó **0 vulnerabilidades conocidas**.
+
+En relación con las 26 alertas de seguridad de la línea base de Dependabot:
+1. **22 alertas con versión de parche declarada (`first_patched_version`):** Quedan cubiertas por las versiones actualizadas en el lockfile:
+   - Alerta #11 [CRÍTICA] `GHSA-53q9-r3pm-6pq6` (`torch < 2.6.0`): Mitigada por `torch==2.15.0+cpu`.
+   - Alerta #27 [ALTA] `GHSA-63cw-57p8-fm3p` (`torch < 2.10.0`): Mitigada por `torch==2.15.0+cpu`.
+   - Alertas #21, #22, #24 [ALTAS] `GHSA-29pf-2h5f-8g72`, `GHSA-fgcw-684q-jj6r`, `GHSA-xrqw-3rrv-vx5w` (`transformers < 5.3.0 / 5.5.0 / 5.10.0`): Mitigadas por `transformers==5.23.0`.
+   - 17 alertas adicionales de severidad media y baja en `torch` y `transformers` con parches declarados.
+2. **4 alertas sin versión de parche declarada en la línea base:**
+   - Alerta #26 [ALTA] `GHSA-x9r9-c232-4q39` (`transformers >= 4.49.0, <= 5.8.1`)
+   - Alerta #17 [MEDIA] `GHSA-f4hp-rmr7-r7v8` (`torch <= 2.6.0`)
+   - Alerta #16 [BAJA] `GHSA-c678-jfcj-6jmf` (`torch <= 2.6.0`)
+   - Alerta #18 [BAJA] `GHSA-x3gm-94wq-g975` (`torch <= 2.6.0`)
+
+   Estas 4 vulnerabilidades se sitúan **fuera de los rangos de versiones afectados publicados** bajo `torch==2.15.0+cpu` y `transformers==5.23.0`, sin atribuirles un parche formal no confirmado. Su cierre formal definitivo queda sujeto a la reevaluación automatizada de Dependabot una vez que los cambios se integren a `main` (el reporte limpio de `pip-audit` no sustituye dicha reevaluación de Dependabot en GitHub).
+
+### 6.5. Validación Real en macOS Intel con Contenedor (Colima + Docker)
+
+Se ejecutó la validación física en el equipo local macOS Intel (`Darwin x86_64`) utilizando **Colima (v0.10.3)** y el motor **Docker (v29.10.0)** (`mountType: virtiofs` compartiendo `$HOME`):
+
+1. **Construcción de imagen inmutable:** La imagen `vogtcon-rag:latest` se construyó exitosamente a partir de [examples/Dockerfile.rag](Dockerfile.rag) sobre plataforma `linux/amd64`.
+2. **Suite de pruebas completa offline:**
+   ```bash
+   bash scripts/run_rag.sh --container test
+   ```
+   Resultado: **27/27 pruebas aprobadas** (18 de integración RAG gobernada + 9 de seguridad, manifiesto y plataforma) ejecutadas en 23.9s bajo aislamiento de red estricto (`--network none`).
+3. **Resolución de ruta relativa y montaje de volumen (`governed`):**
+   ```bash
+   bash scripts/run_rag.sh --container --output-dir rel-governed governed
+   ```
+   Resultado: Código de salida 0; resolución automática de la ruta relativa `rel-governed` a ruta física absoluta del host en `-v <abs_path>:/out`; generación de briefs markdown (`rag-case-a-approved-brief.md`, `rag-case-d-replan-brief.md`) verificada en el host macOS con permisos de usuario intactos.
+4. **Resolución de ruta relativa y montaje de volumen (`pre`):**
+   ```bash
+   bash scripts/run_rag.sh --container --output-dir rel-pre pre
+   ```
+   Resultado: Código de salida 0; generación de los 4 briefs del agente sin gobernanza (`rag-case-a-approved-brief.md`, `rag-case-b-invalid-citation-brief.md`, `rag-case-c-unapproved-brief.md`, `rag-case-d-replan-brief.md`) verificada en el host macOS dentro de `rel-pre/`.
