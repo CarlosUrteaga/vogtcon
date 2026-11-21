@@ -267,7 +267,7 @@ bash scripts/run_rag.sh --container pre
 
 ### 6.4. Resultados de Verificación en CI (GitHub Actions)
 
-Los resultados observados y verificados en GitHub Actions (Workflow CI, Run [44847723175](https://github.com/CarlosUrteaga/vogtcon/actions/runs/44847723175) sobre el commit `c83652f`):
+Los resultados observados y verificados en GitHub Actions (Workflow CI, Runs [44847723175](https://github.com/CarlosUrteaga/vogtcon/actions/runs/44847723175) y [44848376776](https://github.com/CarlosUrteaga/vogtcon/actions/runs/44848376776)):
 
 | Trabajo / Job | Entorno | Duración | Estado | Evidencia y Hallazgos |
 | :--- | :--- | :--- | :--- | :--- |
@@ -277,7 +277,18 @@ Los resultados observados y verificados en GitHub Actions (Workflow CI, Run [448
 
 #### Conciliación de Vulnerabilidades de Dependabot
 
-La ejecución estricta de `pip-audit` (`pip-audit --strict --no-deps -r rag-audit-requirements.txt --format json`) sobre las dependencias congeladas del entorno Linux de referencia (`torch==2.15.0+cpu`, `transformers==5.23.0`, `sentence-transformers==5.6.0`, `huggingface-hub==1.33.0`, `tokenizers==0.23.3`, `numpy==1.26.4`, `langchain==1.5.0`, `langchain-core==1.8.1`, `langsmith==0.16.0`) confirmó la **remediación completa de las 26 vulnerabilidades de la línea base**, incluyendo:
-- `GHSA-53q9-r3pm-6pq6` (Crítica, PyTorch `<2.6.0`) — Mitigada por `torch==2.15.0+cpu`.
-- `GHSA-x9r9-c232-4q39` (Alta, Transformers `<5.0.0`) — Mitigada por `transformers==5.23.0`.
-- 24 vulnerabilidades adicionales de severidad alta, moderada y baja documentadas en la línea base de seguridad.
+La auditoría estricta de dependencias con `pip-audit` (`pip-audit --strict --no-deps -r rag-audit-requirements.txt --format json`) sobre el entorno virtual Linux de referencia congelado (`torch==2.15.0+cpu`, `transformers==5.23.0`, `sentence-transformers==5.6.0`, `huggingface-hub==1.33.0`, `tokenizers==0.23.3`, `numpy==1.26.4`, `langchain==1.5.0`, `langchain-core==1.8.1`, `langsmith==0.16.0`) reportó **0 vulnerabilidades conocidas**.
+
+En relación con las 26 alertas de seguridad de la línea base de Dependabot:
+1. **22 alertas con versión de parche declarada (`first_patched_version`):** Quedan cubiertas por las versiones actualizadas en el lockfile:
+   - Alerta #11 [CRÍTICA] `GHSA-53q9-r3pm-6pq6` (`torch < 2.6.0`): Mitigada por `torch==2.15.0+cpu`.
+   - Alerta #27 [ALTA] `GHSA-63cw-57p8-fm3p` (`torch < 2.10.0`): Mitigada por `torch==2.15.0+cpu`.
+   - Alertas #21, #22, #24 [ALTAS] `GHSA-29pf-2h5f-8g72`, `GHSA-fgcw-684q-jj6r`, `GHSA-xrqw-3rrv-vx5w` (`transformers < 5.3.0 / 5.5.0 / 5.10.0`): Mitigadas por `transformers==5.23.0`.
+   - 17 alertas adicionales de severidad media y baja en `torch` y `transformers` con parches declarados.
+2. **4 alertas sin versión de parche declarada en la línea base:**
+   - Alerta #26 [ALTA] `GHSA-x9r9-c232-4q39` (`transformers >= 4.49.0, <= 5.8.1`)
+   - Alerta #17 [MEDIA] `GHSA-f4hp-rmr7-r7v8` (`torch <= 2.6.0`)
+   - Alerta #16 [BAJA] `GHSA-c678-jfcj-6jmf` (`torch <= 2.6.0`)
+   - Alerta #18 [BAJA] `GHSA-x3gm-94wq-g975` (`torch <= 2.6.0`)
+
+   Estas 4 vulnerabilidades se sitúan **fuera de los rangos de versiones afectados publicados** bajo `torch==2.15.0+cpu` y `transformers==5.23.0`, sin atribuirles un parche formal no confirmado. Su cierre formal definitivo queda sujeto a la reevaluación automatizada de Dependabot una vez que los cambios se integren a `main` (el reporte limpio de `pip-audit` no sustituye dicha reevaluación de Dependabot en GitHub).
