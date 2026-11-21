@@ -19,6 +19,39 @@ updates:
       python-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+    # RAG ML packages are isolated to /examples and maintained via pip lockfiles.
+    ignore:
+      - dependency-name: "torch"
+      - dependency-name: "transformers"
+      - dependency-name: "sentence-transformers"
+      - dependency-name: "huggingface-hub"
+      - dependency-name: "tokenizers"
+      - dependency-name: "langchain"
+      - dependency-name: "langchain-core"
+      - dependency-name: "langchain-huggingface"
+      - dependency-name: "langgraph"
+
+  - package-ecosystem: "pip"
+    directory: "/examples"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Mexico_City"
+    cooldown:
+      default-days: 30
+    open-pull-requests-limit: 5
+    groups:
+      rag-ml-stack:
+        patterns:
+          - "torch"
+          - "transformers"
+          - "sentence-transformers"
+          - "huggingface-hub"
+          - "tokenizers"
+          - "langchain*"
+          - "langgraph*"
+          - "numpy"
 
   - package-ecosystem: "github-actions"
     directory: "/"

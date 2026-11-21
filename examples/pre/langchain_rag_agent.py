@@ -17,8 +17,44 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import re
-from typing import Any
+import sys
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+
+def check_rag_platform() -> None:
+    """Validate that the host platform supports the RAG execution environment.
+
+    Official PyTorch CPU binary support for macOS x86_64 was deprecated after 2.2.2.
+    The Vogtcon RAG reference environment requires Linux x86_64 with Python 3.12.
+    On macOS Intel (Darwin x86_64), native execution is not supported; use the
+    Linux container image (examples/Dockerfile.rag) or a remote Linux x86_64 environment.
+    """
+    if sys.platform == "darwin" and platform.machine() in ("x86_64", "AMD64"):
+        msg = (
+            "ERROR: Native RAG execution is not supported on macOS Intel (Darwin x86_64).\n"
+            "Official PyTorch CPU binaries for macOS x86_64 were deprecated after version 2.2.2,\n"
+            "and newer versions (>=2.13.0) required to address security advisories are only\n"
+            "available for Linux x86_64 and macOS ARM64.\n\n"
+            "To run the RAG agent on macOS Intel, use the Linux reference environment:\n"
+            "  1. Using Docker/Podman container (linux/amd64):\n"
+            "     bash scripts/run_rag.sh --container governed\n"
+            "     bash scripts/run_rag.sh --container pre\n"
+            "     bash scripts/run_rag.sh --container test\n"
+            "  2. Or run directly on a remote Linux x86_64 machine with Python 3.12.\n"
+        )
+        if __name__ == "__main__":
+            sys.stderr.write(msg)
+            sys.exit(2)
+        raise RuntimeError(msg)
+
+
+if __name__ == "__main__":
+    check_rag_platform()
 
 from langchain.agents import create_agent
 from langchain_core.documents import Document
@@ -28,7 +64,6 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
-from langchain_huggingface import HuggingFaceEmbeddings
 
 # Suppress verbose offline tokenizer / embedding notices
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -88,21 +123,159 @@ def load_frozen_corpus(
     return manifest_data, documents
 
 
-def default_local_embeddings() -> HuggingFaceEmbeddings:
-    """Return offline HuggingFace embeddings backed by local cached files."""
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+SNAPSHOT_MANIFEST_FILENAME = "vogtcon_snapshot_manifest.json"
+DEFAULT_MODEL_DIR = Path(
+    os.environ.get(
+        "VOGTCON_RAG_MODEL_DIR",
+        Path(__file__).resolve().parents[1] / "sentence-transformers" / "all-MiniLM-L6-v2",
+    )
+)
+ALLOWED_SNAPSHOT_EXTENSIONS = {".json", ".txt", ".safetensors"}
+FORBIDDEN_SNAPSHOT_EXTENSIONS = {".bin", ".pt", ".pth", ".pkl"}
+
+
+def verify_prepared_embedding_snapshot(
+    model_dir: Path,
+    expected_model: str = EMBEDDING_MODEL_NAME,
+    expected_revision: str = EMBEDDING_REVISION,
+) -> dict[str, Any]:
+    """Verify that model_dir contains a valid vogtcon_snapshot_manifest.json and verified files."""
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"Model directory does not exist: {model_dir}")
+
+    manifest_path = model_dir / SNAPSHOT_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise ValueError(f"Snapshot manifest missing: {manifest_path}")
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Invalid snapshot manifest JSON: {exc}") from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError("Snapshot manifest must be a JSON object")
+
+    model_name = manifest.get("model_name")
+    if model_name != expected_model:
+        raise ValueError(
+            f"Snapshot model_name mismatch: expected '{expected_model}', got '{model_name}'"
+        )
+
+    revision = manifest.get("revision")
+    if revision != expected_revision:
+        raise ValueError(
+            f"Snapshot revision mismatch: expected '{expected_revision}', got '{revision}'"
+        )
+
+    files_manifest = manifest.get("files")
+    if not isinstance(files_manifest, dict) or not files_manifest:
+        raise ValueError("Snapshot manifest must contain a non-empty 'files' mapping")
+
+    has_safetensors = False
+    found_files: set[str] = set()
+
+    for path in model_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        rel_path = path.relative_to(model_dir).as_posix()
+        if rel_path == SNAPSHOT_MANIFEST_FILENAME or rel_path.startswith(".cache/"):
+            continue
+        if path.name == ".DS_Store":
+            continue
+
+        suffix = path.suffix.lower()
+        if suffix in FORBIDDEN_SNAPSHOT_EXTENSIONS:
+            raise ValueError(
+                f"Forbidden weight format '{suffix}' detected: {rel_path}"
+            )
+        if suffix not in ALLOWED_SNAPSHOT_EXTENSIONS:
+            raise ValueError(
+                f"Disallowed file format '{suffix}' detected: {rel_path}"
+            )
+        if suffix == ".safetensors":
+            has_safetensors = True
+
+        if rel_path not in files_manifest:
+            raise ValueError(
+                f"Unlisted file found in model directory: {rel_path}"
+            )
+
+        found_files.add(rel_path)
+
+        expected_entry = files_manifest[rel_path]
+        expected_size = expected_entry.get("size")
+        actual_size = path.stat().st_size
+        if expected_size != actual_size:
+            raise ValueError(
+                f"File size mismatch for {rel_path}: expected {expected_size}, got {actual_size}"
+            )
+
+        expected_sha = expected_entry.get("sha256")
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if expected_sha != actual_sha:
+            raise ValueError(
+                f"SHA-256 mismatch for {rel_path}: expected {expected_sha}, got {actual_sha}"
+            )
+
+    if not has_safetensors:
+        raise ValueError("Snapshot does not contain any .safetensors files")
+
+    for rel_path in files_manifest:
+        if rel_path not in found_files:
+            raise ValueError(f"Snapshot file missing from disk: {rel_path}")
+
+    return manifest
+
+
+def default_local_embeddings(
+    model_dir: Path | None = None,
+) -> HuggingFaceEmbeddings:
+    """Return offline HuggingFace embeddings backed by local verified snapshot."""
+    check_rag_platform()
+
+    if model_dir is not None:
+        target_dir = Path(model_dir).resolve()
+    elif os.environ.get("VOGTCON_RAG_MODEL_DIR"):
+        target_dir = Path(os.environ["VOGTCON_RAG_MODEL_DIR"]).resolve()
+    elif Path("sentence-transformers/all-MiniLM-L6-v2").is_dir():
+        target_dir = Path("sentence-transformers/all-MiniLM-L6-v2").resolve()
+    else:
+        target_dir = DEFAULT_MODEL_DIR.resolve()
+
+    verify_prepared_embedding_snapshot(
+        target_dir,
+        expected_model=EMBEDDING_MODEL_NAME,
+        expected_revision=EMBEDDING_REVISION,
+    )
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    from langchain_huggingface import HuggingFaceEmbeddings
+
     return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={"local_files_only": True},
+        model_name=str(target_dir),
+        model_kwargs={
+            "device": "cpu",
+            "local_files_only": True,
+            "trust_remote_code": False,
+            "revision": EMBEDDING_REVISION,
+            "model_kwargs": {
+                "use_safetensors": True,
+                "local_files_only": True,
+                "trust_remote_code": False,
+            },
+        },
     )
 
 
 def build_vector_store(
     documents: Sequence[Document],
     embeddings: Embeddings | None = None,
+    model_dir: Path | None = None,
 ) -> InMemoryVectorStore:
     """Index verified documents in an in-memory vector store."""
-    emb = embeddings or default_local_embeddings()
+    emb = embeddings or default_local_embeddings(model_dir=model_dir)
     vector_store = InMemoryVectorStore(embedding=emb)
     vector_store.add_documents(documents=list(documents))
     return vector_store

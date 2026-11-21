@@ -160,7 +160,15 @@ La telemetría también es opcional. Pasa `TelemetryObserver` al controlador y m
 
 ### Otros ejemplos en el repositorio
 
-- **LangChain RAG ([examples/langchain_rag_agent.py](examples/langchain_rag_agent.py)):** Demuestra que el núcleo de `vogtcon` es agnóstico del framework. Gobierna un agente `create_agent` de LangChain con embeddings offline de HuggingFace y un vector store en memoria bajo checkpoints pre, runtime y post. Requiere instalar [`examples/requirements-langchain-rag.txt`](examples/requirements-langchain-rag.txt).
+- **LangChain RAG ([examples/langchain_rag_agent.py](examples/langchain_rag_agent.py)):** Demuestra que el núcleo de `vogtcon` es agnóstico del framework. Gobierna un agente `create_agent` de LangChain con embeddings offline de HuggingFace y un vector store en memoria bajo checkpoints pre, runtime y post.
+  - **Entorno de referencia:** Linux `x86_64` con Python 3.12 y PyTorch CPU (`examples/requirements-langchain-rag.txt`).
+  - **macOS Intel (Darwin x86_64):** La ejecución nativa se detiene con código 2 ya que PyTorch descontinuó los binarios oficiales para macOS x86_64 después de la versión 2.2.2. Para ejecutar el ejemplo o sus pruebas en macOS Intel, usa el contenedor oficial:
+    ```bash
+    bash scripts/run_rag.sh --container governed
+    bash scripts/run_rag.sh --container pre
+    bash scripts/run_rag.sh --container test
+    ```
+    O ejecuta directamente en una máquina o VM remota Linux `x86_64` con Python 3.12. Consulta más detalles en [Reporte RAG](examples/REPORTE_LANGCHAIN_RAG.md).
 - **Consumo offline de CFDI ([examples/cfdi_agent.py](examples/cfdi_agent.py)):** Demostración de negocio con un ledger local gobernado para conciliar transacciones sintéticas y facturas de forma determinista y offline. **No es un validador fiscal ni consulta al SAT**; procesa hechos locales bajo políticas de la aplicación. Requiere instalar [`examples/requirements-cfdi.txt`](examples/requirements-cfdi.txt).
 
 ## Estado y límites
