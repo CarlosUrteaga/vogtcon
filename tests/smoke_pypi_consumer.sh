@@ -7,9 +7,9 @@ repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
-# 1. Crear entorno virtual aislado e instalar vogtcon==0.1.0 desde PyPI
+# 1. Crear entorno virtual aislado e instalar vogtcon==0.2.0 desde PyPI
 "$repository/.venv/bin/python" -m venv "$scratch/venv"
-"$scratch/venv/bin/pip" install --quiet "vogtcon==0.1.0"
+"$scratch/venv/bin/pip" install --quiet "vogtcon==0.2.0"
 
 # 2. Prueba de consumo base con wheel_consumer.py (contratos v1 y v2)
 mkdir "$scratch/base_consumer"
@@ -54,6 +54,6 @@ assert all(results[c]["ledger_rows"] == 0 for c in "BCDE")
 assert all(results[c]["trace_id"] for c in "ABCDE")
 assert len([e for e in events if e.get("event") == "input_rejected"]) == 2
 assert not any(n.startswith("tools.enforcement") for n in sys.modules)
-print("Installed PyPI vogtcon==0.1.0 CFDI consumer: A allowed, B-E blocked, F rejected; network disabled; OK")
+print("Installed PyPI vogtcon==0.2.0 CFDI consumer: A allowed, B-E blocked, F rejected; network disabled; OK")
 PY
 )
