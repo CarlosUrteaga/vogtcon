@@ -70,18 +70,28 @@ if controller.state == "active":
 
 The example copies the contract fingerprint from the YAML for convenience. In an integration, obtain the observed identity, roles and approvals from trusted application sources. Treat the model’s claims as untrusted. The note example computes `verified_output` from what the tool actually saved.
 
+### Execution lifecycle
+
 ```mermaid
 sequenceDiagram
     participant A as Application
     participant C as WorkflowController
     participant T as Tool
-    A->>C: execute(proposal, context, tool)
-    alt Allow or warn
-        C->>T: Call tool
-        T-->>C: Result
-        C-->>A: executed=True
-    else Block or abort
-        C-->>A: Return the decision without calling the tool (executed=False)
+    A->>C: begin(context)
+    opt Run is active
+        A->>C: execute(proposal, context, tool)
+        alt allow / allow_with_warning
+            C->>T: Invoke tool
+            T-->>C: Result
+            C-->>A: executed=True
+        else block
+            C-->>A: Skip tool, allow a new proposal
+        else abort
+            C-->>A: Skip tool, abort run
+        end
+        opt Run is active
+            A->>C: finish(context, response)
+        end
     end
 ```
 

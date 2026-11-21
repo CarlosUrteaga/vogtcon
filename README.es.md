@@ -68,18 +68,28 @@ if controller.state == "active":
 
 Para simplificar el ejemplo, la huella del contrato se toma del propio YAML. Al integrarlo en tu aplicación, obtén la identidad observada, los roles y las aprobaciones de fuentes de confianza. Trata las afirmaciones del modelo como datos sin verificar. En el ejemplo de las notas, la aplicación calcula `verified_output` a partir de lo que guardó la herramienta.
 
+### Ciclo de vida de la ejecución
+
 ```mermaid
 sequenceDiagram
     participant A as Aplicación
     participant C as WorkflowController
     participant T as Herramienta
-    A->>C: execute(proposal, context, tool)
-    alt Permitir o advertir
-        C->>T: Invocar la herramienta
-        T-->>C: Resultado
-        C-->>A: executed=True
-    else Bloquear o abortar
-        C-->>A: Devolver la decisión sin invocar la herramienta (executed=False)
+    A->>C: begin(context)
+    opt Ejecución activa
+        A->>C: execute(proposal, context, tool)
+        alt allow / allow_with_warning
+            C->>T: Invocar la herramienta
+            T-->>C: Resultado
+            C-->>A: executed=True
+        else block
+            C-->>A: Omitir la llamada y permitir otra propuesta
+        else abort
+            C-->>A: Omitir la llamada y abortar la ejecución
+        end
+        opt Ejecución activa
+            A->>C: finish(context, response)
+        end
     end
 ```
 
