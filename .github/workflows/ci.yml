@@ -132,24 +132,24 @@ jobs:
 
       - name: Prepare pinned embedding model for offline tests
         run: |
-          uv run --python .venv-rag/bin/python scripts/prepare_rag_model.py \
+          .venv-rag/bin/python scripts/prepare_rag_model.py \
             --output-dir sentence-transformers/all-MiniLM-L6-v2
 
       - name: Run RAG integration tests offline
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-        run: uv run --python .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+        run: .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
 
       - name: Validate governed and pre RAG CLIs
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
         run: |
-          uv run --python .venv-rag/bin/python examples/langchain_rag_agent.py --output-dir /tmp/ci-rag-briefs --log /tmp/ci-rag-events.jsonl
+          .venv-rag/bin/python examples/langchain_rag_agent.py --output-dir /tmp/ci-rag-briefs --log /tmp/ci-rag-events.jsonl
           test -f /tmp/ci-rag-briefs/rag-case-a-approved-brief.md
           test -f /tmp/ci-rag-events.jsonl
-          uv run --python .venv-rag/bin/python examples/pre/langchain_rag_agent.py --output-dir /tmp/ci-rag-pre-briefs
+          .venv-rag/bin/python examples/pre/langchain_rag_agent.py --output-dir /tmp/ci-rag-pre-briefs
           test -f /tmp/ci-rag-pre-briefs/rag-case-a-approved-brief.md
 
       - name: Test installed wheel as consumer in RAG environment
@@ -162,7 +162,7 @@ jobs:
           uv pip install --python .venv-rag/bin/python --no-deps dist/*.whl
           uv pip check --python .venv-rag/bin/python
           .venv-rag/bin/python -c "import vogtcon; assert 'site-packages' in vogtcon.__file__, f'Unexpected: {vogtcon.__file__}'"
-          uv run --python .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
+          .venv-rag/bin/python -m unittest discover -s tests -p 'test_langchain_rag_agent.py' -q
 
   rag-container:
     name: LangChain RAG Linux Container (AMD64)
