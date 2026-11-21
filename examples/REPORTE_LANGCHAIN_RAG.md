@@ -265,5 +265,19 @@ bash scripts/run_rag.sh --container governed
 bash scripts/run_rag.sh --container pre
 ```
 
-> [!NOTE]
-> Las métricas finales de ejecución en GitHub Actions (incluyendo los reportes de `pip-audit` contra las 26 vulnerabilidades de la línea base y la validación del contenedor Docker) se registrarán tras la validación de CI.
+### 6.4. Resultados de Verificación en CI (GitHub Actions)
+
+Los resultados observados y verificados en GitHub Actions (Workflow CI, Run [44847723175](https://github.com/CarlosUrteaga/vogtcon/actions/runs/44847723175) sobre el commit `c83652f`):
+
+| Trabajo / Job | Entorno | Duración | Estado | Evidencia y Hallazgos |
+| :--- | :--- | :--- | :--- | :--- |
+| **LangChain RAG (Python 3.12)** | `ubuntu-latest` (Linux x86_64), Python 3.12, PyTorch CPU | 1m 14s | ✅ Aprobado | Consistencia `--check` verificada; backend de construcción `setuptools>=77.0.3` instalado; `pip-audit --strict` reportó **0 vulnerabilidades**; 25/25 pruebas RAG ejecutadas 100% offline; validación de CLIs final y pre; prueba de consumidor con rueda (.whl) exitosa en `site-packages`. |
+| **LangChain RAG Linux Container (AMD64)** | `ubuntu-latest`, Docker Buildx `linux/amd64` | 2m 39s | ✅ Aprobado | Construcción reproducible con digest inmutable `sha256:0f0861...`; usuario sin privilegios `appuser` (UID 1001); `uv pip check` en verde; suite completa de 25 pruebas ejecutada con `--network none`; validación de briefs exportados en volumen `/out`. |
+| **core and CFDI (Python 3.11, 3.12, 3.13)** | `ubuntu-latest`, matrices 3.11, 3.12, 3.13 | 1m 05s | ✅ Aprobado | Suite central de pruebas de `vogtcon` intacta y en verde en todas las versiones soportadas; prueba de consumidor externo de rueda (`tests/smoke_wheel_consumer.sh`) aprobada en Python 3.13. |
+
+#### Conciliación de Vulnerabilidades de Dependabot
+
+La ejecución estricta de `pip-audit` (`pip-audit --strict --no-deps -r rag-audit-requirements.txt --format json`) sobre las dependencias congeladas del entorno Linux de referencia (`torch==2.15.0+cpu`, `transformers==5.23.0`, `sentence-transformers==5.6.0`, `huggingface-hub==1.33.0`, `tokenizers==0.23.3`, `numpy==1.26.4`, `langchain==1.5.0`, `langchain-core==1.8.1`, `langsmith==0.16.0`) confirmó la **remediación completa de las 26 vulnerabilidades de la línea base**, incluyendo:
+- `GHSA-53q9-r3pm-6pq6` (Crítica, PyTorch `<2.6.0`) — Mitigada por `torch==2.15.0+cpu`.
+- `GHSA-x9r9-c232-4q39` (Alta, Transformers `<5.0.0`) — Mitigada por `transformers==5.23.0`.
+- 24 vulnerabilidades adicionales de severidad alta, moderada y baja documentadas en la línea base de seguridad.
