@@ -6,6 +6,10 @@ version: 2
 updates:
   - package-ecosystem: "uv"
     directory: "/"
+    # Keep root uv focused on pyproject.toml and uv.lock; /examples manifests
+    # are managed separately below or via scripts/compile_rag_requirements.sh.
+    exclude-paths:
+      - "examples/**"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -19,20 +23,16 @@ updates:
       python-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
-    # RAG ML packages are isolated to /examples and maintained via pip lockfiles.
-    ignore:
-      - dependency-name: "torch"
-      - dependency-name: "transformers"
-      - dependency-name: "sentence-transformers"
-      - dependency-name: "huggingface-hub"
-      - dependency-name: "tokenizers"
-      - dependency-name: "langchain"
-      - dependency-name: "langchain-core"
-      - dependency-name: "langchain-huggingface"
-      - dependency-name: "langgraph"
 
   - package-ecosystem: "pip"
     directory: "/examples"
+    # Keep automated pip updates for examples/requirements-cfdi.txt only.
+    # RAG lockfiles are maintained from their .in manifests via
+    # scripts/compile_rag_requirements.sh (uv 0.8.23, CPU backend, SHA-256 hashes)
+    # and verified by CI (--check); Dependabot security alerts still apply.
+    exclude-paths:
+      - "**/requirements-langchain-rag.*"
+      - "**/requirements-rag-build.*"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -42,16 +42,9 @@ updates:
       default-days: 30
     open-pull-requests-limit: 5
     groups:
-      rag-ml-stack:
-        patterns:
-          - "torch"
-          - "transformers"
-          - "sentence-transformers"
-          - "huggingface-hub"
-          - "tokenizers"
-          - "langchain*"
-          - "langgraph*"
-          - "numpy"
+      cfdi-example:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
