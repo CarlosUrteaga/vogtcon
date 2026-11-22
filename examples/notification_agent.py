@@ -72,6 +72,7 @@ def run_notification(
     context_provider: Callable[[], ExecutionContext] | None = None,
     recorder: RunRecorder | None = None,
     run_ledger: dict[str, object] | None = None,
+    agent: NotificationAgent | None = None,
 ) -> NotificationRun:
     """Run up to two proposals through synchronous checkpoints.
 
@@ -83,6 +84,7 @@ def run_notification(
     post-execution check when the active run reaches ``finish``. ``runtime``
     reports the last performed attempt.
     A proposal for another tool raises ``ValueError`` before its checkpoint.
+    Supply ``agent`` to observe or customize proposals; the default is unchanged.
     """
     selected_contract = (
         load_contract(CONTRACT_PATH).contract if contract is None else contract
@@ -94,7 +96,8 @@ def run_notification(
     if controller.state != "active":
         return NotificationRun(pre, None, None, controller.state)
 
-    proposal = NotificationAgent().propose(message, sensitive=sensitive)
+    selected_agent = NotificationAgent() if agent is None else agent
+    proposal = selected_agent.propose(message, sensitive=sensitive)
     last_context = context
 
     def dispatch(action: ActionProposal) -> ToolExecutionOutcome[str]:

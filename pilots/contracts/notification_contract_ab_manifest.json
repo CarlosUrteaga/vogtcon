@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "pilot_id": "notification-contract-ab",
+  "pilot_revision": 1,
+  "implementation_base_revision": "d6a378abbdd53286bd34bc314c70a5f83bdd7da8",
+  "policy": {
+    "mode": "guarded"
+  },
+  "variants": {
+    "A": {
+      "contract_path": "pilots/contracts/notification_without_approval_v2.yaml",
+      "schema_version": 2,
+      "contract_id": "example.notification",
+      "contract_fingerprint": "sha256:ec00757eba141427b274f01800c9179c15f6e261f763b4d553027068f7d24667",
+      "file_sha256": "169f59d8df77e7eb6afb34ab4f5acef83bab6535df71c9174600b5433666c566"
+    },
+    "B": {
+      "contract_path": "examples/notification_contract_v2.yaml",
+      "schema_version": 2,
+      "contract_id": "example.notification",
+      "contract_fingerprint": "sha256:ad61db75c5b4ba43868b51cf287180e7b79adf846a012611178ff6382c692cff",
+      "file_sha256": "5c89e5aeb4692ec3440653198935c3d0c5d321f33735dda56800470cc2e0b271"
+    }
+  }
+}
