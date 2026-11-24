@@ -11,6 +11,10 @@ Vogtcon es una biblioteca experimental de Python que comprueba si las llamadas a
 
 Requiere Python 3.11 o posterior. Instala la biblioteca desde PyPI con `python -m pip install vogtcon`. Si tu aplicación usa Pydantic AI, instala las dependencias opcionales con `python -m pip install "vogtcon[pydantic-ai]"`.
 
+## Validar un contrato
+
+Desde un directorio que contenga un contrato de Vogtcon, ejecuta `vogtcon validate contrato.yaml`. Agrega `--json` para obtener una salida estructurada en scripts o CI.
+
 ## Probar la integración
 
 Desde la raíz del repositorio clonado, ejecuta el ejemplo que guarda notas. Utiliza un modelo con respuestas programadas y funciona sin credenciales de un proveedor.
@@ -134,7 +138,7 @@ sh tests/smoke_wheel_consumer.sh
 
 Las pruebas que dependen del repositorio de evaluación lo localizan mediante `GOVERNOR_BENCHMARK_ROOT`. El piloto exploratorio abarca los escenarios `S-001`, `S-013` y `S-016` en los cuatro modos. El [programa del piloto](pilots/benchmark_probe.py) realiza cuatro ejecuciones por defecto y acepta `--scenarios` y `--modes` para seleccionar las doce. Las diferencias entre el manifiesto y la copia del repositorio limitan las comparaciones históricas.
 
-El paquete ofrece una API de Python. Los programas de línea de comandos son ejemplos. Las pruebas automáticas usan modelos con respuestas programadas. El paquete carece de un registro distribuido y de un evaluador basado en un modelo de lenguaje. Los reportes históricos usan el nombre anterior `governor_contracts`.
+Las pruebas automáticas usan modelos con respuestas programadas. El paquete carece de un registro distribuido y de un evaluador basado en un modelo de lenguaje. Los reportes históricos usan el nombre anterior `governor_contracts`.
 
 ## Licencia
 
