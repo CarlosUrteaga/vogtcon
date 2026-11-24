@@ -11,9 +11,36 @@ Vogtcon es una biblioteca experimental de Python que comprueba si las llamadas a
 
 Requiere Python 3.11 o posterior. Instala la biblioteca desde PyPI con `python -m pip install vogtcon`. Si tu aplicación usa Pydantic AI, instala las dependencias opcionales con `python -m pip install "vogtcon[pydantic-ai]"`.
 
-## Validar un contrato
+## Interfaz de línea de comandos
 
-Desde un directorio que contenga un contrato de Vogtcon, ejecuta `vogtcon validate contrato.yaml`. Agrega `--json` para obtener una salida estructurada en scripts o CI.
+Vogtcon incluye una CLI local, de solo lectura y sin conexión (`vogtcon --help`, `vogtcon --version`) para validar contratos y explicar registros de decisiones sin invocar modelos, ejecutar herramientas ni realizar llamadas de red:
+
+```bash
+vogtcon validate contrato.yaml [--json]
+vogtcon explain decisiones.jsonl [--run-id <id>] [--json]
+```
+
+- **Salida legible vs. JSON.** Sin `--json`, los resultados se escriben en `stdout` y los errores en `stderr`; el formato de texto no es una API estable. Con `--json`, toda invocación válida emite un único objeto JSON (`output_version: 1`) en `stdout` —incluso ante errores de validación, registro o E/S— sin texto diagnóstico adicional. Un error de sintaxis en los argumentos escribe el uso en `stderr`, deja `stdout` vacío y termina con código `3`.
+- **`vogtcon validate <contrato.yaml> [--json]`** valida un contrato v1 o v2 contra el `RuleCatalog` predeterminado. Un contrato v2 válido informa una huella verificada (`verified: true`); un contrato v1 informa su huella declarada con `verified: false` (incluido `no_contract` con `validation_phases: "not_enforced"`).
+- **`vogtcon explain <decisiones.jsonl> [--run-id <id>] [--json]`** valida cada línea no vacía del archivo JSONL en UTF-8 como un registro `RunEvent` v1, conserva el orden físico de los eventos por ejecución, correlaciona cada intento mediante `(run_id, action_index)` e informa `trace_integrity` (`complete`, `partial` o `inconsistent`). Usa `--run-id` para inspeccionar una sola ejecución; la validación de formato línea por línea sigue aplicando a todo el archivo.
+
+### Códigos de salida
+
+| Código | `vogtcon validate` | `vogtcon explain` |
+| --- | --- | --- |
+| `0` | `valid` — contrato válido. | `ok` — registro coherente `complete` o `partial` (incluidos `block`, `abort`, `allow_with_warning`, `tool_error` o eventos de cierre/punto de control ausentes). |
+| `1` | `invalid_contract` — YAML/JSON malformado, versión no soportada, error de esquema, fases faltantes o discrepancia en la huella v2. | `invalid_log` (archivo vacío, UTF-8 inválido o línea `RunEvent` inválida) o `inconsistent_log` (contradicción semántica en alguna ejecución seleccionada). |
+| `2` | `unsupported_rules` — identificador de regla fuera del `RuleCatalog` predeterminado (requiere un `RuleCatalog` proporcionado por la aplicación). | `run_not_found` — el `--run-id` solicitado no existe en un registro por lo demás válido. |
+| `3` | `io_error` (archivo inexistente o ilegible) o uso inválido de la CLI. | `io_error` (archivo inexistente o ilegible) o uso inválido de la CLI. |
+
+### Alcance de la evidencia
+
+`vogtcon explain` informa únicamente lo que demuestra el registro `RunEvent` v1:
+
+- Los registros `RunEvent` v1 no contienen datos de carga: no incluyen argumentos de herramientas, resultados, prompts ni concesiones de aprobación del host.
+- Un `allow` (o `allow_with_warning`) posterior sobre el mismo `tool_name` (`prior_same_tool_block_action_index`) solo señala un `block` previo en ese nombre de herramienta; **no** demuestra argumentos idénticos ni autorización del host.
+- `tool_completed` confirma únicamente que la función retornó (`effect_evidence: "not_verified"` para la entrega externa).
+- `tool_error` o la ausencia de un evento finalizador dejan el efecto externo como `indeterminate`.
 
 ## Probar la integración
 
@@ -129,7 +156,7 @@ bash scripts/run_rag.sh --container test
 
 ## Desarrollo y pruebas
 
-Después de preparar el entorno con el comando `uv sync` anterior, ejecuta las pruebas del controlador y comprueba que otro entorno pueda instalar y usar el paquete en formato wheel.
+Después de preparar el entorno con el comando `uv sync` anterior, ejecuta las pruebas del controlador y `sh tests/smoke_wheel_consumer.sh` para comprobar en un entorno separado tanto el consumo del paquete wheel en Python como los comandos instalados `vogtcon validate` y `vogtcon explain` de la CLI.
 
 ```bash
 uv run --no-sync python -m unittest discover -s tests -p 'test_execution.py'

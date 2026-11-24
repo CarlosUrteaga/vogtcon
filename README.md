@@ -13,9 +13,36 @@ Requires Python 3.11 or later. Install the core library from PyPI with `python -
 
 <a name="probar-la-integración"></a>
 
-## Validate a contract
+## Command-line interface
 
-From a directory containing a Vogtcon contract, run `vogtcon validate contract.yaml`. Add `--json` for structured output in scripts or CI.
+Vogtcon provides a local, read-only, offline CLI (`vogtcon --help`, `vogtcon --version`) for validating contracts and explaining decision logs without invoking models, executing tools, or making network requests:
+
+```bash
+vogtcon validate contract.yaml [--json]
+vogtcon explain decisions.jsonl [--run-id <id>] [--json]
+```
+
+- **Human-readable vs. JSON output.** Without `--json`, results are written to `stdout` and errors to `stderr`; human-readable text is not a stable API. With `--json`, valid invocations emit a single JSON object (`output_version: 1`) on `stdout`—including on validation, log, or I/O errors—with no extra diagnostic text. Invalid CLI syntax writes usage to `stderr`, leaves `stdout` empty, and exits with `3`.
+- **`vogtcon validate <contract.yaml> [--json]`** validates a v1 or v2 contract against the default `RuleCatalog`. A valid v2 contract reports a verified fingerprint (`verified: true`); a v1 contract reports its declared fingerprint as `verified: false` (including `no_contract` with `validation_phases: "not_enforced"`).
+- **`vogtcon explain <decisions.jsonl> [--run-id <id>] [--json]`** parses every non-empty line in the UTF-8 JSONL log as a `RunEvent` v1 record, preserves physical event order per run, correlates actions by `(run_id, action_index)`, and reports `trace_integrity` (`complete`, `partial`, or `inconsistent`). Use `--run-id` to inspect a single run; line-level format validation still applies to the entire file.
+
+### Exit codes
+
+| Code | `vogtcon validate` | `vogtcon explain` |
+| --- | --- | --- |
+| `0` | `valid` — contract is valid. | `ok` — coherent `complete` or `partial` log (including `block`, `abort`, `allow_with_warning`, `tool_error`, or missing checkpoints/finalizers). |
+| `1` | `invalid_contract` — malformed YAML/JSON, unsupported version, schema mismatch, missing phases, or v2 fingerprint mismatch. | `invalid_log` (empty file, invalid UTF-8, or invalid `RunEvent` line) or `inconsistent_log` (semantic contradiction in a selected run). |
+| `2` | `unsupported_rules` — rule ID outside the default `RuleCatalog` (requires a host-supplied `RuleCatalog`). | `run_not_found` — requested `--run-id` is absent from an otherwise valid log. |
+| `3` | `io_error` (file missing or unreadable) or invalid CLI usage. | `io_error` (file missing or unreadable) or invalid CLI usage. |
+
+### Evidence scope
+
+`vogtcon explain` reports only what the `RunEvent` v1 log proves:
+
+- `RunEvent` v1 logs are content-free: they contain no tool arguments, tool results, prompts, or host approval grants.
+- A subsequent `allow` (or `allow_with_warning`) on the same `tool_name` (`prior_same_tool_block_action_index`) only indicates an earlier `block` on that tool name; it does **not** prove identical arguments or host authorization.
+- `tool_completed` confirms only that the callable returned (`effect_evidence: "not_verified"` for external delivery).
+- `tool_error` or a missing finalizer leaves the external effect `indeterminate`.
 
 ## Try the integration
 
@@ -131,7 +158,7 @@ bash scripts/run_rag.sh --container test
 
 ## Development and tests
 
-After setting up the checkout with the `uv sync` command above, run the controller tests and verify that a separate environment can consume the built wheel.
+After setting up the checkout with the `uv sync` command above, run the controller tests and run `sh tests/smoke_wheel_consumer.sh` to verify in a separate environment both the Python wheel consumer and the installed `vogtcon validate` and `vogtcon explain` CLI commands.
 
 ```bash
 uv run --no-sync python -m unittest discover -s tests -p 'test_execution.py'
