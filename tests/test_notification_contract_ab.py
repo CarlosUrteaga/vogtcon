@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -296,7 +297,7 @@ class NotificationContractEvidenceTests(unittest.TestCase):
                 self.assertEqual(manifest["variant"], "B")
                 self.assertEqual(manifest["policy"], {"mode": "guarded"})
                 self.assertEqual(manifest["agent_fingerprint"], "notification-agent-v1")
-                self.assertEqual(manifest["library"]["version"], "0.2.0")
+                self.assertEqual(manifest["library"]["version"], version("vogtcon"))
                 self.assertEqual(manifest["library"]["module_path"], str(Path(pilot.vogtcon.__file__).resolve()))
                 library_dir = Path(manifest["library"]["module_path"]).parent
                 self.assertIn("module_paths", manifest["library"])
