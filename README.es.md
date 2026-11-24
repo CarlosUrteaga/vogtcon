@@ -3,7 +3,7 @@ SPDX-License-Identifier: Apache-2.0 -->
 
 # Vogtcon
 
-[English](README.md) · Español
+[English](https://github.com/CarlosUrteaga/vogtcon/blob/main/README.md) · Español
 
 Vogtcon es una biblioteca experimental de Python que comprueba si las llamadas a herramientas que propone un agente cumplen un contrato YAML. Por ejemplo, el agente puede pedir que se envíe una notificación sensible, pero la aplicación determina si hay aprobación. Vogtcon evalúa las reglas antes de invocar la herramienta. Su evaluador predeterminado es determinista y funciona con independencia de la biblioteca usada para crear el agente.
 
@@ -27,13 +27,13 @@ El agente solicita dos veces que se guarde la misma nota pública. Observa los c
 | `False` | `block` | La lista de notas guardadas queda vacía. |
 | `True` | `allow` | La lista contiene una nota pública. |
 
-El ejemplo añade las decisiones de cada ejecución a `note-events.jsonl`. Agrega `--trace-console` al segundo comando para ver las trazas de OpenTelemetry. [Código del ejemplo](examples/custom_agent.py) · [Contrato de las notas](examples/custom_contract.yaml)
+El ejemplo añade las decisiones de cada ejecución a `note-events.jsonl`. Agrega `--trace-console` al segundo comando para ver las trazas de OpenTelemetry. [Código del ejemplo](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/custom_agent.py) · [Contrato de las notas](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/custom_contract.yaml)
 
 ## Conectar una herramienta
 
 Crea un `WorkflowController` por ejecución. Llama a `begin` antes de iniciar el agente, pasa cada propuesta de uso de una herramienta a `execute` y llama a `finish` con la respuesta final de la aplicación mientras el controlador siga en estado `active`. Si expones una herramienta directamente al agente, sus llamadas quedan fuera de estas comprobaciones.
 
-Este ejemplo se ejecuta desde la raíz del repositorio y solo requiere el paquete principal. Imprime `block []` porque la notificación es sensible y la aplicación no ha concedido la aprobación. [Contrato de notificaciones](examples/notification_contract_v2.yaml)
+Este ejemplo se ejecuta desde la raíz del repositorio y solo requiere el paquete principal. Imprime `block []` porque la notificación es sensible y la aplicación no ha concedido la aprobación. [Contrato de notificaciones](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/notification_contract_v2.yaml)
 
 ```python
 from vogtcon import ActionProposal, EnforcementPolicy, ExecutionContext, WorkflowController
@@ -95,7 +95,7 @@ sequenceDiagram
 
 ## Elegir el modo de ejecución
 
-El contrato v2 define las reglas. La aplicación debe indicar una `EnforcementPolicy` en cada ejecución. Los [contratos v1](examples/notification_contract.yaml) guardan el modo en el YAML y se pueden cargar sin pasar una política por separado.
+El contrato v2 define las reglas. La aplicación debe indicar una `EnforcementPolicy` en cada ejecución. Los [contratos v1](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/notification_contract.yaml) guardan el modo en el YAML y se pueden cargar sin pasar una política por separado.
 
 | Modo | Decisión ante una propuesta de uso de herramienta | Qué ocurre después |
 | --- | --- | --- |
@@ -110,12 +110,12 @@ Consulta `controller.state` después de `begin` y de cada llamada a `execute`. E
 
 Pasa `recorder=JsonlDecisionLog(path)` al crear el controlador para registrar las decisiones en un archivo JSONL local. El controlador escribe la decisión en disco antes de invocar la herramienta. Si la escritura falla, se omite la llamada. Si la propia herramienta lanza una excepción, sus efectos pueden quedar sin confirmar. El registro está pensado para ejecuciones secuenciales en un solo proceso.
 
-Para obtener trazas, pasa un `TelemetryObserver` al controlador y envuelve la ejecución en `with telemetry.run(run_id, contract_id)`. La aplicación configura el exportador de OpenTelemetry. El campo `trace_id` vincula cada traza con sus registros de decisión. Para definir reglas con `RuleCatalog` o usar `GovernedToolExecutor` cuando tu aplicación ya gestiona el ciclo de ejecución, consulta la [guía de integración](INTEGRACION.md).
+Para obtener trazas, pasa un `TelemetryObserver` al controlador y envuelve la ejecución en `with telemetry.run(run_id, contract_id)`. La aplicación configura el exportador de OpenTelemetry. El campo `trace_id` vincula cada traza con sus registros de decisión. Para definir reglas con `RuleCatalog` o usar `GovernedToolExecutor` cuando tu aplicación ya gestiona el ciclo de ejecución, consulta la [guía de integración](https://github.com/CarlosUrteaga/vogtcon/blob/main/INTEGRACION.md).
 
 ## Más ejemplos
 
-- **Generación aumentada por recuperación (RAG) con LangChain.** El agente recupera documentos de un índice vectorial en memoria y aplica el contrato antes de publicar un informe. El entorno de referencia usa Linux x86_64, Python 3.12 y PyTorch para CPU. En un Mac con procesador Intel, usa Docker o Podman para ejecutar el agente con contrato, la versión de referencia y las pruebas con los comandos de abajo. La primera compilación descarga las dependencias y el modelo. Después, el contenedor funciona sin conexión. [Agente](examples/langchain_rag_agent.py) · [Dependencias fijadas](examples/requirements-langchain-rag.txt) · [Reporte](examples/REPORTE_LANGCHAIN_RAG.md)
-- **Facturación electrónica mexicana (CFDI).** El ejemplo concilia facturas y movimientos bancarios sintéticos con registros locales. Funciona sin conexión y muestra cómo aplicar las reglas de la aplicación. La validación fiscal y las consultas al SAT quedan fuera de su alcance. [Agente](examples/cfdi_agent.py) · [Dependencias](examples/requirements-cfdi.txt) · [Reporte](examples/REPORTE_CFDI_SAT.md)
+- **Generación aumentada por recuperación (RAG) con LangChain.** El agente recupera documentos de un índice vectorial en memoria y aplica el contrato antes de publicar un informe. El entorno de referencia usa Linux x86_64, Python 3.12 y PyTorch para CPU. En un Mac con procesador Intel, usa Docker o Podman para ejecutar el agente con contrato, la versión de referencia y las pruebas con los comandos de abajo. La primera compilación descarga las dependencias y el modelo. Después, el contenedor funciona sin conexión. [Agente](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/langchain_rag_agent.py) · [Dependencias fijadas](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/requirements-langchain-rag.txt) · [Reporte](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/REPORTE_LANGCHAIN_RAG.md)
+- **Facturación electrónica mexicana (CFDI).** El ejemplo concilia facturas y movimientos bancarios sintéticos con registros locales. Funciona sin conexión y muestra cómo aplicar las reglas de la aplicación. La validación fiscal y las consultas al SAT quedan fuera de su alcance. [Agente](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/cfdi_agent.py) · [Dependencias](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/requirements-cfdi.txt) · [Reporte](https://github.com/CarlosUrteaga/vogtcon/blob/main/examples/REPORTE_CFDI_SAT.md)
 
 ```bash
 bash scripts/run_rag.sh --container governed
@@ -132,10 +132,10 @@ uv run --no-sync python -m unittest discover -s tests -p 'test_execution.py'
 sh tests/smoke_wheel_consumer.sh
 ```
 
-Las pruebas que dependen del repositorio de evaluación lo localizan mediante `GOVERNOR_BENCHMARK_ROOT`. El piloto exploratorio abarca los escenarios `S-001`, `S-013` y `S-016` en los cuatro modos. El [programa del piloto](pilots/benchmark_probe.py) realiza cuatro ejecuciones por defecto y acepta `--scenarios` y `--modes` para seleccionar las doce. Las diferencias entre el manifiesto y la copia del repositorio limitan las comparaciones históricas.
+Las pruebas que dependen del repositorio de evaluación lo localizan mediante `GOVERNOR_BENCHMARK_ROOT`. El piloto exploratorio abarca los escenarios `S-001`, `S-013` y `S-016` en los cuatro modos. El [programa del piloto](https://github.com/CarlosUrteaga/vogtcon/blob/main/pilots/benchmark_probe.py) realiza cuatro ejecuciones por defecto y acepta `--scenarios` y `--modes` para seleccionar las doce. Las diferencias entre el manifiesto y la copia del repositorio limitan las comparaciones históricas.
 
-El paquete ofrece una API de Python. Los programas de línea de comandos son ejemplos. Las pruebas automáticas usan modelos con respuestas programadas. El paquete carece de un registro distribuido y de un evaluador basado en un modelo de lenguaje. Los reportes históricos usan el nombre anterior `governor_contracts`.
+El paquete ofrece una API de Python y el comando local `vogtcon validate` para comprobar contratos. Las pruebas automáticas usan modelos con respuestas programadas. El paquete carece de un registro distribuido y de un evaluador basado en un modelo de lenguaje. Los reportes históricos usan el nombre anterior `governor_contracts`.
 
 ## Licencia
 
-[Licencia Apache 2.0](LICENSE)
+[Licencia Apache 2.0](https://github.com/CarlosUrteaga/vogtcon/blob/main/LICENSE)
