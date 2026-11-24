@@ -15,7 +15,7 @@ from typing import Any, Sequence
 import yaml
 from pydantic import ValidationError
 
-from .cli_trace import explain_log_file
+from .cli_trace import analyze_log_file
 from .contracts import _UnsupportedContractRules, load_contract
 from .models import ContractRulesV2
 
@@ -126,7 +126,12 @@ def _format_violations(violations: list[str] | None) -> str:
     return f"violations: {', '.join(violations)}"
 
 
-def render_explain_text(code: int, result: dict[str, Any]) -> str:
+def render_explain_text(
+    code: int,
+    result: dict[str, Any],
+    *,
+    tool_events: dict[tuple[str, int], str] | None = None,
+) -> str:
     path = result["path"]
     data = result.get("data")
     diagnostics = result.get("diagnostics", [])
@@ -174,8 +179,21 @@ def render_explain_text(code: int, result: dict[str, Any]) -> str:
             outcome = act["tool_outcome"]
             evidence = act["effect_evidence"]
             if act["tool_event_sequence"] is not None:
-                ev_name = "tool_completed" if outcome == "completed" else "tool_error"
-                note = "callable returned; external delivery not verified" if outcome == "completed" else "tool raised error; effect indeterminate"
+                if outcome == "completed":
+                    ev_name = "tool_completed"
+                    note = "callable returned; external delivery not verified"
+                elif outcome == "error":
+                    ev_name = "tool_error"
+                    note = "tool raised error; effect indeterminate"
+                else:
+                    recorded_ev = tool_events.get((run_id, idx)) if tool_events else None
+                    ev_name = recorded_ev or "tool_event"
+                    if recorded_ev == "tool_completed":
+                        note = "callable returned without recorded decision; effect indeterminate"
+                    elif recorded_ev == "tool_error":
+                        note = "tool raised error without recorded decision; effect indeterminate"
+                    else:
+                        note = "tool event recorded without decision; effect indeterminate"
                 lines.append(
                     f"  {act['tool_event_sequence']}  action {idx:<3}  {ev_name}  {note} ({evidence})"
                 )
@@ -277,11 +295,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return code
 
     if args.command == "explain":
-        code, result = explain_log_file(args.log_path, run_id=args.run_id)
+        code, result, tool_events = analyze_log_file(args.log_path, run_id=args.run_id)
         if args.as_json:
             print(json.dumps(result, indent=2))
         else:
-            out = render_explain_text(code, result)
+            out = render_explain_text(code, result, tool_events=tool_events)
             if code == 0:
                 print(out)
             else:

@@ -580,3 +580,214 @@ class TestCliExplain(unittest.TestCase):
         self.assertEqual(first[0], 0)
         self.assertEqual(json.loads(first[1])["path"], dotted_path)
         self.assertEqual(self.log_path.read_bytes(), raw)
+
+    def _write_events(self, events: list[RunEvent]) -> None:
+        self.log_path.write_text(
+            "\n".join(ev.model_dump_json() for ev in events) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_explain_rejects_events_after_terminal_abort(self) -> None:
+        cases = [
+            (
+                "strict_pre_violation_then_post",
+                [
+                    RunEvent(
+                        run_id="term-1", sequence=1, contract_id="c1", mode="strict",
+                        phase="pre_execution", event_type="decision",
+                        violation_rules=["agent.identity_required"],
+                    ),
+                    RunEvent(
+                        run_id="term-1", sequence=2, contract_id="c1", mode="strict",
+                        phase="post_execution", event_type="decision",
+                    ),
+                ],
+            ),
+            (
+                "runtime_abort_then_post",
+                [
+                    RunEvent(
+                        run_id="term-2", sequence=1, contract_id="c1", mode="strict",
+                        phase="pre_execution", event_type="decision",
+                    ),
+                    RunEvent(
+                        run_id="term-2", sequence=2, contract_id="c1", mode="strict",
+                        phase="runtime", event_type="decision", action_index=1,
+                        tool_name="t", decision="abort", violation_rules=["r1"],
+                    ),
+                    RunEvent(
+                        run_id="term-2", sequence=3, contract_id="c1", mode="strict",
+                        phase="post_execution", event_type="decision",
+                    ),
+                ],
+            ),
+            (
+                "tool_error_then_post",
+                [
+                    RunEvent(
+                        run_id="term-3", sequence=1, contract_id="c1", mode="guarded",
+                        phase="pre_execution", event_type="decision",
+                    ),
+                    RunEvent(
+                        run_id="term-3", sequence=2, contract_id="c1", mode="guarded",
+                        phase="runtime", event_type="decision", action_index=1,
+                        tool_name="t", decision="allow",
+                    ),
+                    RunEvent(
+                        run_id="term-3", sequence=3, contract_id="c1", mode="guarded",
+                        phase="runtime", event_type="tool_error", action_index=1,
+                        tool_name="t", execution_status="unknown",
+                    ),
+                    RunEvent(
+                        run_id="term-3", sequence=4, contract_id="c1", mode="guarded",
+                        phase="post_execution", event_type="decision",
+                    ),
+                ],
+            ),
+        ]
+        for label, events in cases:
+            with self.subTest(case=label):
+                self._write_events(events)
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (1, ""))
+                res = json.loads(out)
+                self.assertEqual(res["status"], "inconsistent_log")
+                self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "inconsistent")
+
+        # Positive control: strict pre_execution violation alone is complete pre_abort
+        self._write_events([
+            RunEvent(
+                run_id="term-ok", sequence=1, contract_id="c1", mode="strict",
+                phase="pre_execution", event_type="decision",
+                violation_rules=["agent.identity_required"],
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "pre_abort")
+
+    def test_explain_text_preserves_tool_completed_on_gap_unknown_outcome(self) -> None:
+        self._write_events([
+            RunEvent(
+                run_id="gap-1", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="gap-1", sequence=3, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="tool_completed", action_index=1,
+                tool_name="send_notification", execution_status="completed",
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        run = json.loads(out)["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertEqual(run["actions"][0]["tool_outcome"], "unknown")
+        self.assertEqual(run["actions"][0]["effect_evidence"], "indeterminate")
+
+        code_t, out_t, err_t = self.run_cli(["explain", str(self.log_path)])
+        self.assertEqual((code_t, err_t), (0, ""))
+        self.assertIn("tool_completed", out_t)
+        self.assertIn("indeterminate", out_t)
+        self.assertNotIn("tool_error", out_t)
+
+    def test_explain_rejects_post_after_unfinalized_allow_without_gap(self) -> None:
+        for label, seqs in (("contiguous", (1, 2, 3)), ("prior_gap_only", (1, 3, 4))):
+            with self.subTest(case=label):
+                self._write_events([
+                    RunEvent(
+                        run_id="unfin", sequence=seqs[0], contract_id="c1", mode="guarded",
+                        phase="pre_execution", event_type="decision",
+                    ),
+                    RunEvent(
+                        run_id="unfin", sequence=seqs[1], contract_id="c1", mode="guarded",
+                        phase="runtime", event_type="decision", action_index=1,
+                        tool_name="t", decision="allow",
+                    ),
+                    RunEvent(
+                        run_id="unfin", sequence=seqs[2], contract_id="c1", mode="guarded",
+                        phase="post_execution", event_type="decision",
+                    ),
+                ])
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (1, ""))
+                res = json.loads(out)
+                self.assertEqual(res["status"], "inconsistent_log")
+                self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "inconsistent")
+
+        # Positive control: gap between allow (2) and post (4) permits unfinalized partial
+        self._write_events([
+            RunEvent(
+                run_id="unfin-ok", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="unfin-ok", sequence=2, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=1,
+                tool_name="t", decision="allow",
+            ),
+            RunEvent(
+                run_id="unfin-ok", sequence=4, contract_id="c1", mode="guarded",
+                phase="post_execution", event_type="decision",
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertEqual(run["actions"][0]["tool_outcome"], "unfinalized")
+
+    def test_explain_requires_gap_in_action_decision_interval(self) -> None:
+        # Exact reviewer case: pre(1) -> block action 1 (3) -> tool_completed action 2 (4)
+        self._write_events([
+            RunEvent(
+                run_id="interval-bad", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="interval-bad", sequence=3, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=1,
+                tool_name="t", decision="block", violation_rules=["r1"],
+            ),
+            RunEvent(
+                run_id="interval-bad", sequence=4, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="tool_completed", action_index=2,
+                tool_name="t", execution_status="completed",
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "inconsistent_log")
+        self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "inconsistent")
+
+        # Positive control: gap at seq 3 inside action 2 interval -> partial, action 2 unknown
+        self._write_events([
+            RunEvent(
+                run_id="interval-ok", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="interval-ok", sequence=2, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=1,
+                tool_name="t", decision="block", violation_rules=["r1"],
+            ),
+            RunEvent(
+                run_id="interval-ok", sequence=4, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="tool_completed", action_index=2,
+                tool_name="t", execution_status="completed",
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertEqual(run["actions"][1]["tool_outcome"], "unknown")
