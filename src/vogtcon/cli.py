@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import defaultdict
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Sequence
@@ -144,11 +145,17 @@ def render_explain_text(
             f"  Error: {message}",
         ])
 
+    diags_by_run: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for diag in diagnostics:
+        diag_run_id = diag.get("run_id")
+        if diag_run_id is not None:
+            diags_by_run[diag_run_id].append(diag)
+
     sections: list[str] = []
     for run in data["runs"]:
         run_id = run["run_id"]
         if run["trace_integrity"] == "inconsistent":
-            run_diags = [d for d in diagnostics if d.get("run_id") == run_id]
+            run_diags = diags_by_run.get(run_id, [])
             lines = [f"{run_id} · inconsistent"]
             for diag in run_diags:
                 loc = f"line {diag['line']}: " if diag.get("line") is not None else ""
@@ -187,6 +194,8 @@ def render_explain_text(
                     note = "tool raised error; effect indeterminate"
                 else:
                     recorded_ev = tool_events.get((run_id, idx)) if tool_events else None
+                    if recorded_ev is None and run.get("terminal") == "tool_error" and act is run["actions"][-1]:
+                        recorded_ev = "tool_error"
                     ev_name = recorded_ev or "tool_event"
                     if recorded_ev == "tool_completed":
                         note = "callable returned without recorded decision; effect indeterminate"
@@ -215,7 +224,11 @@ def render_explain_text(
         sections.append("\n".join(lines))
 
     if code != 0 and diagnostics:
-        diag_lines = [f"Error: {d['message']}" for d in diagnostics if d.get("code") == "inconsistent_log"]
+        diag_lines = [
+            f"Error: {d['message']}"
+            for d in diagnostics
+            if d.get("code") == "inconsistent_log" and d.get("run_id") is None
+        ]
         if diag_lines:
             sections.extend(diag_lines)
 
