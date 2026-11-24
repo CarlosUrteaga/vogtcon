@@ -1164,23 +1164,6 @@ class TestCliExplainStage3(unittest.TestCase):
                     RunEvent(run_id="bad", sequence=2, contract_id="c2", mode="guarded", phase="post_execution", event_type="decision"),
                 ],
             ),
-            (
-                "out_of_order_finalizer_after_later_action",
-                [
-                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
-                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
-                    RunEvent(run_id="bad", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
-                    RunEvent(run_id="bad", sequence=5, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
-                ],
-            ),
-            (
-                "next_action_after_unfinalized_allow_without_gap",
-                [
-                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
-                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
-                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="block"),
-                ],
-            ),
         ]
         for label, events in inconsistent_cases:
             with self.subTest(case=label):
@@ -1364,3 +1347,75 @@ class TestCliExplainStage3(unittest.TestCase):
         self.assertIn("bad-0 · inconsistent", text)
         self.assertIn("bad-1999 · inconsistent", text)
         self.assertIn("line 2000: error 1999", text)
+
+    def test_nested_tool_execution_from_real_controller(self) -> None:
+        controller = WorkflowController.from_contract_path(
+            self.notification_v2,
+            "nested-run",
+            policy=EnforcementPolicy(mode="guarded"),
+            recorder=JsonlDecisionLog(self.log_path),
+        )
+        approved = self._context(controller.contract.contract_fingerprint, approved=True)
+        self.assertEqual(controller.begin(approved).violations, [])
+
+        def outer_tool(_proposal: ActionProposal) -> str:
+            inner_outcome = controller.execute(
+                self._sensitive_proposal(),
+                approved,
+                lambda _inner: "inner-sent",
+            )
+            self.assertTrue(inner_outcome.executed)
+            return "outer-sent"
+
+        outer_outcome = controller.execute(self._sensitive_proposal(), approved, outer_tool)
+        self.assertTrue(outer_outcome.executed)
+        self.assertEqual(controller.finish(approved, {"status": "sent"}).violations, [])
+
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["diagnostics"], [])
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "post_execution")
+        self.assertEqual(run["counts"]["completed"], 2)
+        self.assertEqual(run["actions"][0]["action_index"], 1)
+        self.assertEqual(run["actions"][0]["decision_sequence"], 2)
+        self.assertEqual(run["actions"][0]["tool_event_sequence"], 5)
+        self.assertEqual(run["actions"][0]["tool_outcome"], "completed")
+        self.assertEqual(run["actions"][1]["action_index"], 2)
+        self.assertEqual(run["actions"][1]["decision_sequence"], 3)
+        self.assertEqual(run["actions"][1]["tool_event_sequence"], 4)
+        self.assertEqual(run["actions"][1]["tool_outcome"], "completed")
+
+        # Missing outer finalizer with gap before post -> partial (unfinalized=1, completed=1)
+        self._write_events([
+            RunEvent(run_id="nested-gap", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="nested-gap", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+            RunEvent(run_id="nested-gap", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+            RunEvent(run_id="nested-gap", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=2, tool_name="t", execution_status="completed"),
+            RunEvent(run_id="nested-gap", sequence=6, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code_g, out_g, err_g = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code_g, err_g), (0, ""))
+        res_g = json.loads(out_g)
+        self.assertEqual(res_g["status"], "ok")
+        run_g = res_g["data"]["runs"][0]
+        self.assertEqual(run_g["trace_integrity"], "partial")
+        self.assertEqual(run_g["counts"]["unfinalized"], 1)
+        self.assertEqual(run_g["counts"]["completed"], 1)
+
+        # Missing outer finalizer without gap before post -> inconsistent
+        self._write_events([
+            RunEvent(run_id="nested-bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="nested-bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+            RunEvent(run_id="nested-bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+            RunEvent(run_id="nested-bad", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=2, tool_name="t", execution_status="completed"),
+            RunEvent(run_id="nested-bad", sequence=5, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code_b, out_b, err_b = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code_b, err_b), (1, ""))
+        res_b = json.loads(out_b)
+        self.assertEqual(res_b["status"], "inconsistent_log")
+        self.assertEqual(res_b["data"]["runs"][0]["trace_integrity"], "inconsistent")
