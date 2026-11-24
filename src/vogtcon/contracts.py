@@ -17,6 +17,13 @@ from .rules import DEFAULT_RULE_CATALOG, POSTCONDITIONS, RUNTIME_RULES, RuleCata
 _PHASES = {"pre_execution", "runtime", "post_execution"}
 
 
+class _UnsupportedContractRules(ValueError):
+    def __init__(self, field: str, unknown: set[str]) -> None:
+        self.field = field
+        self.ids = sorted(unknown)
+        super().__init__(f"Unsupported {field}: {', '.join(self.ids)}")
+
+
 def validate_contract_rules(
     contract: AgentContract | ContractRulesV2,
     rule_catalog: RuleCatalog | None = None,
@@ -33,7 +40,7 @@ def validate_contract_rules(
     ):
         unknown = set(getattr(contract, name)) - set(supported)
         if unknown:
-            raise ValueError(f"Unsupported {name}: {', '.join(sorted(unknown))}")
+            raise _UnsupportedContractRules(name, unknown)
     if (isinstance(contract, ContractRulesV2) or contract.mode != "no_contract") and (
         contract.validation_phases == "not_enforced"
         or set(contract.validation_phases) != _PHASES
