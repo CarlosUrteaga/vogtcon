@@ -77,6 +77,31 @@ def _has_gap_between(seq_gaps: list[tuple[int, int]], lower_bound: int, upper_bo
     return idx < len(seq_gaps) and seq_gaps[idx][1] <= upper_bound
 
 
+def _check_prev_action_finalized(
+    run_id: str,
+    act_idx: int,
+    seq: int,
+    line_no: int,
+    actions_order: list[int],
+    actions_map: dict[int, dict[str, Any]],
+    seq_gaps: list[tuple[int, int]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, str]] | None:
+    if not actions_order:
+        return None
+    prev_entry = actions_map[actions_order[-1]]
+    if (
+        prev_entry["decision"] in ("allow", "allow_with_warning")
+        and prev_entry["finalizer_type"] is None
+        and not _has_gap_between(seq_gaps, prev_entry["decision_sequence"], seq)
+    ):
+        return _inconsistent_run(
+            run_id,
+            f"Action {act_idx} started while action {prev_entry['action_index']} lacks a finalizer without a sequence gap",
+            line=line_no,
+        )
+    return None
+
+
 def _classify_outcome(
     decision: str | None,
     finalizer_type: str | None,
@@ -209,6 +234,17 @@ def _analyze_run(
                     )
                 if act_idx > prev_action_index + 1:
                     has_action_gap = True
+            if mode in ("guarded", "strict") and event.violation_rules and event.decision in ("allow", "allow_with_warning"):
+                return _inconsistent_run(
+                    run_id,
+                    f"Decision '{event.decision}' with violations in {mode} mode at line {line_no}",
+                    line=line_no,
+                )
+            unfinalized_err = _check_prev_action_finalized(
+                run_id, act_idx, event.sequence, line_no, actions_order, actions_map, seq_gaps,
+            )
+            if unfinalized_err is not None:
+                return unfinalized_err
             prev_action_index = act_idx
 
             prior_block = last_blocked_by_tool.get(event.tool_name)
@@ -231,6 +267,12 @@ def _analyze_run(
         else:
             # tool_completed or tool_error
             if act_idx in actions_map:
+                if act_idx != actions_order[-1]:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Out-of-order tool event for action {act_idx} after action {actions_order[-1]} at line {line_no}",
+                        line=line_no,
+                    )
                 entry = actions_map[act_idx]
                 if entry["finalizer_type"] is not None:
                     return _inconsistent_run(
@@ -261,6 +303,11 @@ def _analyze_run(
                         f"Non-increasing action_index {act_idx} at line {line_no}",
                         line=line_no,
                     )
+                unfinalized_err = _check_prev_action_finalized(
+                    run_id, act_idx, event.sequence, line_no, actions_order, actions_map, seq_gaps,
+                )
+                if unfinalized_err is not None:
+                    return unfinalized_err
                 if actions_order:
                     prev_entry = actions_map[actions_order[-1]]
                     lower_bound = (

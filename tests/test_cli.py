@@ -830,3 +830,537 @@ class TestCliExplain(unittest.TestCase):
         run = res["data"]["runs"][0]
         self.assertEqual(run["trace_integrity"], "partial")
         self.assertEqual(run["counts"]["unknown"], 2000)
+
+
+class TestCliExplainStage3(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.notification_v2 = self.repo_root / "examples" / "notification_contract_v2.yaml"
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.log_path = Path(workspace.name) / "decisions.jsonl"
+
+    def run_cli(self, args: list[str]) -> tuple[int, str, str]:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = main(args)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def _write_events(self, events: list[RunEvent]) -> None:
+        self.log_path.write_text(
+            "\n".join(ev.model_dump_json() for ev in events) + "\n",
+            encoding="utf-8",
+        )
+
+    def _context(
+        self,
+        contract_fingerprint: str,
+        *,
+        approved: bool,
+        agent: str = "notification-agent-v1",
+    ) -> ExecutionContext:
+        return ExecutionContext(
+            state={"approval_granted": approved},
+            available_tools=["send_notification"],
+            observed_agent_fingerprint=agent,
+            observed_contract_fingerprint=contract_fingerprint,
+        )
+
+    def _sensitive_proposal(self) -> ActionProposal:
+        return ActionProposal(
+            tool_name="send_notification",
+            arguments={"message": "hi", "sensitive": True},
+        )
+
+    def test_e2_valid_terminals_from_real_controller(self) -> None:
+        # 1. tool_error without post_execution
+        controller = WorkflowController.from_contract_path(
+            self.notification_v2,
+            "e2-tool-err",
+            policy=EnforcementPolicy(mode="guarded"),
+            recorder=JsonlDecisionLog(self.log_path),
+        )
+        approved = self._context(controller.contract.contract_fingerprint, approved=True)
+        self.assertEqual(controller.begin(approved).violations, [])
+
+        def explode(_proposal: ActionProposal) -> str:
+            raise RuntimeError("boom")
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            controller.execute(self._sensitive_proposal(), approved, explode)
+
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["diagnostics"], [])
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "tool_error")
+        self.assertIsNone(run["post_execution"])
+        self.assertEqual(run["actions"][0]["tool_outcome"], "error")
+        self.assertEqual(run["actions"][0]["effect_evidence"], "indeterminate")
+        self.assertEqual(run["counts"]["error"], 1)
+
+        # 2. strict pre_abort without post_execution
+        self.log_path.unlink()
+        strict_pre = WorkflowController.from_contract_path(
+            self.notification_v2,
+            "e2-pre-abort",
+            policy=EnforcementPolicy(mode="strict"),
+            recorder=JsonlDecisionLog(self.log_path),
+        )
+        bad_agent = self._context(
+            strict_pre.contract.contract_fingerprint,
+            approved=True,
+            agent="wrong-agent",
+        )
+        self.assertTrue(strict_pre.begin(bad_agent).violations)
+        self.assertEqual(strict_pre.state, "aborted")
+
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["diagnostics"], [])
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "pre_abort")
+        self.assertIsNone(run["pre_execution"]["decision"])
+        self.assertTrue(run["pre_execution"]["violation_rules"])
+        self.assertIsNone(run["post_execution"])
+        self.assertEqual(run["actions"], [])
+
+        # 3. strict runtime_abort without post_execution
+        self.log_path.unlink()
+        strict_rt = WorkflowController.from_contract_path(
+            self.notification_v2,
+            "e2-rt-abort",
+            policy=EnforcementPolicy(mode="strict"),
+            recorder=JsonlDecisionLog(self.log_path),
+        )
+        unapproved = self._context(strict_rt.contract.contract_fingerprint, approved=False)
+        self.assertEqual(strict_rt.begin(unapproved).violations, [])
+        outcome = strict_rt.execute(self._sensitive_proposal(), unapproved, lambda _p: "sent")
+        self.assertFalse(outcome.executed)
+        self.assertEqual(strict_rt.state, "aborted")
+
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["diagnostics"], [])
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "runtime_abort")
+        self.assertIsNone(run["post_execution"])
+        self.assertEqual(run["actions"][0]["decision"], "abort")
+        self.assertEqual(run["actions"][0]["tool_outcome"], "prevented")
+        self.assertEqual(run["actions"][0]["effect_evidence"], "prevented_by_recorded_decision")
+
+    def test_e3_partial_traces_and_diagnostics(self) -> None:
+        # 1. SDD acceptance example: pre(1) -> block act 1 (2) -> allow act 2 (3), no finalizer/post
+        self._write_events([
+            RunEvent(
+                run_id="e3-sdd", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="e3-sdd", sequence=2, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=1,
+                tool_name="send_notification", decision="block", violation_rules=["r1"],
+            ),
+            RunEvent(
+                run_id="e3-sdd", sequence=3, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=2,
+                tool_name="send_notification", decision="allow",
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertIsNone(run["terminal"])
+        self.assertEqual(run["actions"][0]["tool_outcome"], "prevented")
+        self.assertEqual(run["actions"][1]["tool_outcome"], "unfinalized")
+        self.assertEqual(run["actions"][1]["effect_evidence"], "indeterminate")
+        self.assertEqual(run["counts"]["unfinalized"], 1)
+        self.assertTrue(
+            any(d["code"] == "partial_log" and d["run_id"] == "e3-sdd" for d in res["diagnostics"])
+        )
+
+        # Human mode for partial trace: stdout only, exit 0
+        code_h, out_h, err_h = self.run_cli(["explain", str(self.log_path)])
+        self.assertEqual((code_h, err_h), (0, ""))
+        self.assertIn("partial", out_h)
+
+        # 2. Missing pre_execution (both starting at seq 2 and starting at seq 1)
+        for label, seqs in (("missing_seq1", (2, 3)), ("starts_at_seq1", (1, 2))):
+            with self.subTest(case=label):
+                self._write_events([
+                    RunEvent(
+                        run_id="e3-nopre", sequence=seqs[0], contract_id="c1", mode="guarded",
+                        phase="runtime", event_type="decision", action_index=1,
+                        tool_name="t", decision="block", violation_rules=["r1"],
+                    ),
+                    RunEvent(
+                        run_id="e3-nopre", sequence=seqs[1], contract_id="c1", mode="guarded",
+                        phase="post_execution", event_type="decision",
+                    ),
+                ])
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (0, ""))
+                res = json.loads(out)
+                run = res["data"]["runs"][0]
+                self.assertEqual(run["trace_integrity"], "partial")
+                self.assertIsNone(run["pre_execution"])
+                self.assertIsNone(run["post_execution"]["decision"])
+                self.assertEqual(res["diagnostics"][0]["code"], "partial_log")
+
+        # 3. Recoverable action_index gap
+        self._write_events([
+            RunEvent(
+                run_id="e3-gap", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="e3-gap", sequence=2, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=1,
+                tool_name="t", decision="block", violation_rules=["r1"],
+            ),
+            RunEvent(
+                run_id="e3-gap", sequence=4, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=3,
+                tool_name="t", decision="block", violation_rules=["r1"],
+            ),
+            RunEvent(
+                run_id="e3-gap", sequence=5, contract_id="c1", mode="guarded",
+                phase="post_execution", event_type="decision",
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "partial")
+        self.assertEqual(res["diagnostics"][0]["code"], "partial_log")
+
+        # 4. Guarded block without post_execution
+        self._write_events([
+            RunEvent(
+                run_id="e3-nopost", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            RunEvent(
+                run_id="e3-nopost", sequence=2, contract_id="c1", mode="guarded",
+                phase="runtime", event_type="decision", action_index=1,
+                tool_name="t", decision="block", violation_rules=["r1"],
+            ),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertIsNone(run["terminal"])
+        self.assertIsNone(run["post_execution"])
+        self.assertEqual(run["counts"]["prevented"], 1)
+        self.assertEqual(res["diagnostics"][0]["code"], "partial_log")
+
+    def test_e4_inconsistencies_and_mixed_file_preservation(self) -> None:
+        inconsistent_cases = [
+            (
+                "duplicate_sequence",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+            (
+                "descending_sequence",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="block"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+            (
+                "duplicate_post",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+            (
+                "finalizer_after_blocked_attempt_sdd_example",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="block", violation_rules=["r1"]),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="send_notification", decision="allow"),
+                    RunEvent(run_id="bad", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed"),
+                ],
+            ),
+            (
+                "finalizer_after_abort_with_gap",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="strict", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="strict", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="abort", violation_rules=["r1"]),
+                    RunEvent(run_id="bad", sequence=4, contract_id="c1", mode="strict", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                ],
+            ),
+            (
+                "tool_name_mismatch",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="tool_a", decision="allow"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="tool_b", execution_status="completed"),
+                ],
+            ),
+            (
+                "orphan_finalizer_seq1",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                ],
+            ),
+            (
+                "orphan_finalizer_after_pre_no_gap",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                ],
+            ),
+            (
+                "finalizer_before_own_decision",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                    RunEvent(run_id="bad", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                ],
+            ),
+            (
+                "duplicate_decision_same_action",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                ],
+            ),
+            (
+                "duplicate_finalizer_same_action",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                    RunEvent(run_id="bad", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                ],
+            ),
+            (
+                "contract_or_mode_change_within_run",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c2", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+            (
+                "out_of_order_finalizer_after_later_action",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="bad", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+                    RunEvent(run_id="bad", sequence=5, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="t", execution_status="completed"),
+                ],
+            ),
+            (
+                "next_action_after_unfinalized_allow_without_gap",
+                [
+                    RunEvent(run_id="bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="bad", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="bad", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="block"),
+                ],
+            ),
+        ]
+        for label, events in inconsistent_cases:
+            with self.subTest(case=label):
+                self._write_events(events)
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (1, ""))
+                res = json.loads(out)
+                self.assertEqual(res["status"], "inconsistent_log")
+                run = res["data"]["runs"][0]
+                self.assertEqual(run["trace_integrity"], "inconsistent")
+                for null_field in (
+                    "contract_id", "mode", "terminal",
+                    "pre_execution", "post_execution", "actions", "counts",
+                ):
+                    self.assertIsNone(run[null_field])
+                diag = res["diagnostics"][0]
+                self.assertEqual(diag["code"], "inconsistent_log")
+                self.assertEqual(diag["run_id"], "bad")
+                self.assertIsInstance(diag["line"], int)
+                self.assertGreater(diag["line"], 0)
+
+        # Mixed file: coherent run + inconsistent run without --run-id
+        self._write_events([
+            RunEvent(run_id="good-run", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="bad-run", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="good-run", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="block", violation_rules=["r1"]),
+            RunEvent(run_id="bad-run", sequence=1, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+            RunEvent(run_id="good-run", sequence=3, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "inconsistent_log")
+        good, bad = res["data"]["runs"]
+        self.assertEqual(good["run_id"], "good-run")
+        self.assertEqual(good["trace_integrity"], "complete")
+        self.assertEqual(good["counts"]["prevented"], 1)
+        self.assertEqual(bad["run_id"], "bad-run")
+        self.assertEqual(bad["trace_integrity"], "inconsistent")
+        self.assertIsNone(bad["actions"])
+        self.assertIsNone(bad["counts"])
+
+        # Human mode: stderr only, no duplicate diagnostic message
+        code_h, out_h, err_h = self.run_cli(["explain", str(self.log_path)])
+        self.assertEqual((code_h, out_h), (1, ""))
+        self.assertIn("bad-run · inconsistent", err_h)
+        inconsistent_msg = res["diagnostics"][0]["message"]
+        self.assertEqual(err_h.count(inconsistent_msg), 1)
+
+    def test_e5_and_e6_format_errors_with_physical_line_numbers(self) -> None:
+        # 1. Foreign JSONL omits raw secret value
+        self.log_path.write_text(
+            '{"benchmark_event": "step", "secret": "RAW-PRIVATE-TOKEN"}\n',
+            encoding="utf-8",
+        )
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertNotIn("RAW-PRIVATE-TOKEN", out)
+        res = json.loads(out)
+        self.assertEqual(res["status"], "invalid_log")
+        self.assertIsNone(res["data"])
+        self.assertEqual(res["diagnostics"][0]["code"], "invalid_event")
+        self.assertEqual(res["diagnostics"][0]["line"], 1)
+        self.assertIsNone(res["diagnostics"][0]["run_id"])
+
+        code_h, out_h, err_h = self.run_cli(["explain", str(self.log_path)])
+        self.assertEqual((code_h, out_h), (1, ""))
+        self.assertNotIn("RAW-PRIVATE-TOKEN", err_h)
+
+        # 2. Damaged line at physical line 4 after blank line 2; fails even with --run-id run-good
+        ev1 = RunEvent(run_id="run-good", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision")
+        ev2 = RunEvent(run_id="run-good", sequence=2, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision")
+        ev3 = RunEvent(run_id="run-other", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision")
+        self.log_path.write_text(
+            f"{ev1.model_dump_json()}\n\n{ev2.model_dump_json()}\n{{corrupt json\n{ev3.model_dump_json()}\n",
+            encoding="utf-8",
+        )
+        for args in (
+            ["explain", str(self.log_path), "--json"],
+            ["explain", str(self.log_path), "--run-id", "run-good", "--json"],
+        ):
+            with self.subTest(args=args):
+                code, out, err = self.run_cli(args)
+                self.assertEqual((code, err), (1, ""))
+                res = json.loads(out)
+                self.assertEqual(res["status"], "invalid_log")
+                self.assertIsNone(res["data"])
+                self.assertEqual(res["diagnostics"][0]["code"], "invalid_event")
+                self.assertEqual(res["diagnostics"][0]["line"], 4)
+
+        # 3. Unsupported event schema_version on physical line 2
+        bad_ver = json.loads(ev1.model_dump_json())
+        bad_ver["schema_version"] = 2
+        self.log_path.write_text(
+            f"{ev1.model_dump_json()}\n{json.dumps(bad_ver)}\n",
+            encoding="utf-8",
+        )
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        res = json.loads(out)
+        self.assertEqual(res["diagnostics"][0]["code"], "invalid_event")
+        self.assertEqual(res["diagnostics"][0]["line"], 2)
+
+        # 4. Empty and whitespace-only files
+        for content in ("", "  \n\t\n"):
+            with self.subTest(content=repr(content)):
+                self.log_path.write_text(content, encoding="utf-8")
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (1, ""))
+                res = json.loads(out)
+                self.assertEqual(res["status"], "invalid_log")
+                self.assertIsNone(res["data"])
+                self.assertEqual(res["diagnostics"][0]["code"], "empty_log")
+                self.assertIsNone(res["diagnostics"][0]["line"])
+
+        # 5. Invalid UTF-8 bytes
+        self.log_path.write_bytes(b"\xff\xfe\n")
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "invalid_log")
+        self.assertIsNone(res["data"])
+        self.assertEqual(res["diagnostics"][0]["code"], "invalid_event")
+
+    def test_e4_rejects_allow_with_violations_in_enforced_modes(self) -> None:
+        for mode in ("guarded", "strict"):
+            for decision in ("allow", "allow_with_warning"):
+                with self.subTest(mode=mode, decision=decision):
+                    self._write_events([
+                        RunEvent(
+                            run_id="bad-allow", sequence=1, contract_id="c1", mode=mode,
+                            phase="pre_execution", event_type="decision",
+                        ),
+                        RunEvent(
+                            run_id="bad-allow", sequence=2, contract_id="c1", mode=mode,
+                            phase="runtime", event_type="decision", action_index=1,
+                            tool_name="t", decision=decision, violation_rules=["r1"],
+                        ),
+                    ])
+                    code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                    self.assertEqual((code, err), (1, ""))
+                    res = json.loads(out)
+                    self.assertEqual(res["status"], "inconsistent_log")
+                    self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "inconsistent")
+
+    def test_render_explain_text_scales_linearly_on_many_inconsistent_runs(self) -> None:
+        from vogtcon.cli import render_explain_text
+
+        runs = []
+        diagnostics = []
+        for i in range(2000):
+            r_id = f"bad-{i}"
+            runs.append({
+                "run_id": r_id,
+                "contract_id": None,
+                "mode": None,
+                "trace_integrity": "inconsistent",
+                "terminal": None,
+                "pre_execution": None,
+                "post_execution": None,
+                "actions": None,
+                "counts": None,
+            })
+            diagnostics.append({
+                "code": "inconsistent_log",
+                "message": f"error {i}",
+                "line": i + 1,
+                "run_id": r_id,
+            })
+        text = render_explain_text(
+            1,
+            {
+                "output_version": 1,
+                "command": "explain",
+                "status": "inconsistent_log",
+                "path": "many.jsonl",
+                "data": {"runs": runs},
+                "diagnostics": diagnostics,
+            },
+        )
+        self.assertIn("bad-0 · inconsistent", text)
+        self.assertIn("bad-1999 · inconsistent", text)
+        self.assertIn("line 2000: error 1999", text)
