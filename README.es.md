@@ -16,13 +16,15 @@ Requiere Python 3.11 o posterior. Instala la biblioteca desde PyPI con `python -
 Vogtcon incluye una CLI local, de solo lectura y sin conexión (`vogtcon --help`, `vogtcon --version`) para validar contratos y explicar registros de decisiones sin invocar modelos, ejecutar herramientas ni realizar llamadas de red:
 
 ```bash
-vogtcon validate contrato.yaml [--json]
-vogtcon explain decisiones.jsonl [--run-id <id>] [--json]
+vogtcon validate contrato.yaml
+vogtcon explain decisiones.jsonl
 ```
 
+Banderas opcionales: pasa `--json` a cualquiera de los dos comandos para obtener salida JSON estructurada, y `--run-id <run-id>` a `vogtcon explain` para inspeccionar una sola ejecución (por ejemplo, `vogtcon explain decisiones.jsonl --run-id demo-run --json`).
+
 - **Salida legible vs. JSON.** Sin `--json`, los resultados se escriben en `stdout` y los errores en `stderr`; el formato de texto no es una API estable. Con `--json`, toda invocación válida emite un único objeto JSON (`output_version: 1`) en `stdout` —incluso ante errores de validación, registro o E/S— sin texto diagnóstico adicional. Un error de sintaxis en los argumentos escribe el uso en `stderr`, deja `stdout` vacío y termina con código `3`.
-- **`vogtcon validate <contrato.yaml> [--json]`** valida un contrato v1 o v2 contra el `RuleCatalog` predeterminado. Un contrato v2 válido informa una huella verificada (`verified: true`); un contrato v1 informa su huella declarada con `verified: false` (incluido `no_contract` con `validation_phases: "not_enforced"`).
-- **`vogtcon explain <decisiones.jsonl> [--run-id <id>] [--json]`** valida cada línea no vacía del archivo JSONL en UTF-8 como un registro `RunEvent` v1, conserva el orden físico de los eventos por ejecución, correlaciona cada intento mediante `(run_id, action_index)` e informa `trace_integrity` (`complete`, `partial` o `inconsistent`). Usa `--run-id` para inspeccionar una sola ejecución; la validación de formato línea por línea sigue aplicando a todo el archivo.
+- **`vogtcon validate`** valida un archivo de contrato YAML v1 o v2 contra el `RuleCatalog` predeterminado. Un contrato v2 válido informa una huella verificada (`verified: true`); un contrato v1 informa su huella declarada con `verified: false` (incluido `no_contract` con `validation_phases: "not_enforced"`).
+- **`vogtcon explain`** valida cada línea no vacía de un archivo JSONL en UTF-8 como un registro `RunEvent` v1, conserva el orden físico de los eventos por ejecución, correlaciona cada intento mediante `(run_id, action_index)` e informa `trace_integrity` (`complete`, `partial` o `inconsistent`). Al pasar `--run-id`, la validación de formato línea por línea sigue aplicando a todo el archivo.
 
 ### Códigos de salida
 
@@ -39,8 +41,9 @@ vogtcon explain decisiones.jsonl [--run-id <id>] [--json]
 
 - Los registros `RunEvent` v1 no contienen datos de carga: no incluyen argumentos de herramientas, resultados, prompts ni concesiones de aprobación del host.
 - Un `allow` (o `allow_with_warning`) posterior sobre el mismo `tool_name` (`prior_same_tool_block_action_index`) solo señala un `block` previo en ese nombre de herramienta; **no** demuestra argumentos idénticos ni autorización del host.
+- Las acciones bloqueadas (`block`) y abortadas (`pre_abort` / `runtime_abort`) omiten el evento finalizador por diseño (`effect_evidence: "prevented_by_recorded_decision"`).
 - `tool_completed` confirma únicamente que la función retornó (`effect_evidence: "not_verified"` para la entrega externa).
-- `tool_error` o la ausencia de un evento finalizador dejan el efecto externo como `indeterminate`.
+- `tool_error`, o la ausencia de un evento finalizador cuando la decisión registrada permitió la acción (`allow` o `allow_with_warning`), deja el efecto externo como `indeterminate`.
 
 ## Probar la integración
 

@@ -18,13 +18,15 @@ Requires Python 3.11 or later. Install the core library from PyPI with `python -
 Vogtcon provides a local, read-only, offline CLI (`vogtcon --help`, `vogtcon --version`) for validating contracts and explaining decision logs without invoking models, executing tools, or making network requests:
 
 ```bash
-vogtcon validate contract.yaml [--json]
-vogtcon explain decisions.jsonl [--run-id <id>] [--json]
+vogtcon validate contract.yaml
+vogtcon explain decisions.jsonl
 ```
 
+Optional flags: pass `--json` to either command for structured JSON output, and `--run-id <run-id>` to `vogtcon explain` to inspect a single run (for example, `vogtcon explain decisions.jsonl --run-id demo-run --json`).
+
 - **Human-readable vs. JSON output.** Without `--json`, results are written to `stdout` and errors to `stderr`; human-readable text is not a stable API. With `--json`, valid invocations emit a single JSON object (`output_version: 1`) on `stdout`—including on validation, log, or I/O errors—with no extra diagnostic text. Invalid CLI syntax writes usage to `stderr`, leaves `stdout` empty, and exits with `3`.
-- **`vogtcon validate <contract.yaml> [--json]`** validates a v1 or v2 contract against the default `RuleCatalog`. A valid v2 contract reports a verified fingerprint (`verified: true`); a v1 contract reports its declared fingerprint as `verified: false` (including `no_contract` with `validation_phases: "not_enforced"`).
-- **`vogtcon explain <decisions.jsonl> [--run-id <id>] [--json]`** parses every non-empty line in the UTF-8 JSONL log as a `RunEvent` v1 record, preserves physical event order per run, correlates actions by `(run_id, action_index)`, and reports `trace_integrity` (`complete`, `partial`, or `inconsistent`). Use `--run-id` to inspect a single run; line-level format validation still applies to the entire file.
+- **`vogtcon validate`** validates a v1 or v2 contract YAML file against the default `RuleCatalog`. A valid v2 contract reports a verified fingerprint (`verified: true`); a v1 contract reports its declared fingerprint as `verified: false` (including `no_contract` with `validation_phases: "not_enforced"`).
+- **`vogtcon explain`** parses every non-empty line in a UTF-8 JSONL log as a `RunEvent` v1 record, preserves physical event order per run, correlates actions by `(run_id, action_index)`, and reports `trace_integrity` (`complete`, `partial`, or `inconsistent`). When `--run-id` is passed, line-level format validation still applies to the entire file.
 
 ### Exit codes
 
@@ -41,8 +43,9 @@ vogtcon explain decisions.jsonl [--run-id <id>] [--json]
 
 - `RunEvent` v1 logs are content-free: they contain no tool arguments, tool results, prompts, or host approval grants.
 - A subsequent `allow` (or `allow_with_warning`) on the same `tool_name` (`prior_same_tool_block_action_index`) only indicates an earlier `block` on that tool name; it does **not** prove identical arguments or host authorization.
+- Blocked (`block`) and aborted (`pre_abort` / `runtime_abort`) actions omit a tool finalizer by design (`effect_evidence: "prevented_by_recorded_decision"`).
 - `tool_completed` confirms only that the callable returned (`effect_evidence: "not_verified"` for external delivery).
-- `tool_error` or a missing finalizer leaves the external effect `indeterminate`.
+- `tool_error`, or a missing finalizer when the recorded decision allowed the action (`allow` or `allow_with_warning`), leaves the external effect `indeterminate`.
 
 ## Try the integration
 
