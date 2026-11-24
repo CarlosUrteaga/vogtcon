@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import heapq
 from bisect import bisect_left
 from collections import defaultdict
 from pathlib import Path
@@ -77,6 +78,40 @@ def _has_gap_between(seq_gaps: list[tuple[int, int]], lower_bound: int, upper_bo
     return idx < len(seq_gaps) and seq_gaps[idx][1] <= upper_bound
 
 
+def _can_allocate_distinct_slots(
+    seq_gaps: list[tuple[int, int]],
+    demands: list[tuple[int, int]],
+) -> bool:
+    if not demands:
+        return True
+    if any(lo > hi for lo, hi in demands):
+        return False
+    ordered = sorted(demands)
+    active: list[int] = []
+    d_idx = 0
+    n_demands = len(ordered)
+    for gap_start, gap_end_excl in seq_gaps:
+        slot = gap_start + 1
+        gap_end = gap_end_excl - 1
+        while slot <= gap_end:
+            while d_idx < n_demands and ordered[d_idx][0] <= slot:
+                heapq.heappush(active, ordered[d_idx][1])
+                d_idx += 1
+            if not active:
+                if d_idx >= n_demands:
+                    return True
+                next_start = ordered[d_idx][0]
+                if next_start > gap_end:
+                    break
+                slot = next_start
+                continue
+            if active[0] < slot:
+                return False
+            heapq.heappop(active)
+            slot += 1
+    return d_idx == n_demands and not active
+
+
 def _classify_outcome(
     decision: str | None,
     finalizer_type: str | None,
@@ -112,6 +147,7 @@ def _analyze_run(
     last_blocked_by_tool: dict[str, int] = {}
     prev_action_index: int | None = None
     has_action_gap = False
+    missing_decision_demands: list[tuple[int, int, int]] = []
 
     for line_no, event in items:
         if event.contract_id != contract_id or event.mode != mode:
@@ -161,18 +197,17 @@ def _analyze_run(
             continue
 
         if event.phase == "post_execution":
+            slot_demands = [(lo, hi) for lo, hi, _ in missing_decision_demands]
             for act_idx in actions_order:
                 entry = actions_map[act_idx]
-                if (
-                    entry["decision"] in ("allow", "allow_with_warning")
-                    and entry["finalizer_type"] is None
-                    and not _has_gap_between(seq_gaps, entry["decision_sequence"], event.sequence)
-                ):
-                    return _inconsistent_run(
-                        run_id,
-                        f"post_execution recorded while action {act_idx} lacks a finalizer without a sequence gap",
-                        line=line_no,
-                    )
+                if entry["decision"] in ("allow", "allow_with_warning") and entry["finalizer_type"] is None:
+                    slot_demands.append((entry["decision_sequence"] + 1, event.sequence - 1))
+            if slot_demands and not _can_allocate_distinct_slots(seq_gaps, slot_demands):
+                return _inconsistent_run(
+                    run_id,
+                    "Insufficient distinct sequence slots for missing events before post_execution",
+                    line=line_no,
+                )
             post_execution = {
                 "sequence": event.sequence,
                 "decision": None,
@@ -282,6 +317,7 @@ def _analyze_run(
                     prev_action_index is not None and act_idx > prev_action_index + 1
                 ):
                     has_action_gap = True
+                missing_decision_demands.append((lower_bound + 1, event.sequence - 1, line_no))
                 prev_action_index = act_idx
                 actions_order.append(act_idx)
                 actions_map[act_idx] = {
@@ -296,6 +332,17 @@ def _analyze_run(
                 }
                 if event.event_type == "tool_error":
                     terminal = "tool_error"
+
+    if (
+        post_execution is None
+        and len(missing_decision_demands) > 1
+        and not _can_allocate_distinct_slots(seq_gaps, [(lo, hi) for lo, hi, _ in missing_decision_demands])
+    ):
+        return _inconsistent_run(
+            run_id,
+            "Insufficient distinct sequence slots for missing decisions",
+            line=missing_decision_demands[-1][2],
+        )
 
     actions: list[dict[str, Any]] = []
     counts = {outcome: 0 for outcome in TOOL_OUTCOMES}

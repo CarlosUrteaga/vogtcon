@@ -1419,3 +1419,82 @@ class TestCliExplainStage3(unittest.TestCase):
         res_b = json.loads(out_b)
         self.assertEqual(res_b["status"], "inconsistent_log")
         self.assertEqual(res_b["data"]["runs"][0]["trace_integrity"], "inconsistent")
+
+    def test_missing_events_require_distinct_sequence_slots(self) -> None:
+        inconsistent_cases = [
+            (
+                "two_unfinalized_allows_single_slot",
+                [
+                    RunEvent(run_id="slot-1", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="slot-1", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="slot-1", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+                    RunEvent(run_id="slot-1", sequence=5, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+            (
+                "early_gap_plus_single_late_slot",
+                [
+                    RunEvent(run_id="slot-2", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="slot-2", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="slot-2", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+                    RunEvent(run_id="slot-2", sequence=6, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+            (
+                "orphan_decision_and_unfinalized_allow_share_one_slot",
+                [
+                    RunEvent(run_id="slot-3", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEvent(run_id="slot-3", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+                    RunEvent(run_id="slot-3", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=2, tool_name="t", execution_status="completed"),
+                    RunEvent(run_id="slot-3", sequence=5, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+                ],
+            ),
+        ]
+        for label, events in inconsistent_cases:
+            with self.subTest(case=label):
+                self._write_events(events)
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (1, ""))
+                res = json.loads(out)
+                self.assertEqual(res["status"], "inconsistent_log")
+                self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "inconsistent")
+
+        # Positive control 1: 2 missing finalizers with 2 slots {4, 5} -> partial
+        self._write_events([
+            RunEvent(run_id="slot-ok-1", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="slot-ok-1", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+            RunEvent(run_id="slot-ok-1", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+            RunEvent(run_id="slot-ok-1", sequence=6, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "partial")
+        self.assertEqual(res["data"]["runs"][0]["counts"]["unfinalized"], 2)
+
+        # Positive control 2: separate slots {3} and {5} -> partial
+        self._write_events([
+            RunEvent(run_id="slot-ok-2", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="slot-ok-2", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+            RunEvent(run_id="slot-ok-2", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=2, tool_name="t", decision="allow"),
+            RunEvent(run_id="slot-ok-2", sequence=6, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "partial")
+        self.assertEqual(res["data"]["runs"][0]["counts"]["unfinalized"], 2)
+
+        # Positive control 3: huge gap jump completes immediately
+        self._write_events([
+            RunEvent(run_id="slot-huge", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEvent(run_id="slot-huge", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="t", decision="allow"),
+            RunEvent(run_id="slot-huge", sequence=10**9, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "partial")
