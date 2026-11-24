@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -72,7 +73,8 @@ def _inconsistent_run(
 
 
 def _has_gap_between(seq_gaps: list[tuple[int, int]], lower_bound: int, upper_bound: int) -> bool:
-    return any(a >= lower_bound and b <= upper_bound for a, b in seq_gaps)
+    idx = bisect_left(seq_gaps, (lower_bound, 0))
+    return idx < len(seq_gaps) and seq_gaps[idx][1] <= upper_bound
 
 
 def _classify_outcome(

@@ -791,3 +791,42 @@ class TestCliExplain(unittest.TestCase):
         run = res["data"]["runs"][0]
         self.assertEqual(run["trace_integrity"], "partial")
         self.assertEqual(run["actions"][1]["tool_outcome"], "unknown")
+
+    def test_has_gap_between_boundaries_and_large_partial_trace(self) -> None:
+        from vogtcon.cli_trace import _has_gap_between
+
+        gaps = [(1, 3), (5, 8), (10, 12)]
+        self.assertTrue(_has_gap_between(gaps, 1, 3))
+        self.assertTrue(_has_gap_between(gaps, 4, 8))
+        self.assertFalse(_has_gap_between(gaps, 2, 7))
+        self.assertFalse(_has_gap_between(gaps, 13, 20))
+        self.assertFalse(_has_gap_between([], 0, 10))
+
+        events = [
+            RunEvent(
+                run_id="many-gaps", sequence=1, contract_id="c1", mode="guarded",
+                phase="pre_execution", event_type="decision",
+            ),
+            *[
+                RunEvent(
+                    run_id="many-gaps",
+                    sequence=3 + (i - 1) * 2,
+                    contract_id="c1",
+                    mode="guarded",
+                    phase="runtime",
+                    event_type="tool_completed",
+                    action_index=i,
+                    tool_name="t",
+                    execution_status="completed",
+                )
+                for i in range(1, 2001)
+            ],
+        ]
+        self._write_events(events)
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "ok")
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertEqual(run["counts"]["unknown"], 2000)
