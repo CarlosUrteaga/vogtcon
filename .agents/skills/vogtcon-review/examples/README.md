@@ -1,0 +1,15 @@
+# Example Decision Traces (`RunEvent` v1)
+
+This directory contains deterministic `RunEvent` v1 JSONL traces used to reproduce the `vogtcon-review` walkthroughs without executing workflows or modifying source data.
+
+## Provenance
+
+| File | Scenario | Origin & Provenance | Expected `vogtcon explain` Outcome |
+| --- | --- | --- | --- |
+| [notification_recovery.jsonl](notification_recovery.jsonl) | Notificaciones recovery (`wheel-recovery`) | Generated locally via `WorkflowController` and `JsonlDecisionLog` against `examples/notification_contract_v2.yaml` (`EnforcementPolicy(mode="guarded")`), reusing the `wheel-recovery` sequence from `tests/wheel_consumer.py` (`pre_execution` -> `block` on `sensitive_requires_approval` -> `allow` -> `tool_completed` -> `post_execution`). | Exit `0`, `status: "ok"`, `trace_integrity: "complete"`, `terminal: "post_execution"`, action 2 `prior_same_tool_block_action_index: 1`, `effect_evidence: "not_verified"`. |
+| [notification_tool_error.jsonl](notification_tool_error.jsonl) | Notificaciones tool failure (`wheel-tool-error`) | Controlled `WorkflowController` run against `examples/notification_contract_v2.yaml` (`EnforcementPolicy(mode="guarded")`) where the tool callable raises an exception after an `allow` decision. | Exit `0`, `status: "ok"`, `trace_integrity: "complete"`, `terminal: "tool_error"`, `tool_outcome: "error"`, `effect_evidence: "indeterminate"`. |
+| [notification_partial.jsonl](notification_partial.jsonl) | Notificaciones truncated log (`wheel-partial`) | Controlled `WorkflowController` recovery trace truncated after action 2's `allow` decision (omitting `tool_completed` and `post_execution`). | Exit `0`, `status: "ok"`, `trace_integrity: "partial"`, `terminal: null`, `partial_log` diagnostic, action 2 `tool_outcome: "unfinalized"`, `effect_evidence: "indeterminate"`. |
+| [notification_inconsistent.jsonl](notification_inconsistent.jsonl) | Coherent run + contradictory run (`wheel-recovery-ok` & `wheel-recovery-corrupt`) | Controlled multi-run JSONL file combining a complete `WorkflowController` recovery run (`wheel-recovery-ok`) with a corrupted run (`wheel-recovery-corrupt`) containing a `tool_completed` event after a `block` decision on action 1. | Exit `1`, `status: "inconsistent_log"`, `inconsistent_log` diagnostic at line `8`, with `wheel-recovery-ok` preserved separately in `data.runs`. |
+| [cfdi_reconciliation.jsonl](cfdi_reconciliation.jsonl) | CFDI reconciliation (`cfdi-reconciliation-demo`) | Synthetic `RunEvent` v1 test trace created directly with `JsonlDecisionLog` and fictitious run/tool identifiers (`contract_id: "example.cfdi_reconciliation"`, `run_id: "cfdi-reconciliation-demo"`, `tool_name: "mark_reconciled"`). It was not produced by executing the CFDI benchmark. | Exit `0`, `status: "ok"`, `trace_integrity: "complete"`, `terminal: "post_execution"`, action 1 `block` (`cfdi.exact_match_required`), action 2 `allow` (`prior_same_tool_block_action_index: 1`, `tool_outcome: "completed"`, `effect_evidence: "not_verified"`). |
+
+See [GUIDE.md](../GUIDE.md) for step-by-step commands and [VERIFICATION.md](../VERIFICATION.md) for recorded CLI outputs.
