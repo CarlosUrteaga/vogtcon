@@ -21,8 +21,8 @@ Copy `examples/notification_contract.yaml`, `examples/notification_contract_v2.y
 1. **Validate v1 and v2 contracts:**
 
    ```bash
-   vogtcon validate "notification_contract.yaml" --json
-   vogtcon validate "notification_contract_v2.yaml" --json
+   vogtcon validate --json -- "notification_contract.yaml"
+   vogtcon validate --json -- "notification_contract_v2.yaml"
    ```
 
    - `notification_contract.yaml` (v1): exit `0`, `status: "valid"`, `contract_version: 1`, `mode: "guarded"`, `fingerprint.verified: false` (declared only).
@@ -31,7 +31,7 @@ Copy `examples/notification_contract.yaml`, `examples/notification_contract_v2.y
 2. **Explain the recovery trace (`wheel-recovery`):**
 
    ```bash
-   vogtcon explain ".agents/skills/vogtcon-review/examples/notification_recovery.jsonl" --run-id "wheel-recovery" --json
+   vogtcon explain --run-id="wheel-recovery" --json -- ".agents/skills/vogtcon-review/examples/notification_recovery.jsonl"
    ```
 
    - Exit `0`, `status: "ok"`, `trace_integrity: "complete"`, `terminal: "post_execution"`.
@@ -41,16 +41,16 @@ Copy `examples/notification_contract.yaml`, `examples/notification_contract_v2.y
 3. **Explain controlled failure and integrity variants:**
 
    ```bash
-   vogtcon explain ".agents/skills/vogtcon-review/examples/notification_tool_error.jsonl" --json
-   vogtcon explain ".agents/skills/vogtcon-review/examples/notification_partial.jsonl" --json
-   vogtcon explain ".agents/skills/vogtcon-review/examples/notification_inconsistent.jsonl" --json
-   vogtcon explain ".agents/skills/vogtcon-review/examples/notification_recovery.jsonl" --run-id "missing" --json
+   vogtcon explain --json -- ".agents/skills/vogtcon-review/examples/notification_tool_error.jsonl"
+   vogtcon explain --json -- ".agents/skills/vogtcon-review/examples/notification_partial.jsonl"
+   vogtcon explain --json -- ".agents/skills/vogtcon-review/examples/notification_inconsistent.jsonl"
+   vogtcon explain --run-id="missing" --json -- ".agents/skills/vogtcon-review/examples/notification_recovery.jsonl"
    ```
 
    - `notification_tool_error.jsonl`: exit `0`, `trace_integrity: "complete"`, `terminal: "tool_error"`, `tool_outcome: "error"`, `effect_evidence: "indeterminate"`.
    - `notification_partial.jsonl`: exit `0`, `trace_integrity: "partial"`, `terminal: null`, `partial_log` diagnostic, `tool_outcome: "unfinalized"`, `effect_evidence: "indeterminate"`.
    - `notification_inconsistent.jsonl`: exit `1`, `status: "inconsistent_log"`, `inconsistent_log` diagnostic at physical line `8`, with `wheel-recovery-ok` preserved separately from `wheel-recovery-corrupt`.
-   - `--run-id "missing"`: exit `2`, `status: "run_not_found"`.
+   - `--run-id="missing"`: exit `2`, `status: "run_not_found"`.
 
 ## Walkthrough 2: CFDI
 
@@ -59,7 +59,7 @@ Copy `examples/cfdi_contract.yaml` into your consumer workspace alongside the sy
 1. **Validate the CFDI contract with the default catalog:**
 
    ```bash
-   vogtcon validate "cfdi_contract.yaml" --json
+   vogtcon validate --json -- "cfdi_contract.yaml"
    ```
 
    - Exit `2`, `status: "unsupported_rules"`.
@@ -69,7 +69,7 @@ Copy `examples/cfdi_contract.yaml` into your consumer workspace alongside the sy
 2. **Explain the synthetic CFDI trace separately:**
 
    ```bash
-   vogtcon explain ".agents/skills/vogtcon-review/examples/cfdi_reconciliation.jsonl" --json
+   vogtcon explain --json -- ".agents/skills/vogtcon-review/examples/cfdi_reconciliation.jsonl"
    ```
 
    - Exit `0`, `status: "ok"`, `contract_id: "example.cfdi_reconciliation"`, `trace_integrity: "complete"`, `terminal: "post_execution"`.

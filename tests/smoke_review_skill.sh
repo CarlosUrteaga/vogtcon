@@ -72,43 +72,44 @@ PY
     [ "$rc" -eq 0 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" validate notification_contract.yaml --json > "$scratch/validate_v1.json" 2> "$scratch/validate_v1.err" || rc=$?
+    env -u PYTHONPATH "$cli" validate --json -- notification_contract.yaml > "$scratch/validate_v1.json" 2> "$scratch/validate_v1.err" || rc=$?
     [ "$rc" -eq 0 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" validate notification_contract_v2.yaml --json > "$scratch/validate_v2.json" 2> "$scratch/validate_v2.err" || rc=$?
+    env -u PYTHONPATH "$cli" validate --json -- notification_contract_v2.yaml > "$scratch/validate_v2.json" 2> "$scratch/validate_v2.err" || rc=$?
     [ "$rc" -eq 0 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" explain .agents/skills/vogtcon-review/examples/notification_recovery.jsonl --run-id wheel-recovery --json > "$scratch/explain_recovery.json" 2> "$scratch/explain_recovery.err" || rc=$?
+    env -u PYTHONPATH "$cli" explain --run-id=wheel-recovery --json -- .agents/skills/vogtcon-review/examples/notification_recovery.jsonl > "$scratch/explain_recovery.json" 2> "$scratch/explain_recovery.err" || rc=$?
     [ "$rc" -eq 0 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" explain .agents/skills/vogtcon-review/examples/notification_tool_error.jsonl --json > "$scratch/explain_tool_error.json" 2> "$scratch/explain_tool_error.err" || rc=$?
+    env -u PYTHONPATH "$cli" explain --json -- .agents/skills/vogtcon-review/examples/notification_tool_error.jsonl > "$scratch/explain_tool_error.json" 2> "$scratch/explain_tool_error.err" || rc=$?
     [ "$rc" -eq 0 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" explain .agents/skills/vogtcon-review/examples/notification_partial.jsonl --json > "$scratch/explain_partial.json" 2> "$scratch/explain_partial.err" || rc=$?
+    env -u PYTHONPATH "$cli" explain --json -- .agents/skills/vogtcon-review/examples/notification_partial.jsonl > "$scratch/explain_partial.json" 2> "$scratch/explain_partial.err" || rc=$?
     [ "$rc" -eq 0 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" explain .agents/skills/vogtcon-review/examples/notification_inconsistent.jsonl --json > "$scratch/explain_inconsistent.json" 2> "$scratch/explain_inconsistent.err" || rc=$?
+    env -u PYTHONPATH "$cli" explain --json -- .agents/skills/vogtcon-review/examples/notification_inconsistent.jsonl > "$scratch/explain_inconsistent.json" 2> "$scratch/explain_inconsistent.err" || rc=$?
     [ "$rc" -eq 1 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" explain .agents/skills/vogtcon-review/examples/notification_recovery.jsonl --run-id missing --json > "$scratch/explain_missing.json" 2> "$scratch/explain_missing.err" || rc=$?
+    env -u PYTHONPATH "$cli" explain --run-id=missing --json -- .agents/skills/vogtcon-review/examples/notification_recovery.jsonl > "$scratch/explain_missing.json" 2> "$scratch/explain_missing.err" || rc=$?
     [ "$rc" -eq 2 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" validate cfdi_contract.yaml --json > "$scratch/validate_cfdi.json" 2> "$scratch/validate_cfdi.err" || rc=$?
+    env -u PYTHONPATH "$cli" validate --json -- cfdi_contract.yaml > "$scratch/validate_cfdi.json" 2> "$scratch/validate_cfdi.err" || rc=$?
     [ "$rc" -eq 2 ]
 
     rc=0
-    env -u PYTHONPATH "$cli" explain .agents/skills/vogtcon-review/examples/cfdi_reconciliation.jsonl --json > "$scratch/explain_cfdi.json" 2> "$scratch/explain_cfdi.err" || rc=$?
+    env -u PYTHONPATH "$cli" explain --json -- .agents/skills/vogtcon-review/examples/cfdi_reconciliation.jsonl > "$scratch/explain_cfdi.json" 2> "$scratch/explain_cfdi.err" || rc=$?
     [ "$rc" -eq 0 ]
 
     env -u PYTHONPATH "$venv_python" -I - "$scratch" <<'PY'
 import hashlib
+import importlib.metadata
 import json
 import sys
 from pathlib import Path
@@ -118,7 +119,8 @@ scratch = Path(sys.argv[1])
 for err_file in scratch.glob("*.err"):
     assert err_file.read_text(encoding="utf-8") == "", f"Unexpected stderr in {err_file.name}: {err_file.read_text()}"
 
-assert (scratch / "version.txt").read_text(encoding="utf-8").strip() == "vogtcon 0.4.0"
+expected_version = f"vogtcon {importlib.metadata.version('vogtcon')}"
+assert (scratch / "version.txt").read_text(encoding="utf-8").strip() == expected_version
 
 def load(name: str) -> dict:
     payload = json.loads((scratch / name).read_text(encoding="utf-8"))

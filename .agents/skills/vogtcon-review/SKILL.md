@@ -40,12 +40,12 @@ description: >-
 
 ### Step 3: Safe Invocation & Envelope Parsing
 
-1. Pass file paths and `run_id` selectors as **literal arguments** (quoted, never shell-expanded or rewritten):
+1. Pass file paths and `run_id` selectors as **literal arguments** (quoted, never shell-expanded or rewritten). Always use `--` before positional file paths (protecting paths starting with `-`, such as `-trace.jsonl`) and inline `--run-id="$run_id"` (protecting run IDs starting with `-`, such as `--demo`):
 
    ```bash
-   vogtcon validate "$contract_path" --json
-   vogtcon explain "$log_path" --json
-   vogtcon explain "$log_path" --run-id "$run_id" --json
+   vogtcon validate --json -- "$contract_path"
+   vogtcon explain --json -- "$log_path"
+   vogtcon explain --run-id="$run_id" --json -- "$log_path"
    ```
 
 2. Capture the **exit code**, **`stdout`**, and **`stderr`** separately so that JSON emitted on `stdout` is still parsed on non-zero exit codes (`1`, `2`, `3`).

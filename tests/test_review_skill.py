@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,7 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "vogtcon-review"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 SKILL_EXAMPLES = SKILL_DIR / "examples"
-VOGTCON_BIN = REPO_ROOT / ".venv" / "bin" / "vogtcon"
+_SYS_VOGTCON = Path(sys.executable).with_name("vogtcon")
+VOGTCON_BIN = _SYS_VOGTCON if _SYS_VOGTCON.is_file() else REPO_ROOT / ".venv" / "bin" / "vogtcon"
 
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
 FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -62,9 +65,10 @@ def _find_broken_markdown_links(md_path: Path, markdown_text: str) -> list[tuple
     return broken
 
 
-def _run_vogtcon(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_vogtcon(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(VOGTCON_BIN), *args],
+        cwd=cwd,
         capture_output=True,
         text=True,
         check=False,
@@ -146,7 +150,7 @@ class TestReviewSkillStage1Contract(unittest.TestCase):
         )
 
     def test_literal_arguments_command_and_separate_streams(self) -> None:
-        self.assertIn('vogtcon validate "$contract_path" --json', self.body)
+        self.assertIn('vogtcon validate --json -- "$contract_path"', self.body)
         self._assert_matches(
             r"(argumentos?\s+literales|literal\s+arguments?)",
             "SKILL.md must require passing arguments literally",
@@ -225,10 +229,11 @@ class TestValidateCliGroundTruth(unittest.TestCase):
         self.addCleanup(workspace.cleanup)
         self.tmp_dir = Path(workspace.name)
 
-    def test_vogtcon_binary_version_is_0_4_0(self) -> None:
+    def test_vogtcon_binary_version_matches_installed_distribution(self) -> None:
+        installed_version = importlib.metadata.version("vogtcon")
         proc = _run_vogtcon(["--version"])
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout, "vogtcon 0.4.0\n")
+        self.assertEqual(proc.stdout, f"vogtcon {installed_version}\n")
         self.assertEqual(proc.stderr, "")
 
     def test_validate_yaml_v1_and_v2_preserve_bytes(self) -> None:
@@ -359,6 +364,70 @@ class TestValidateCliGroundTruth(unittest.TestCase):
                 self.assertEqual(proc.stdout, "")
                 self.assertIn("usage: vogtcon", proc.stderr)
 
+    def test_dash_prefixed_paths_and_run_id_succeed_with_separator(self) -> None:
+        from vogtcon import RunEvent
+
+        dash_contract = self.tmp_dir / "-contract.yaml"
+        dash_contract.write_bytes(self.notification_v2.read_bytes())
+        contract_before = _sha256_bytes(dash_contract)
+        val_proc = _run_vogtcon(["validate", "--json", "--", "-contract.yaml"], cwd=self.tmp_dir)
+        contract_after = _sha256_bytes(dash_contract)
+        self.assertEqual(contract_before, contract_after)
+        self.assertEqual(val_proc.returncode, 0, val_proc.stderr)
+        self.assertEqual(val_proc.stderr, "")
+        val_payload = json.loads(val_proc.stdout)
+        self.assertEqual(val_payload["status"], "valid")
+        self.assertEqual(val_payload["path"], "-contract.yaml")
+
+        dash_trace = self.tmp_dir / "-trace.jsonl"
+        events = [
+            RunEvent(
+                run_id="--demo",
+                sequence=1,
+                contract_id="example.notification",
+                mode="guarded",
+                phase="pre_execution",
+                event_type="decision",
+            ),
+            RunEvent(
+                run_id="--demo",
+                sequence=2,
+                contract_id="example.notification",
+                mode="guarded",
+                phase="runtime",
+                event_type="decision",
+                action_index=1,
+                tool_name="send_notification",
+                decision="block",
+                violation_rules=["sensitive_requires_approval"],
+            ),
+            RunEvent(
+                run_id="--demo",
+                sequence=3,
+                contract_id="example.notification",
+                mode="guarded",
+                phase="post_execution",
+                event_type="decision",
+            ),
+        ]
+        dash_trace.write_text(
+            "\n".join(ev.model_dump_json() for ev in events) + "\n",
+            encoding="utf-8",
+        )
+        trace_before = _sha256_bytes(dash_trace)
+        exp_proc = _run_vogtcon(
+            ["explain", "--run-id=--demo", "--json", "--", "-trace.jsonl"],
+            cwd=self.tmp_dir,
+        )
+        trace_after = _sha256_bytes(dash_trace)
+        self.assertEqual(trace_before, trace_after)
+        self.assertEqual(exp_proc.returncode, 0, exp_proc.stderr)
+        self.assertEqual(exp_proc.stderr, "")
+        exp_payload = json.loads(exp_proc.stdout)
+        self.assertEqual(exp_payload["status"], "ok")
+        self.assertEqual(exp_payload["path"], "-trace.jsonl")
+        self.assertEqual(exp_payload["data"]["runs"][0]["run_id"], "--demo")
+
 
 class TestReviewSkillStage2Contract(unittest.TestCase):
     def setUp(self) -> None:
@@ -370,8 +439,8 @@ class TestReviewSkillStage2Contract(unittest.TestCase):
         self.assertRegex(self.body, re.compile(pattern, re.IGNORECASE | re.DOTALL), msg)
 
     def test_explain_invocation_run_id_and_run_separation(self) -> None:
-        self.assertIn('vogtcon explain "$log_path" --json', self.body)
-        self.assertIn('--run-id "$run_id"', self.body)
+        self.assertIn('vogtcon explain --json -- "$log_path"', self.body)
+        self.assertIn('vogtcon explain --run-id="$run_id" --json -- "$log_path"', self.body)
         self._assert_matches(
             r"(mantener|keep).{0,60}(ejecuciones|runs).{0,40}(separad|separate)",
             "SKILL.md must keep runs separated when reviewing an entire log",
