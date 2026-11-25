@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage 1 & 2 TDD tests for the vogtcon-review skill and CLI ground truth."""
+"""Stage 1, 2 & 3 TDD tests for the vogtcon-review skill and CLI ground truth."""
 
 from __future__ import annotations
 
@@ -47,6 +47,21 @@ def _strip_code_from_markdown(markdown_text: str) -> str:
     return INLINE_CODE_RE.sub("", without_fences)
 
 
+def _find_broken_markdown_links(md_path: Path, markdown_text: str) -> list[tuple[str, Path]]:
+    prosaic = _strip_code_from_markdown(markdown_text)
+    broken: list[tuple[str, Path]] = []
+    for raw_target in MARKDOWN_LINK_RE.findall(prosaic):
+        if raw_target.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        target_path_str = raw_target.split("#", 1)[0]
+        if not target_path_str:
+            continue
+        resolved = (md_path.parent / target_path_str).resolve()
+        if not resolved.exists():
+            broken.append((raw_target, resolved))
+    return broken
+
+
 def _run_vogtcon(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(VOGTCON_BIN), *args],
@@ -75,18 +90,12 @@ class TestReviewSkillFormat(unittest.TestCase):
     def test_relative_markdown_links_resolve(self) -> None:
         self.assertTrue(SKILL_MD.is_file(), f"Missing {SKILL_MD}")
         _, body = _parse_skill_document(SKILL_MD)
-        prosaic = _strip_code_from_markdown(body)
-        for raw_target in MARKDOWN_LINK_RE.findall(prosaic):
-            if raw_target.startswith(("http://", "https://", "mailto:", "#")):
-                continue
-            target_path_str = raw_target.split("#", 1)[0]
-            if not target_path_str:
-                continue
-            resolved = (SKILL_MD.parent / target_path_str).resolve()
-            self.assertTrue(
-                resolved.exists(),
-                f"Broken relative markdown link {raw_target!r} -> {resolved}",
-            )
+        broken = _find_broken_markdown_links(SKILL_MD, body)
+        self.assertEqual(
+            broken,
+            [],
+            f"Broken relative markdown links in {SKILL_MD}: {broken}",
+        )
 
 
 class TestReviewSkillStage1Contract(unittest.TestCase):
@@ -563,6 +572,158 @@ class TestNotificationExampleTraces(unittest.TestCase):
         self.assertTrue(
             any(r["trace_integrity"] in ("complete", "partial") for r in runs),
             f"Expected at least one coherent run preserved in {runs}",
+        )
+
+
+class TestCfdiExampleAndDocs(unittest.TestCase):
+    def _read_doc_with_valid_links(self, doc_path: Path) -> str:
+        self.assertTrue(doc_path.is_file(), f"Missing documentation file {doc_path}")
+        text = doc_path.read_text(encoding="utf-8")
+        self.assertTrue(text.strip(), f"Documentation file {doc_path} must be non-empty")
+        broken = _find_broken_markdown_links(doc_path, text)
+        self.assertEqual(broken, [], f"Broken relative markdown links in {doc_path}: {broken}")
+        return text
+
+    def test_cfdi_example_trace_and_contract_validation(self) -> None:
+        from vogtcon import RunEvent
+
+        cfdi_trace = SKILL_EXAMPLES / "cfdi_reconciliation.jsonl"
+        self.assertTrue(cfdi_trace.is_file(), f"Missing CFDI example trace at {cfdi_trace}")
+
+        lines = [line for line in cfdi_trace.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), 4, "CFDI trace must contain RunEvent v1 JSONL records")
+        events = [RunEvent.model_validate_json(line) for line in lines]
+        self.assertTrue(all(ev.schema_version == 1 for ev in events))
+        self.assertTrue(any(ev.tool_name == "mark_reconciled" for ev in events))
+
+        trace_before = _sha256_bytes(cfdi_trace)
+        explain_proc = _run_vogtcon(["explain", str(cfdi_trace), "--json"])
+        trace_after = _sha256_bytes(cfdi_trace)
+        self.assertEqual(trace_before, trace_after, f"{cfdi_trace} bytes modified")
+        self.assertEqual(explain_proc.returncode, 0, explain_proc.stderr)
+        self.assertEqual(explain_proc.stderr, "")
+
+        explain_payload = json.loads(explain_proc.stdout)
+        self.assertEqual(explain_payload["output_version"], 1)
+        self.assertEqual(explain_payload["command"], "explain")
+        self.assertEqual(explain_payload["status"], "ok")
+        runs = explain_payload["data"]["runs"]
+        self.assertGreaterEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual(run["contract_id"], "example.cfdi_reconciliation")
+
+        actions = run["actions"]
+        blocked_actions = [
+            a for a in actions
+            if a["tool_name"] == "mark_reconciled"
+            and a["decision"] == "block"
+            and "cfdi.exact_match_required" in a["violation_rules"]
+        ]
+        self.assertTrue(blocked_actions, f"Expected mark_reconciled block citing cfdi.exact_match_required: {actions}")
+        blocked_idx = blocked_actions[0]["action_index"]
+        allowed_actions = [
+            a for a in actions
+            if a["tool_name"] == "mark_reconciled"
+            and a["decision"] == "allow"
+            and a["prior_same_tool_block_action_index"] == blocked_idx
+            and a["tool_outcome"] == "completed"
+            and a["effect_evidence"] == "not_verified"
+        ]
+        self.assertTrue(
+            allowed_actions,
+            f"Expected subsequent mark_reconciled allow with prior_same_tool_block_action_index={blocked_idx}: {actions}",
+        )
+
+        cfdi_contract = REPO_ROOT / "examples" / "cfdi_contract.yaml"
+        contract_before = _sha256_bytes(cfdi_contract)
+        validate_proc = _run_vogtcon(["validate", str(cfdi_contract), "--json"])
+        contract_after = _sha256_bytes(cfdi_contract)
+        self.assertEqual(contract_before, contract_after, f"{cfdi_contract} bytes modified")
+        self.assertEqual(validate_proc.returncode, 2)
+        self.assertEqual(validate_proc.stderr, "")
+        validate_payload = json.loads(validate_proc.stdout)
+        self.assertEqual(validate_payload["status"], "unsupported_rules")
+        self.assertEqual(
+            validate_payload["data"],
+            {"field": "runtime_rules", "unsupported_ids": ["cfdi.exact_match_required"]},
+        )
+
+    def test_examples_readme_documents_provenance_and_links(self) -> None:
+        text = self._read_doc_with_valid_links(SKILL_EXAMPLES / "README.md")
+        for filename in (
+            "notification_recovery.jsonl",
+            "notification_tool_error.jsonl",
+            "notification_partial.jsonl",
+            "notification_inconsistent.jsonl",
+            "cfdi_reconciliation.jsonl",
+        ):
+            self.assertIn(filename, text, f"examples/README.md must document {filename}")
+        self.assertRegex(
+            text,
+            re.compile(r"(WorkflowController|wheel-recovery|controlador|controller)", re.IGNORECASE),
+            "examples/README.md must document controller provenance for Notificaciones traces",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(sint[eé]tic|synthetic|fictici|fictitious)", re.IGNORECASE),
+            "examples/README.md must document synthetic/fictitious provenance for cfdi_reconciliation.jsonl",
+        )
+
+    def test_guide_markdown_exists_links_and_content(self) -> None:
+        text = self._read_doc_with_valid_links(SKILL_DIR / "GUIDE.md")
+        self.assertIn("0.4.0", text)
+        self.assertRegex(
+            text,
+            re.compile(r"(consumidor|consumer|wheel)", re.IGNORECASE),
+            "GUIDE.md must explain clean consumer wheel setup",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(sin\s+importar|without\s+importing).{0,80}(checkout|repositorio|repo)|benchmark", re.IGNORECASE),
+            "GUIDE.md must forbid importing repo checkout or installing benchmark",
+        )
+        for token in ("notification_contract", "notification_recovery.jsonl", "cfdi_contract.yaml", "cfdi_reconciliation.jsonl"):
+            self.assertIn(token, text, f"GUIDE.md must cover walkthrough artifact {token!r}")
+
+    def test_verification_markdown_exists_links_and_content(self) -> None:
+        text = self._read_doc_with_valid_links(SKILL_DIR / "VERIFICATION.md")
+        self.assertIn("0.4.0", text)
+        self.assertIn("vogtcon validate", text)
+        self.assertIn("vogtcon explain", text)
+        self.assertRegex(
+            text,
+            re.compile(r"(solicitud|prompt|request)", re.IGNORECASE),
+            "VERIFICATION.md must record user prompts/requests",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(c[oó]digo\s+de\s+salida|exit\s+code)", re.IGNORECASE),
+            "VERIFICATION.md must record exit codes",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(esperad|expected).{0,200}(observad|observed)", re.IGNORECASE | re.DOTALL),
+            "VERIFICATION.md must compare expected vs observed JSON facts",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"sha-?256", re.IGNORECASE),
+            "VERIFICATION.md must record SHA-256 byte preservation",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(solo\s+lectura|read[- ]only)", re.IGNORECASE),
+            "VERIFICATION.md must confirm read-only behavior",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(validador|validator|frontmatter|SKILL\.md)", re.IGNORECASE),
+            "VERIFICATION.md must record skill format validation",
+        )
+        self.assertRegex(
+            text,
+            re.compile(r"(fase\s*3|phase\s*3).{0,120}\bmcp\b|\bmcp\b.{0,120}(fase\s*3|phase\s*3)", re.IGNORECASE | re.DOTALL),
+            "VERIFICATION.md must document deferred cases including Phase 3 MCP",
         )
 
 

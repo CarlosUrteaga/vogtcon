@@ -84,3 +84,9 @@ description: >-
 | `invalid_log`, `run_not_found`, or `io_error` | Cite the diagnostic and physical `diagnostics.line` when present. On `run_not_found`, ask for another run id (`run_id`) or offer a full-file review if requested. Note that filtering with `--run-id` still validates the format of the whole file. |
 
 - **Integrity boundary:** `trace_integrity: complete` refers to log integrity only. Effective authorization, external delivery, and task success require additional host or destination evidence.
+
+## References
+
+- Usage walkthroughs and isolated wheel setup: [GUIDE.md](GUIDE.md)
+- Example trace provenance: [examples/README.md](examples/README.md)
+- Recorded CLI verification log: [VERIFICATION.md](VERIFICATION.md)
