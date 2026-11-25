@@ -159,6 +159,10 @@ bash scripts/run_rag.sh --container pre
 bash scripts/run_rag.sh --container test
 ```
 
+## Evidence from a live language model
+
+We ran 16 notification-agent trials with DeepSeek V4.1 Flash via Ollama against a wheel built from **Vogtcon 0.4.0**. The agent requested approval in all eight runs with an initial block. The destination stayed empty in all four denied runs, and each of the four granted runs recorded exactly one notification. The host simulated approval and the destination was in memory. [Reproduce the pilot and inspect the evidence](https://github.com/CarlosUrteaga/vogtcon/tree/main/pilots/notification_llm).
+
 ## Development and tests
 
 After setting up the checkout with the `uv sync` command above, run the controller tests and run `sh tests/smoke_wheel_consumer.sh` to verify in a separate environment both the Python wheel consumer and the installed `vogtcon validate` and `vogtcon explain` CLI commands.
@@ -168,7 +172,7 @@ uv run --no-sync python -m unittest discover -s tests -p 'test_execution.py'
 sh tests/smoke_wheel_consumer.sh
 ```
 
-Benchmark-dependent tests use `GOVERNOR_BENCHMARK_ROOT` to locate a local benchmark checkout. The exploratory pilot covers scenarios `S-001`, `S-013` and `S-016` across all four modes. The [pilot script](https://github.com/CarlosUrteaga/vogtcon/blob/main/pilots/benchmark_probe.py) defaults to four runs and accepts `--scenarios` and `--modes` for the twelve-run selection. Differences between the manifest and the checkout limit historical comparisons.
+Benchmark-dependent tests use `GOVERNOR_BENCHMARK_ROOT` to locate a local benchmark checkout. The scripted integration probe covers scenarios `S-001`, `S-013` and `S-016` across all four modes. The [pilot script](https://github.com/CarlosUrteaga/vogtcon/blob/main/pilots/benchmark_probe.py) defaults to four runs and accepts `--scenarios` and `--modes` for the twelve-run selection. Differences between the manifest and the checkout limit historical comparisons.
 
 Automated tests use scripted models, and the package provides neither a distributed ledger nor an LLM-based Governor. Older reports use the former name `governor_contracts`.
 

@@ -157,6 +157,10 @@ bash scripts/run_rag.sh --container pre
 bash scripts/run_rag.sh --container test
 ```
 
+## Evidencia con un modelo de lenguaje real
+
+Ejecutamos 16 corridas de un agente de notificaciones con DeepSeek V4.1 Flash vía Ollama y un wheel construido desde **Vogtcon 0.4.0**. El agente pidió aprobación en las ocho corridas con un bloqueo inicial. El destino quedó vacío en las cuatro corridas en que el host denegó el permiso. En las cuatro en que lo concedió, se registró exactamente una notificación por corrida. La aprobación fue simulada y el destino estaba en memoria. [Reproducir el piloto y consultar la evidencia](https://github.com/CarlosUrteaga/vogtcon/tree/main/pilots/notification_llm).
+
 ## Desarrollo y pruebas
 
 Después de preparar el entorno con el comando `uv sync` anterior, ejecuta las pruebas del controlador y `sh tests/smoke_wheel_consumer.sh` para comprobar en un entorno separado tanto el consumo del paquete wheel en Python como los comandos instalados `vogtcon validate` y `vogtcon explain` de la CLI.
@@ -166,7 +170,7 @@ uv run --no-sync python -m unittest discover -s tests -p 'test_execution.py'
 sh tests/smoke_wheel_consumer.sh
 ```
 
-Las pruebas que dependen del repositorio de evaluación lo localizan mediante `GOVERNOR_BENCHMARK_ROOT`. El piloto exploratorio abarca los escenarios `S-001`, `S-013` y `S-016` en los cuatro modos. El [programa del piloto](pilots/benchmark_probe.py) realiza cuatro ejecuciones por defecto y acepta `--scenarios` y `--modes` para seleccionar las doce. Las diferencias entre el manifiesto y la copia del repositorio limitan las comparaciones históricas.
+Las pruebas que dependen del repositorio de evaluación lo localizan mediante `GOVERNOR_BENCHMARK_ROOT`. La prueba de integración con respuestas programadas abarca los escenarios `S-001`, `S-013` y `S-016` en los cuatro modos. El [programa del piloto](pilots/benchmark_probe.py) realiza cuatro ejecuciones por defecto y acepta `--scenarios` y `--modes` para seleccionar las doce. Las diferencias entre el manifiesto y la copia del repositorio limitan las comparaciones históricas.
 
 Las pruebas automáticas usan modelos con respuestas programadas. El paquete carece de un registro distribuido y de un evaluador basado en un modelo de lenguaje. Los reportes históricos usan el nombre anterior `governor_contracts`.
 
