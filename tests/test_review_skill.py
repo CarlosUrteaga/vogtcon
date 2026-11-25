@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage 1 TDD tests for the vogtcon-review skill and validate CLI ground truth."""
+"""Stage 1 & 2 TDD tests for the vogtcon-review skill and CLI ground truth."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "vogtcon-review"
 SKILL_MD = SKILL_DIR / "SKILL.md"
+SKILL_EXAMPLES = SKILL_DIR / "examples"
 VOGTCON_BIN = REPO_ROOT / ".venv" / "bin" / "vogtcon"
 
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
@@ -348,6 +349,221 @@ class TestValidateCliGroundTruth(unittest.TestCase):
                 self.assertEqual(proc.returncode, 3)
                 self.assertEqual(proc.stdout, "")
                 self.assertIn("usage: vogtcon", proc.stderr)
+
+
+class TestReviewSkillStage2Contract(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assertTrue(SKILL_MD.is_file(), f"Missing {SKILL_MD}")
+        _, self.body = _parse_skill_document(SKILL_MD)
+        self.lower = self.body.lower()
+
+    def _assert_matches(self, pattern: str, msg: str) -> None:
+        self.assertRegex(self.body, re.compile(pattern, re.IGNORECASE | re.DOTALL), msg)
+
+    def test_explain_invocation_run_id_and_run_separation(self) -> None:
+        self.assertIn('vogtcon explain "$log_path" --json', self.body)
+        self.assertIn('--run-id "$run_id"', self.body)
+        self._assert_matches(
+            r"(mantener|keep).{0,60}(ejecuciones|runs).{0,40}(separad|separate)",
+            "SKILL.md must keep runs separated when reviewing an entire log",
+        )
+        self._assert_matches(
+            r"output_version.{0,40}1.{0,120}(detener|stop)",
+            "SKILL.md must check output_version == 1 and stop on incompatible version",
+        )
+
+    def test_explain_reporting_fields_and_contract_id_comparison(self) -> None:
+        for field in ("run_id", "action_index", "decision_sequence", "tool_event_sequence", "diagnostics.line"):
+            self.assertIn(field, self.body, f"SKILL.md must reference {field!r}")
+        self._assert_matches(
+            r"contract_id.{0,180}(difieren|difere|mismatch|differs|distint)",
+            "SKILL.md must flag mismatched contract_id when both contract and trace are provided",
+        )
+        self._assert_matches(
+            r"(coincidencia|match).{0,120}contract_id.{0,160}(pendiente|pending|unverified|no\s+prueba|does\s+not\s+prove).{0,120}(identidad|identity|revisi[oó]n|revision|fingerprint|huella)",
+            "SKILL.md must note matching contract_id leaves exact contract revision/fingerprint identity pending",
+        )
+
+    def test_traces_table_block_abort_and_prior_block_retry_guard(self) -> None:
+        # Row 1: block / abort & pre_abort
+        self.assertIn("violation_rules", self.body)
+        self.assertIn("pre_abort", self.body)
+        self._assert_matches(
+            r"(block|abort).{0,140}(impidi[oó]|prevented)",
+            "SKILL.md must state block/abort prevented tool invocation",
+        )
+        self._assert_matches(
+            r"pre_abort.{0,120}(sin\s+acciones|no\s+runtime\s+actions|without\s+runtime\s+actions)",
+            "SKILL.md must state pre_abort is a terminal without runtime actions",
+        )
+        # Row 2: allow / allow_with_warning + prior_same_tool_block_action_index
+        self.assertIn("allow_with_warning", self.body)
+        self.assertIn("prior_same_tool_block_action_index", self.body)
+        self.assertNotIn(
+            "is_retry",
+            self.lower,
+            "SKILL.md must NOT use fabricated field name 'is_retry'",
+        )
+        self._assert_matches(
+            r"prior_same_tool_block_action_index.{0,220}(mismo\s+nombre|same\s+tool(?:\s+name)?).{0,180}(ambos\s+[ií]ndices|both\s+indices|both\s+action\s+indices)",
+            "SKILL.md must explain prior_same_tool_block_action_index as subsequent allowed same-tool-name attempt and cite both indices",
+        )
+        self._assert_matches(
+            r"(identidad\s+de\s+argumentos|argument\s+identity).{0,120}(autorizaci[oó]n\s+del\s+host|host\s+authorization).{0,120}(relaci[oó]n\s+de\s+reintento|retry\s+relationship).{0,120}(sin\s+determinar|undetermined|indeterminad)",
+            "SKILL.md must leave argument identity, host authorization, and retry relationship undetermined",
+        )
+
+    def test_traces_table_outcomes_integrity_and_errors(self) -> None:
+        # Row 3: completed -> not_verified
+        self.assertIn("not_verified", self.body)
+        self._assert_matches(
+            r"completed.{0,160}(retorn[oó]|returned).{0,120}not_verified",
+            "SKILL.md must state tool_outcome completed means callable returned and external effect is not_verified",
+        )
+        # Row 4: error / unfinalized / unknown -> indeterminate + tool_error complete
+        for token in ("unfinalized", "unknown", "indeterminate", "trace_integrity", "terminal", "tool_error"):
+            self.assertIn(token, self.body, f"SKILL.md must reference {token!r}")
+        self._assert_matches(
+            r"tool_error.{0,140}(complete|completa)",
+            "SKILL.md must note a run ending in tool_error can have trace_integrity complete",
+        )
+        # Row 5: partial -> partial_log
+        self.assertIn("partial_log", self.body)
+        self._assert_matches(
+            r"partial.{0,180}(ausente|missing|faltante).{0,160}(conservar|preserv|hechos|facts)",
+            "SKILL.md must explain partial traces identify missing evidence while preserving supported facts",
+        )
+        # Row 6: inconsistent_log
+        self.assertIn("inconsistent_log", self.body)
+        self._assert_matches(
+            r"inconsistent_log.{0,180}(contradicci[oó]n|contradiction).{0,160}(coherentes|coherent)",
+            "SKILL.md must explain inconsistent_log cites contradiction per run and separates coherent runs",
+        )
+        # Row 7: invalid_log / run_not_found / io_error
+        for token in ("invalid_log", "run_not_found", "io_error"):
+            self.assertIn(token, self.body, f"SKILL.md must reference {token!r}")
+        self._assert_matches(
+            r"run_not_found.{0,220}(otro\s+id|another\s+id|another\s+run\s+id).{0,120}(archivo\s+completo|full[- ]file|entire\s+file|whole\s+file)",
+            "SKILL.md must ask for another ID or offer full-file review on run_not_found",
+        )
+        self._assert_matches(
+            r"--run-id.{0,180}(todo\s+el\s+archivo|whole\s+file|entire\s+file|full\s+file)",
+            "SKILL.md must note --run-id still validates format of the whole file",
+        )
+
+    def test_complete_integrity_disclaimer(self) -> None:
+        self._assert_matches(
+            r"complete.{0,120}(integridad\s+del\s+registro|log\s+integrity|trace\s+integrity)",
+            "SKILL.md must clarify complete refers to log/trace integrity only",
+        )
+        self._assert_matches(
+            r"(autorizaci[oó]n\s+efectiva|effective\s+authorization).{0,120}(entrega\s+externa|external\s+delivery).{0,120}([eé]xito\s+de\s+la\s+tarea|task\s+success)",
+            "SKILL.md must state effective authorization, external delivery, and task success require additional host/destination evidence",
+        )
+
+
+class TestNotificationExampleTraces(unittest.TestCase):
+    def _explain_preserving_bytes(self, trace_name: str, extra_args: list[str] | None = None) -> tuple[int, dict[str, object]]:
+        trace_path = SKILL_EXAMPLES / trace_name
+        self.assertTrue(trace_path.is_file(), f"Missing example trace at {trace_path}")
+        before_digest = _sha256_bytes(trace_path)
+        args = ["explain", str(trace_path), *(extra_args or []), "--json"]
+        proc = _run_vogtcon(args)
+        after_digest = _sha256_bytes(trace_path)
+        self.assertEqual(before_digest, after_digest, f"{trace_path} bytes modified")
+        self.assertEqual(proc.stderr, "", f"Unexpected stderr for {args}: {proc.stderr}")
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["output_version"], 1)
+        self.assertEqual(payload["command"], "explain")
+        return proc.returncode, payload
+
+    def test_notification_recovery_trace(self) -> None:
+        code, payload = self._explain_preserving_bytes(
+            "notification_recovery.jsonl",
+            ["--run-id", "wheel-recovery"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "ok")
+        runs = payload["data"]["runs"]
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual(run["run_id"], "wheel-recovery")
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "post_execution")
+        self.assertEqual(len(run["actions"]), 2)
+
+        a1, a2 = run["actions"]
+        self.assertEqual(a1["action_index"], 1)
+        self.assertEqual(a1["decision"], "block")
+        self.assertIn("sensitive_requires_approval", a1["violation_rules"])
+        self.assertEqual(a1["tool_outcome"], "prevented")
+
+        self.assertEqual(a2["action_index"], 2)
+        self.assertEqual(a2["decision"], "allow")
+        self.assertEqual(a2["prior_same_tool_block_action_index"], 1)
+        self.assertEqual(a2["tool_outcome"], "completed")
+        self.assertEqual(a2["effect_evidence"], "not_verified")
+
+        missing_code, missing_payload = self._explain_preserving_bytes(
+            "notification_recovery.jsonl",
+            ["--run-id", "missing"],
+        )
+        self.assertEqual(missing_code, 2)
+        self.assertEqual(missing_payload["status"], "run_not_found")
+        self.assertIsNone(missing_payload["data"])
+        self.assertEqual(missing_payload["diagnostics"][0]["code"], "run_not_found")
+
+    def test_notification_tool_error_trace(self) -> None:
+        code, payload = self._explain_preserving_bytes("notification_tool_error.jsonl")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "ok")
+        runs = payload["data"]["runs"]
+        self.assertGreaterEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "tool_error")
+        self.assertTrue(
+            any(
+                a["tool_outcome"] == "error" and a["effect_evidence"] == "indeterminate"
+                for a in run["actions"]
+            ),
+            f"Expected an action with tool_outcome='error' and effect_evidence='indeterminate': {run['actions']}",
+        )
+
+    def test_notification_partial_trace(self) -> None:
+        code, payload = self._explain_preserving_bytes("notification_partial.jsonl")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "ok")
+        diag_codes = [d["code"] for d in payload["diagnostics"]]
+        self.assertIn("partial_log", diag_codes)
+        runs = payload["data"]["runs"]
+        self.assertGreaterEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertIsNone(run["terminal"])
+        self.assertTrue(
+            any(
+                a["tool_outcome"] == "unfinalized" and a["effect_evidence"] == "indeterminate"
+                for a in run["actions"]
+            ),
+            f"Expected an action with tool_outcome='unfinalized' and effect_evidence='indeterminate': {run['actions']}",
+        )
+
+    def test_notification_inconsistent_trace(self) -> None:
+        code, payload = self._explain_preserving_bytes("notification_inconsistent.jsonl")
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["status"], "inconsistent_log")
+        diag_codes = [d["code"] for d in payload["diagnostics"]]
+        self.assertIn("inconsistent_log", diag_codes)
+        runs = payload["data"]["runs"]
+        self.assertTrue(
+            any(r["trace_integrity"] == "inconsistent" for r in runs),
+            f"Expected at least one inconsistent run in {runs}",
+        )
+        self.assertTrue(
+            any(r["trace_integrity"] in ("complete", "partial") for r in runs),
+            f"Expected at least one coherent run preserved in {runs}",
+        )
 
 
 if __name__ == "__main__":
