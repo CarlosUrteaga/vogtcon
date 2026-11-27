@@ -4,20 +4,32 @@
 """Data boundaries for governance, independent of the benchmark and providers.
 
 These schemas validate structure, not policy compliance or the truth of agent
-claims. Models prevent field reassignment, but nested lists/dicts are not deeply
-immutable. ContractDocument keeps an independent original document for identity
-checks; never compute a historical fingerprint from a model_dump().
+claims. Legacy models prevent field reassignment without deep immutability,
+while HostFacts and PlannedEffect store deeply immutable snapshots.
+ContractDocument keeps an independent original document for identity checks;
+never compute a historical fingerprint from a model_dump().
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Annotated, Final, Literal, Self, TypeAlias
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Self, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    PlainSerializer,
+    field_validator,
+    model_validator,
+)
 
 Mode = Literal["no_contract", "advisory", "guarded", "strict"]
 Phase = Literal["pre_execution", "runtime", "post_execution"]
@@ -28,6 +40,16 @@ InstanceId = Annotated[
     Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
 ]
 JsonObject = dict[str, JsonValue]
+FrozenJsonValue: TypeAlias = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | Sequence["FrozenJsonValue"]
+    | Mapping[str, "FrozenJsonValue"]
+)
+FrozenJsonObject: TypeAlias = Mapping[str, FrozenJsonValue]
 
 OPERATION_IDENTITY_VERSION: Final[int] = 1
 OPERATION_DIGEST_EXCLUDED_METADATA: Final[tuple[str, ...]] = (
@@ -48,9 +70,49 @@ OPERATION_DIGEST_EXCLUDED_METADATA: Final[tuple[str, ...]] = (
 )
 
 
+def _freeze_json_value(value: object) -> FrozenJsonValue:
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze_json_value(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json_value(item) for item in value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"Unsupported JSON value type: {type(value)!r}")
+
+
+def _freeze_json_object(value: JsonObject) -> FrozenJsonObject:
+    frozen = _freeze_json_value(value)
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _thaw_json_value(value: object) -> Any:
+    if isinstance(value, Mapping):
+        return {k: _thaw_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json_value(item) for item in value]
+    return value
+
+
+def _thaw_json_object(value: FrozenJsonObject) -> JsonObject:
+    thawed = _thaw_json_value(value)
+    assert isinstance(thawed, dict)
+    return thawed
+
+
+if TYPE_CHECKING:
+    _FrozenJsonObjectField: TypeAlias = FrozenJsonObject
+else:
+    _FrozenJsonObjectField = Annotated[
+        JsonObject,
+        AfterValidator(_freeze_json_object),
+        PlainSerializer(_thaw_json_object, return_type=JsonObject),
+    ]
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
-        value,
+        _thaw_json_value(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -236,28 +298,63 @@ class ActionProposal(_Model):
 class HostFacts(_Model):
     """Host-supplied facts, separate from untrusted agent action proposals.
 
-    Schema validation checks structure only and does not prove provenance; the
-    host remains responsible for sourcing trustworthy facts.
+    Validated values are stored as deeply immutable snapshots. Schema validation
+    checks structure only and does not prove provenance; the host remains
+    responsible for sourcing trustworthy facts.
     """
 
-    facts: JsonObject = Field(default_factory=dict)
+    facts: _FrozenJsonObjectField = Field(default_factory=dict, validate_default=True)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            frozen_update = dict(update)
+            if "facts" in frozen_update:
+                frozen_update["facts"] = _freeze_json_value(frozen_update["facts"])
+            return super().model_copy(update=frozen_update, deep=False)
+        return self.__copy__()
 
 
 class PlannedEffect(_Model):
     """Host-resolved planned effect, separate from ActionProposal.
 
-    Canonical operation identity derives solely from ``tool_name`` and
+    Validated ``parameters`` and ``defaults`` are stored as deeply immutable
+    snapshots. Canonical operation identity derives solely from ``tool_name`` and
     ``effective_parameters`` (a top-level overlay where explicit ``parameters``,
     including explicit ``None``, replace ``defaults`` keys as whole values).
     """
 
     tool_name: NonEmptyString
-    parameters: JsonObject = Field(default_factory=dict)
-    defaults: JsonObject = Field(default_factory=dict)
+    parameters: _FrozenJsonObjectField = Field(default_factory=dict, validate_default=True)
+    defaults: _FrozenJsonObjectField = Field(default_factory=dict, validate_default=True)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            frozen_update = dict(update)
+            for key in ("parameters", "defaults"):
+                if key in frozen_update:
+                    frozen_update[key] = _freeze_json_value(frozen_update[key])
+            return super().model_copy(update=frozen_update, deep=False)
+        return self.__copy__()
 
     @property
     def effective_parameters(self) -> JsonObject:
-        return {**deepcopy(self.defaults), **deepcopy(self.parameters)}
+        return {**_thaw_json_object(self.defaults), **_thaw_json_object(self.parameters)}
 
     def canonical_operation(self) -> JsonObject:
         return {

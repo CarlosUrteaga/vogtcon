@@ -9,6 +9,7 @@ import os
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import MappingProxyType
 
 from pydantic import ValidationError
 
@@ -378,21 +379,133 @@ class EvaluationModelTests(unittest.TestCase):
 
 
 class HostFactsAndEffectTests(unittest.TestCase):
-    def test_host_facts_and_planned_effect_defaults_and_isolation(self):
-        first_facts = HostFacts()
-        second_facts = HostFacts()
-        self.assertEqual(first_facts.facts, {})
-        first_facts.facts["role"] = "manager"
-        self.assertEqual(second_facts.facts, {})
+    def test_host_facts_and_planned_effect_defaults_and_deep_immutability(self):
+        default_facts = HostFacts()
+        self.assertIsInstance(default_facts.facts, MappingProxyType)
+        self.assertEqual(default_facts.facts, {})
+        with self.assertRaises(TypeError):
+            default_facts.facts["role"] = "manager"
 
-        first_effect = PlannedEffect(tool_name="send_notification")
-        second_effect = PlannedEffect(tool_name="send_notification")
-        self.assertEqual(first_effect.parameters, {})
-        self.assertEqual(first_effect.defaults, {})
-        first_effect.parameters["channel"] = "email"
-        first_effect.defaults["retries"] = 1
-        self.assertEqual(second_effect.parameters, {})
-        self.assertEqual(second_effect.defaults, {})
+        default_effect = PlannedEffect(tool_name="send_notification")
+        self.assertIsInstance(default_effect.parameters, MappingProxyType)
+        self.assertIsInstance(default_effect.defaults, MappingProxyType)
+        self.assertEqual(default_effect.parameters, {})
+        self.assertEqual(default_effect.defaults, {})
+        with self.assertRaises(TypeError):
+            default_effect.parameters["channel"] = "email"
+        with self.assertRaises(TypeError):
+            default_effect.defaults["retries"] = 1
+
+        caller_facts_input = {
+            "role": "manager",
+            "nested": {"dept": "finance", "scopes": ["read", {"level": 2}]},
+        }
+        caller_params_input = {
+            "recipient": "ops@example.com",
+            "targets": ["primary", {"backup": "audit@example.com"}],
+        }
+        caller_defaults_input = {
+            "channel": "email",
+            "headers": {"priority": "normal", "tags": ["v3"]},
+        }
+
+        facts = HostFacts(facts=caller_facts_input)
+        effect = PlannedEffect(
+            tool_name="send_notification",
+            parameters=caller_params_input,
+            defaults=caller_defaults_input,
+        )
+        initial_digest = effect.operation_digest()
+
+        # Caller mutates original input dicts and nested dicts/lists after validation
+        caller_facts_input["role"] = "admin"
+        caller_facts_input["nested"]["dept"] = "tampered"
+        caller_facts_input["nested"]["scopes"].append("write")
+        caller_facts_input["nested"]["scopes"][1]["level"] = 99
+
+        caller_params_input["recipient"] = "attacker@example.com"
+        caller_params_input["targets"].append("injected")
+        caller_params_input["targets"][1]["backup"] = "attacker@example.com"
+
+        caller_defaults_input["channel"] = "sms"
+        caller_defaults_input["headers"]["priority"] = "urgent"
+        caller_defaults_input["headers"]["tags"].append("mutated")
+
+        self.assertEqual(facts.facts["role"], "manager")
+        self.assertEqual(facts.facts["nested"]["dept"], "finance")
+        self.assertEqual(facts.facts["nested"]["scopes"], ("read", MappingProxyType({"level": 2})))
+        self.assertEqual(effect.parameters["recipient"], "ops@example.com")
+        self.assertEqual(
+            effect.parameters["targets"],
+            ("primary", MappingProxyType({"backup": "audit@example.com"})),
+        )
+        self.assertEqual(effect.defaults["channel"], "email")
+        self.assertEqual(effect.defaults["headers"]["tags"], ("v3",))
+        self.assertEqual(effect.operation_digest(), initial_digest)
+
+        # Direct top-level and nested mutations on stored snapshots fail
+        with self.assertRaises(TypeError):
+            facts.facts["role"] = "admin"
+        with self.assertRaises(TypeError):
+            facts.facts["nested"]["dept"] = "tampered"
+        with self.assertRaises(AttributeError):
+            facts.facts["nested"]["scopes"].append("write")
+        with self.assertRaises(TypeError):
+            facts.facts["nested"]["scopes"][0] = "write"
+        with self.assertRaises(TypeError):
+            facts.facts["nested"]["scopes"][1]["level"] = 99
+
+        with self.assertRaises(TypeError):
+            effect.parameters["recipient"] = "attacker@example.com"
+        with self.assertRaises(AttributeError):
+            effect.parameters["targets"].append("injected")
+        with self.assertRaises(TypeError):
+            effect.parameters["targets"][1]["backup"] = "attacker@example.com"
+
+        with self.assertRaises(TypeError):
+            effect.defaults["channel"] = "sms"
+        with self.assertRaises(TypeError):
+            effect.defaults["headers"]["priority"] = "urgent"
+        with self.assertRaises(AttributeError):
+            effect.defaults["headers"]["tags"].append("mutated")
+
+        self.assertEqual(effect.operation_digest(), initial_digest)
+
+    def test_serialization_and_deepcopy_produce_native_json_structures(self):
+        facts = HostFacts(facts={"nested": {"items": [1, {"ok": True}]}})
+        effect = PlannedEffect(
+            tool_name="send_notification",
+            parameters={"targets": ["ops@example.com", {"cc": ["audit@example.com"]}]},
+            defaults={"meta": {"retries": [1, 2]}},
+        )
+        for dumped in (facts.model_dump(), facts.model_dump(mode="json"), json.loads(facts.model_dump_json())):
+            self.assertIs(type(dumped["facts"]), dict)
+            self.assertIs(type(dumped["facts"]["nested"]), dict)
+            self.assertIs(type(dumped["facts"]["nested"]["items"]), list)
+            self.assertIs(type(dumped["facts"]["nested"]["items"][1]), dict)
+            dumped["facts"]["nested"]["items"].append(99)
+
+        self.assertEqual(len(facts.facts["nested"]["items"]), 2)
+
+        for dumped in (effect.model_dump(), effect.model_dump(mode="json"), json.loads(effect.model_dump_json())):
+            self.assertIs(type(dumped["parameters"]), dict)
+            self.assertIs(type(dumped["parameters"]["targets"]), list)
+            self.assertIs(type(dumped["parameters"]["targets"][1]), dict)
+            self.assertIs(type(dumped["parameters"]["targets"][1]["cc"]), list)
+            self.assertIs(type(dumped["defaults"]), dict)
+            self.assertIs(type(dumped["defaults"]["meta"]["retries"]), list)
+
+        self.assertEqual(deepcopy(facts), facts)
+        self.assertEqual(facts.model_copy(deep=True), facts)
+        updated_effect = effect.model_copy(
+            update={"tool_name": "create_ticket", "parameters": {"nested": [1, 2]}},
+            deep=True,
+        )
+        self.assertEqual(effect.tool_name, "send_notification")
+        self.assertEqual(updated_effect.tool_name, "create_ticket")
+        self.assertIsInstance(updated_effect.parameters, MappingProxyType)
+        with self.assertRaises(AttributeError):
+            updated_effect.parameters["nested"].append(3)
 
     def test_strict_typing_extra_forbid_and_frozen_assignment(self):
         for bad_facts in ([], "facts", 1, None):
@@ -815,6 +928,28 @@ class SourceAgreementTests(unittest.TestCase):
         }
         request = GovernorInput.model_validate(data)
         self.assertEqual(request, GovernorInput.model_validate_json(request.model_dump_json()))
+        self.assertEqual(deepcopy(request), request)
+        for dumped in (request.model_dump(), request.model_dump(mode="json")):
+            self.assertIs(type(dumped["host_facts"]["facts"]), dict)
+            self.assertIs(type(dumped["host_facts"]["facts"]["nested"]["b"]), list)
+            self.assertIs(type(dumped["planned_effect"]["parameters"]), dict)
+
+        assert request.host_facts is not None
+        with self.assertRaises(TypeError):
+            request.host_facts.facts["user_role"] = "admin"
+        with self.assertRaises(AttributeError):
+            request.host_facts.facts["nested"]["b"].append(3)
+        with self.assertRaises(TypeError):
+            request.host_facts.facts["nested"]["a"]["x"] = "tampered"
+
+        nested_type_conflict = input_data("runtime")
+        nested_type_conflict["context"]["state"] = {"nested_list": [1, True]}
+        nested_type_conflict["host_facts"] = {"facts": {"nested_list": [1, 1]}}
+        with self.assertRaisesRegex(
+            ValidationError,
+            r"host_facts conflicts with context\.state for key\(s\): nested_list",
+        ):
+            GovernorInput.model_validate(nested_type_conflict)
 
     def test_conflicting_host_facts_fail_naming_keys_without_leaking_values(self):
         secret_state = "SECRET_STATE_TOKEN_ALPHA_9001"
