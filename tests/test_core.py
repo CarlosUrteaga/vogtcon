@@ -602,5 +602,145 @@ class V3EvaluationTests(unittest.TestCase):
         self.assertEqual(digest, "sha256:" + "b" * 64)
 
 
+class V3AuthorizationEvaluationTests(unittest.TestCase):
+    def test_stage3_rules_evaluate_deterministically_across_modes_without_wall_clock(
+        self,
+    ) -> None:
+        from vogtcon.models import HostApproval, RetrievedEvidence
+
+        contract = ContractRulesV3.model_validate(
+            {
+                "schema_version": 3,
+                "contract_id": "example.v3.auth",
+                "approved_agent_configurations": ["agent-v3"],
+                "declared_tools": ["send_notification"],
+                "response_schema": {"required_fields": ["status"]},
+                "memory_policy": "none",
+                "validation_phases": ["pre_execution", "runtime", "post_execution"],
+                "rules": [
+                    {
+                        "instance_id": "declared-only",
+                        "rule_type": "tool.declared_only",
+                        "phases": ["runtime"],
+                    },
+                    {
+                        "instance_id": "dest-check",
+                        "rule_type": "destination.allowlist",
+                        "phases": ["runtime"],
+                        "params": {
+                            "tools": ["send_notification"],
+                            "allowed_destinations": ["ops@example.com"],
+                            "destination_param": "recipient",
+                        },
+                    },
+                    {
+                        "instance_id": "evidence-check",
+                        "rule_type": "evidence.retrieved_required",
+                        "phases": ["runtime"],
+                        "params": {
+                            "tools": ["send_notification"],
+                            "min_count": 1,
+                            "allowed_sources": ["kb.internal"],
+                            "claim_param": "evidence_ids",
+                        },
+                    },
+                    {
+                        "instance_id": "approval-check",
+                        "rule_type": "approval.bound_required",
+                        "phases": ["runtime"],
+                        "params": {
+                            "tools": ["send_notification"],
+                            "required_authorities": ["notif.approve"],
+                            "sensitivity_fact_key": "is_sensitive",
+                        },
+                    },
+                    {
+                        "instance_id": "schema-complete",
+                        "rule_type": "response.schema_complete",
+                        "phases": ["post_execution"],
+                    },
+                ],
+                "contract_fingerprint": "sha256:" + "c" * 64,
+            }
+        )
+        planned = PlannedEffect(
+            tool_name="send_notification",
+            parameters={
+                "recipient": "ops@example.com",
+                "evidence_ids": ["ev-101"],
+            },
+        )
+        approval = HostApproval(
+            approval_id="app-1",
+            operation_digest=planned.operation_digest(),
+            requester_id="user-1",
+            approver_id="mgr-1",
+            approver_authorities=["notif.approve"],
+            policy_scope="scope.notif",
+            issued_at="2020-01-01T00:00:00Z",
+            expires_at="2020-01-01T01:00:00Z",
+        )
+        evidence = [RetrievedEvidence(evidence_id="ev-101", source="kb.internal")]
+        evaluator = DeterministicEvaluator()
+
+        # Passing historical timestamps from 2020 proves zero wall-clock dependency
+        valid_req = GovernorInput(
+            run_id="run-auth",
+            contract=contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(
+                state={}, available_tools=["send_notification"]
+            ),
+            action=ActionProposal(tool_name="send_notification"),
+            host_facts=HostFacts(facts={"is_sensitive": True}),
+            planned_effect=planned,
+            policy_scope="scope.notif",
+            requester_id="user-1",
+            evaluated_at="2020-01-01T00:30:00Z",
+            approval=approval,
+            retrieved_evidence=evidence,
+            trajectory=TrajectoryView(policy_scope="scope.notif"),
+        )
+        res_ok = evaluator.evaluate(valid_req)
+        self.assertEqual(res_ok.decision, "allow")
+        self.assertEqual(res_ok.violations, [])
+
+        # All three Stage 3 rules violated simultaneously across all 4 enforcement modes
+        bad_planned = PlannedEffect(
+            tool_name="send_notification",
+            parameters={
+                "recipient": "outside@attacker.org",
+                "evidence_ids": ["invented-ev"],
+            },
+        )
+        for mode, expected_decision in (
+            ("no_contract", "allow"),
+            ("advisory", "allow_with_warning"),
+            ("guarded", "block"),
+            ("strict", "abort"),
+        ):
+            with self.subTest(mode=mode):
+                violating_req = valid_req.model_copy(
+                    update={
+                        "policy": EnforcementPolicy(mode=mode),
+                        "planned_effect": bad_planned,
+                    }
+                )
+                decision = evaluator.evaluate(violating_req)
+                self.assertEqual(decision.decision, expected_decision)
+                if mode == "no_contract":
+                    self.assertEqual(decision.violations, [])
+                else:
+                    self.assertEqual(
+                        [(v.rule, v.rule_type) for v in decision.violations],
+                        [
+                            ("dest-check", "destination.allowlist"),
+                            ("evidence-check", "evidence.retrieved_required"),
+                            ("approval-check", "approval.bound_required"),
+                        ],
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

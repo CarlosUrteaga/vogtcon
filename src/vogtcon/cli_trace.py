@@ -553,6 +553,16 @@ def _analyze_run_v2(
                         f"Cannot reconcile non-uncertain effect '{eff_id}' at line {line_no}",
                         line=line_no,
                     )
+                if (
+                    eff_info.get("approval_id") is not None
+                    and event.approval_id is not None
+                    and eff_info["approval_id"] != event.approval_id
+                ):
+                    return _inconsistent_run(
+                        run_id,
+                        f"Approval ID mismatch on effect_reconciled for effect '{eff_id}' at line {line_no}",
+                        line=line_no,
+                    )
                 eff_info["reconciled_status"] = event.effect_status
                 eff_info["reconciliation_sequence"] = event.sequence
                 eff_info["reconciliation_evidence_ref"] = event.evidence_ref
@@ -561,6 +571,14 @@ def _analyze_run_v2(
                 act_entry["reconciled"] = True
                 act_entry["reconciliation_sequence"] = event.sequence
                 act_entry["reconciliation_evidence_ref"] = event.evidence_ref
+                if act_entry["approval_id"] is None and event.approval_id is not None:
+                    act_entry["approval_id"] = event.approval_id
+                    eff_info["approval_id"] = event.approval_id
+                resolved_approval_id = (
+                    event.approval_id
+                    if event.approval_id is not None
+                    else eff_info.get("approval_id")
+                )
             else:
                 cross_info = known_effects_across_runs.get(eff_id)
                 if cross_info is not None:
@@ -570,14 +588,36 @@ def _analyze_run_v2(
                             f"Cannot reconcile non-uncertain effect '{eff_id}' at line {line_no}",
                             line=line_no,
                         )
+                    if (
+                        cross_info.get("approval_id") is not None
+                        and event.approval_id is not None
+                        and cross_info["approval_id"] != event.approval_id
+                    ):
+                        return _inconsistent_run(
+                            run_id,
+                            f"Approval ID mismatch on effect_reconciled for effect '{eff_id}' at line {line_no}",
+                            line=line_no,
+                        )
+                resolved_approval_id = (
+                    event.approval_id
+                    if event.approval_id is not None
+                    else (
+                        cross_info.get("approval_id")
+                        if cross_info is not None
+                        else None
+                    )
+                )
             reconciled_in_run.add(eff_id)
-            reconciliations.append({
+            rec_out: dict[str, Any] = {
                 "effect_id": eff_id,
                 "effect_status": event.effect_status,
                 "sequence": event.sequence,
                 "policy_scope": event.policy_scope,
                 "evidence_ref": event.evidence_ref,
-            })
+            }
+            if resolved_approval_id is not None:
+                rec_out["approval_id"] = resolved_approval_id
+            reconciliations.append(rec_out)
             continue
 
         if event.event_type == "effect_compensated":
@@ -662,6 +702,7 @@ def _analyze_run_v2(
                 "policy_scope": event.policy_scope,
                 "operation_digest": event.operation_digest,
                 "effect_status": event.effect_status,
+                "approval_id": event.approval_id,
                 "observed_status": None,
                 "observation_sequence": None,
                 "observation_evidence_ref": None,
@@ -674,6 +715,7 @@ def _analyze_run_v2(
                     "action_index": act_idx,
                     "policy_scope": event.policy_scope,
                     "operation_digest": event.operation_digest,
+                    "approval_id": event.approval_id,
                     "observed_status": None,
                     "reconciled_status": None,
                 }
@@ -760,6 +802,7 @@ def _analyze_run_v2(
                     "policy_scope": event.policy_scope,
                     "operation_digest": event.operation_digest,
                     "effect_status": None,
+                    "approval_id": None,
                     "observed_status": None,
                     "observation_sequence": None,
                     "observation_evidence_ref": None,
@@ -802,9 +845,21 @@ def _analyze_run_v2(
                         f"Effect ID mismatch on effect_observed for action {act_idx} at line {line_no}",
                         line=line_no,
                     )
+                if (
+                    entry["approval_id"] is not None
+                    and event.approval_id is not None
+                    and entry["approval_id"] != event.approval_id
+                ):
+                    return _inconsistent_run(
+                        run_id,
+                        f"Approval ID mismatch on effect_observed for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
                 entry["effect_id"] = eff_id
                 entry["policy_scope"] = event.policy_scope
                 entry["operation_digest"] = event.operation_digest
+                if entry["approval_id"] is None and event.approval_id is not None:
+                    entry["approval_id"] = event.approval_id
                 entry["observed_status"] = event.effect_status
                 entry["effect_status"] = event.effect_status
                 entry["observation_sequence"] = event.sequence
@@ -853,6 +908,7 @@ def _analyze_run_v2(
                     "policy_scope": event.policy_scope,
                     "operation_digest": event.operation_digest,
                     "effect_status": event.effect_status,
+                    "approval_id": event.approval_id,
                     "observed_status": event.effect_status,
                     "observation_sequence": event.sequence,
                     "observation_evidence_ref": event.evidence_ref,
@@ -865,6 +921,7 @@ def _analyze_run_v2(
                 "action_index": act_idx,
                 "policy_scope": event.policy_scope,
                 "operation_digest": event.operation_digest,
+                "approval_id": actions_map[act_idx]["approval_id"],
                 "observed_status": event.effect_status,
                 "reconciled_status": None,
             }
@@ -930,6 +987,8 @@ def _analyze_run_v2(
             "effect_status": raw["effect_status"],
             "observation_sequence": raw["observation_sequence"],
         }
+        if raw["approval_id"] is not None:
+            action_out["approval_id"] = raw["approval_id"]
         if raw["reconciliation_sequence"] is not None:
             action_out["reconciliation_sequence"] = raw["reconciliation_sequence"]
             action_out["reconciliation_evidence_ref"] = raw["reconciliation_evidence_ref"]
@@ -1005,15 +1064,26 @@ def analyze_log_file(
                     )
                 grouped[event.run_id].append((line_no, event))
                 if isinstance(event, RunEventV2):
-                    if event.event_type == "effect_observed" and event.effect_id is not None:
-                        known_effects_across_runs.setdefault(
+                    if (
+                        event.event_type in ("decision", "effect_observed")
+                        and event.effect_id is not None
+                    ):
+                        info = known_effects_across_runs.setdefault(
                             event.effect_id,
                             {
                                 "run_id": event.run_id,
-                                "observed_status": event.effect_status,
+                                "observed_status": None,
                                 "policy_scope": event.policy_scope,
+                                "approval_id": event.approval_id,
                             },
                         )
+                        if event.event_type == "effect_observed":
+                            info["observed_status"] = event.effect_status
+                        if (
+                            info.get("approval_id") is None
+                            and event.approval_id is not None
+                        ):
+                            info["approval_id"] = event.approval_id
                     elif event.event_type == "effect_reconciled" and event.effect_id is not None:
                         file_reconciled_lines[event.effect_id].append((event.run_id, line_no))
     except OSError as error:

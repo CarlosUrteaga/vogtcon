@@ -838,5 +838,137 @@ class LegacyIdentityRegressionTests(unittest.TestCase):
             )
 
 
+class ContractV3AuthorizationLoadingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "auth_v3.yaml"
+
+    def test_stage3_builtin_rules_load_validate_params_and_fingerprint_deterministically(
+        self,
+    ) -> None:
+        omitted_defaults_rules = [
+            {
+                "instance_id": "declared-only",
+                "rule_type": "tool.declared_only",
+                "phases": ["runtime"],
+            },
+            {
+                "instance_id": "bound-approval",
+                "rule_type": "approval.bound_required",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "required_authorities": ["notif.approve"],
+                },
+            },
+            {
+                "instance_id": "dest-allow",
+                "rule_type": "destination.allowlist",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "allowed_destinations": ["ops@example.com"],
+                },
+            },
+            {
+                "instance_id": "evidence-req",
+                "rule_type": "evidence.retrieved_required",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                },
+            },
+            {
+                "instance_id": "resp-schema",
+                "rule_type": "response.schema_complete",
+                "phases": ["post_execution"],
+            },
+        ]
+        explicit_defaults_rules = [
+            {
+                "instance_id": "declared-only",
+                "rule_type": "tool.declared_only",
+                "phases": ["runtime"],
+                "params": {},
+            },
+            {
+                "instance_id": "bound-approval",
+                "rule_type": "approval.bound_required",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "required_authorities": ["notif.approve"],
+                    "authority_match": "any",
+                    "sensitivity_fact_key": None,
+                    "allow_self_approval": False,
+                    "require_single_use": True,
+                    "allow_retry_after_confirmed_absent": False,
+                },
+            },
+            {
+                "instance_id": "dest-allow",
+                "rule_type": "destination.allowlist",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "allowed_destinations": ["ops@example.com"],
+                    "destination_param": "destination",
+                    "source": "planned_effect",
+                },
+            },
+            {
+                "instance_id": "evidence-req",
+                "rule_type": "evidence.retrieved_required",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "min_count": 1,
+                    "allowed_sources": None,
+                    "require_content_digest": False,
+                    "claim_param": None,
+                },
+            },
+            {
+                "instance_id": "resp-schema",
+                "rule_type": "response.schema_complete",
+                "phases": ["post_execution"],
+                "params": {},
+            },
+        ]
+        omitted_data = v3_contract(rules=omitted_defaults_rules)
+        explicit_data = v3_contract(rules=explicit_defaults_rules)
+        self.assertEqual(
+            omitted_data["contract_fingerprint"],
+            explicit_data["contract_fingerprint"],
+        )
+
+        for dump in (yaml.safe_dump, json.dumps):
+            self.path.write_text(dump(omitted_data), encoding="utf-8")
+            doc = load_contract(self.path)
+            self.assertIsInstance(doc.contract, ContractRulesV3)
+
+        # Invalid parameters and disallowed phases fail closed without leaking values
+        secret = "SECRET_AUTH_PARAM_VALUE_555"
+        for rule_type, bad_params in (
+            ("approval.bound_required", {"tools": [], "required_authorities": [secret]}),
+            ("destination.allowlist", {"tools": ["send_notification"], "allowed_destinations": [], "extra": secret}),
+            ("evidence.retrieved_required", {"tools": ["send_notification"], "min_count": 0, "claim_param": secret}),
+        ):
+            bad_contract = dict(omitted_data)
+            bad_contract["rules"] = [
+                {
+                    "instance_id": "bad-inst",
+                    "rule_type": rule_type,
+                    "phases": ["runtime"],
+                    "params": bad_params,
+                }
+            ]
+            self.path.write_text(json.dumps(bad_contract), encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                load_contract(self.path)
+            self.assertNotIn(secret, str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

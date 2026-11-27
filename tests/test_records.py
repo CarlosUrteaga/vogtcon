@@ -442,6 +442,151 @@ class RunEventV2Tests(unittest.TestCase):
             self.assertIsInstance(events[1], RunEventV2)
             self.assertEqual(events, [v1_event, v2_event])
 
+    def test_v2_optional_approval_id_exclusion_and_shape_constraints(self) -> None:
+        without_app = RunEventV2(
+            run_id="run-v2",
+            sequence=1,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="decision",
+            action_index=1,
+            tool_name="send_notification",
+            decision="allow",
+            effect_id="eff-000001",
+            operation_digest=_digest("1"),
+            effect_status="reserved",
+        )
+        self.assertNotIn("approval_id", without_app.model_dump())
+        self.assertNotIn('"approval_id"', without_app.model_dump_json())
+
+        for ev in (
+            RunEventV2(
+                run_id="run-v2",
+                sequence=1,
+                contract_id="c-v3",
+                mode="guarded",
+                phase="runtime",
+                event_type="decision",
+                action_index=1,
+                tool_name="send_notification",
+                decision="allow",
+                effect_id="eff-000001",
+                operation_digest=_digest("1"),
+                effect_status="reserved",
+                approval_id="app-101",
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=2,
+                contract_id="c-v3",
+                mode="guarded",
+                phase="runtime",
+                event_type="effect_observed",
+                action_index=1,
+                tool_name="send_notification",
+                execution_status="completed",
+                effect_id="eff-000001",
+                operation_digest=_digest("1"),
+                effect_status="confirmed",
+                approval_id="app-101",
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=3,
+                contract_id="c-v3",
+                mode="guarded",
+                phase="runtime",
+                event_type="effect_reconciled",
+                execution_status="completed",
+                effect_id="eff-000001",
+                operation_digest=_digest("1"),
+                effect_status="confirmed",
+                evidence_ref="rec-1",
+                approval_id="app-101",
+            ),
+        ):
+            self.assertEqual(ev.approval_id, "app-101")
+            self.assertEqual(parse_run_event(ev.model_dump_json()), ev)
+
+        # Forbidden approval_id combinations
+        for bad_kwargs in (
+            # pre_execution decision
+            {
+                "phase": "pre_execution",
+                "event_type": "decision",
+                "approval_id": "app-1",
+            },
+            # post_execution decision
+            {
+                "phase": "post_execution",
+                "event_type": "decision",
+                "approval_id": "app-1",
+            },
+            # blocked runtime decision
+            {
+                "phase": "runtime",
+                "event_type": "decision",
+                "action_index": 1,
+                "tool_name": "send_notification",
+                "decision": "block",
+                "approval_id": "app-1",
+            },
+            # allow runtime decision without effect_id
+            {
+                "phase": "runtime",
+                "event_type": "decision",
+                "action_index": 1,
+                "tool_name": "send_notification",
+                "decision": "allow",
+                "approval_id": "app-1",
+            },
+            # tool_completed
+            {
+                "phase": "runtime",
+                "event_type": "tool_completed",
+                "action_index": 1,
+                "tool_name": "send_notification",
+                "execution_status": "completed",
+                "effect_id": "eff-000001",
+                "operation_digest": _digest("1"),
+                "approval_id": "app-1",
+            },
+            # tool_error
+            {
+                "phase": "runtime",
+                "event_type": "tool_error",
+                "action_index": 1,
+                "tool_name": "send_notification",
+                "execution_status": "unknown",
+                "effect_id": "eff-000001",
+                "operation_digest": _digest("1"),
+                "approval_id": "app-1",
+            },
+            # effect_compensated
+            {
+                "phase": "runtime",
+                "event_type": "effect_compensated",
+                "tool_name": "refund",
+                "execution_status": "completed",
+                "effect_id": "eff-000002",
+                "operation_digest": _digest("2"),
+                "effect_status": "confirmed",
+                "compensates_effect_id": "eff-000001",
+                "evidence_ref": "comp-1",
+                "approval_id": "app-1",
+            },
+        ):
+            with self.subTest(bad_kwargs=bad_kwargs):
+                with self.assertRaises(ValidationError):
+                    RunEventV2(
+                        run_id="run-v2",
+                        sequence=1,
+                        contract_id="c-v3",
+                        mode="guarded",
+                        **bad_kwargs,  # type: ignore[arg-type]
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
