@@ -58,11 +58,11 @@ def validate_contract_rules(
         for binding in contract.rules:
             try:
                 catalog.validate_rule_params(binding.rule_type, binding.params)
-            except ValidationError as exc:
+            except ValidationError:
                 raise ValueError(
                     f"Invalid parameters for rule instance '{binding.instance_id}' "
                     f"(rule_type '{binding.rule_type}')"
-                ) from exc
+                ) from None
         if set(contract.validation_phases) != _PHASES:
             raise ValueError("Enforced contracts require all three validation phases")
         return

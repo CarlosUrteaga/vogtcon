@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 
@@ -382,7 +383,11 @@ class ContractV3LoadingTests(unittest.TestCase):
 
     def test_v3_rejects_invalid_params_without_leaking_values(self):
         catalog = _make_custom_v3_catalog()
-        sentinel = "TOP_SECRET_PARAM_VALUE_999"
+        self.assertIsNot(
+            _TransferLimitParams.model_config.get("hide_input_in_errors"),
+            True,
+        )
+        sentinel = "SECRET_PARAM_SENTINEL_XYZ"
         for bad_params in (
             {},  # missing required max_amount
             {"max_amount": sentinel},  # wrong type
@@ -400,14 +405,40 @@ class ContractV3LoadingTests(unittest.TestCase):
                         "params": bad_params,
                     }
                 ]
-                with self.assertRaises(ValueError) as ctx:
-                    self.load(json.dumps(data), rule_catalog=catalog)
-                message = str(ctx.exception)
-                self.assertIn(
-                    "Invalid parameters for rule instance 'limit-check' (rule_type 'transfer.max_amount')",
-                    message,
-                )
-                self.assertNotIn(sentinel, message)
+                typed = ContractRulesV3.model_validate(data)
+                for call_name, fn in (
+                    (
+                        "validate_contract_rules",
+                        lambda: validate_contract_rules(
+                            typed, rule_catalog=catalog
+                        ),
+                    ),
+                    (
+                        "load_contract",
+                        lambda: self.load(
+                            json.dumps(data), rule_catalog=catalog
+                        ),
+                    ),
+                ):
+                    with self.subTest(call=call_name):
+                        caught: ValueError | None = None
+                        formatted_tb = ""
+                        try:
+                            fn()
+                        except ValueError as exc:
+                            caught = exc
+                            formatted_tb = traceback.format_exc()
+                        self.assertIsNotNone(caught)
+                        assert caught is not None
+                        self.assertIsNone(caught.__cause__)
+                        self.assertTrue(caught.__suppress_context__)
+                        message = str(caught)
+                        self.assertIn(
+                            "Invalid parameters for rule instance 'limit-check' (rule_type 'transfer.max_amount')",
+                            message,
+                        )
+                        self.assertNotIn(sentinel, message)
+                        self.assertNotIn(sentinel, formatted_tb)
 
     def test_v3_rejects_duplicate_instance_id_legacy_fields_and_incomplete_phases(self):
         dup_data = v3_contract()
