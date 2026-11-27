@@ -18,6 +18,7 @@ from vogtcon import (
     RunEvent,
     WorkflowController,
 )
+from vogtcon.records import RunEventV2, parse_run_event
 
 
 def contract() -> AgentContract:
@@ -161,6 +162,285 @@ class RecordTests(unittest.TestCase):
                 **valid.model_dump(), "event_type": "tool_completed",
                 "decision": None, "execution_status": "not_started",
             })
+
+
+def _digest(ch: str = "a") -> str:
+    return "sha256:" + (ch * 64)[:64]
+
+
+class RunEventV2Tests(unittest.TestCase):
+    def test_valid_v2_event_shapes_across_all_six_event_types(self) -> None:
+        pre = RunEventV2(
+            run_id="run-v2",
+            sequence=1,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="pre_execution",
+            event_type="decision",
+            policy_scope="scope.1",
+        )
+        self.assertEqual(pre.schema_version, 2)
+
+        rt_allow = RunEventV2(
+            run_id="run-v2",
+            sequence=2,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="decision",
+            action_index=1,
+            tool_name="transfer_funds",
+            decision="allow",
+            policy_scope="scope.1",
+            effect_id="eff-000001",
+            operation_digest=_digest("1"),
+            effect_status="reserved",
+        )
+        self.assertEqual(rt_allow.effect_status, "reserved")
+
+        rt_block = RunEventV2(
+            run_id="run-v2",
+            sequence=3,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="decision",
+            action_index=2,
+            tool_name="transfer_funds",
+            decision="block",
+            violation_rules=["limit-rule"],
+            policy_scope="scope.1",
+        )
+        self.assertIsNone(rt_block.effect_id)
+        self.assertEqual(rt_block.violation_rules, ("limit-rule",))
+        with self.assertRaises(AttributeError):
+            rt_block.violation_rules.append("hacked")  # type: ignore[attr-defined]
+        self.assertIs(type(rt_block.model_dump()["violation_rules"]), list)
+        with self.assertRaises(ValidationError):
+            rt_block.model_copy(update={"effect_id": "eff-000009"})
+
+        tool_done = RunEventV2(
+            run_id="run-v2",
+            sequence=4,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="tool_completed",
+            action_index=1,
+            tool_name="transfer_funds",
+            execution_status="completed",
+            policy_scope="scope.1",
+            effect_id="eff-000001",
+            operation_digest=_digest("1"),
+        )
+        self.assertEqual(tool_done.execution_status, "completed")
+
+        tool_err = RunEventV2(
+            run_id="run-v2",
+            sequence=5,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="tool_error",
+            action_index=1,
+            tool_name="transfer_funds",
+            execution_status="unknown",
+            policy_scope="scope.1",
+            effect_id="eff-000001",
+            operation_digest=_digest("1"),
+        )
+        self.assertEqual(tool_err.execution_status, "unknown")
+
+        observed_uncertain = RunEventV2(
+            run_id="run-v2",
+            sequence=6,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="effect_observed",
+            action_index=1,
+            tool_name="transfer_funds",
+            execution_status="unknown",
+            policy_scope="scope.1",
+            effect_id="eff-000001",
+            operation_digest=_digest("1"),
+            effect_status="uncertain",
+            evidence_ref="obs-timeout",
+        )
+        self.assertEqual(observed_uncertain.effect_status, "uncertain")
+
+        reconciled = RunEventV2(
+            run_id="run-v2",
+            sequence=7,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="effect_reconciled",
+            execution_status="completed",
+            policy_scope="scope.1",
+            effect_id="eff-000001",
+            operation_digest=_digest("1"),
+            effect_status="confirmed",
+            evidence_ref="audit-confirmed-1",
+        )
+        self.assertEqual(reconciled.effect_status, "confirmed")
+
+        compensated = RunEventV2(
+            run_id="run-v2",
+            sequence=8,
+            contract_id="c-v3",
+            mode="guarded",
+            phase="runtime",
+            event_type="effect_compensated",
+            tool_name="refund_funds",
+            execution_status="completed",
+            policy_scope="scope.1",
+            effect_id="eff-000002",
+            operation_digest=_digest("2"),
+            effect_status="confirmed",
+            compensates_effect_id="eff-000001",
+            evidence_ref="refund-confirmed-2",
+        )
+        self.assertEqual(compensated.compensates_effect_id, "eff-000001")
+
+    def test_v2_rejects_extra_secret_fields_and_invalid_event_shapes(self) -> None:
+        sentinel = "SECRET_ARG_OR_PROMPT_VALUE_888"
+        base = {
+            "schema_version": 2,
+            "run_id": "run-v2",
+            "sequence": 1,
+            "contract_id": "c-v3",
+            "mode": "guarded",
+            "phase": "runtime",
+            "event_type": "decision",
+            "action_index": 1,
+            "tool_name": "transfer_funds",
+            "decision": "allow",
+            "effect_id": "eff-000001",
+            "operation_digest": _digest("1"),
+            "effect_status": "reserved",
+        }
+        for forbidden_key in ("arguments", "prompt", "result", "params", "host_facts"):
+            with self.subTest(forbidden_key=forbidden_key):
+                with self.assertRaises(ValidationError) as ctx:
+                    RunEventV2.model_validate({**base, forbidden_key: sentinel})
+                self.assertNotIn(sentinel, str(ctx.exception))
+
+        invalid_cases = [
+            # blocked decision cannot carry effect_id
+            {**base, "decision": "block"},
+            # reserved decision missing operation_digest
+            {**base, "operation_digest": None},
+            # reserved decision with wrong effect_status
+            {**base, "effect_status": "confirmed"},
+            # pre_execution decision with effect_id
+            {
+                **base,
+                "phase": "pre_execution",
+                "action_index": None,
+                "tool_name": None,
+                "decision": None,
+            },
+            # effect_observed with status="reserved"
+            {
+                **base,
+                "event_type": "effect_observed",
+                "decision": None,
+                "effect_status": "reserved",
+                "execution_status": "completed",
+            },
+            # effect_observed uncertain with execution_status="completed"
+            {
+                **base,
+                "event_type": "effect_observed",
+                "decision": None,
+                "effect_status": "uncertain",
+                "execution_status": "completed",
+            },
+            # effect_reconciled missing evidence_ref
+            {
+                **base,
+                "event_type": "effect_reconciled",
+                "decision": None,
+                "effect_status": "confirmed",
+                "execution_status": "completed",
+                "evidence_ref": None,
+            },
+            # effect_reconciled with uncertain status
+            {
+                **base,
+                "event_type": "effect_reconciled",
+                "decision": None,
+                "effect_status": "uncertain",
+                "execution_status": "completed",
+                "evidence_ref": "ev-1",
+            },
+            # effect_compensated self-compensation
+            {
+                **base,
+                "event_type": "effect_compensated",
+                "decision": None,
+                "effect_status": "confirmed",
+                "execution_status": "completed",
+                "compensates_effect_id": "eff-000001",
+                "evidence_ref": "ev-comp",
+            },
+            # trace_id without span_id
+            {**base, "trace_id": "trace-only"},
+        ]
+        for idx, payload in enumerate(invalid_cases):
+            with self.subTest(case_index=idx):
+                with self.assertRaises(ValidationError):
+                    RunEventV2.model_validate(payload)
+
+    def test_parse_run_event_and_jsonl_decision_log_multi_version_roundtrip(
+        self,
+    ) -> None:
+        v1_event = RunEvent(
+            run_id="run-v1",
+            sequence=1,
+            contract_id="c1",
+            mode="guarded",
+            phase="pre_execution",
+            event_type="decision",
+        )
+        v2_event = RunEventV2(
+            run_id="run-v2",
+            sequence=1,
+            contract_id="c3",
+            mode="guarded",
+            phase="runtime",
+            event_type="effect_observed",
+            action_index=1,
+            tool_name="transfer_funds",
+            execution_status="completed",
+            effect_id="eff-000001",
+            operation_digest=_digest("a"),
+            effect_status="confirmed",
+            evidence_ref="tx-100",
+        )
+
+        self.assertEqual(parse_run_event(v1_event.model_dump_json()), v1_event)
+        self.assertEqual(parse_run_event(v2_event.model_dump_json()), v2_event)
+        # Omitted schema_version in dict defaults to v1 RunEvent
+        v1_no_ver = v1_event.model_dump()
+        del v1_no_ver["schema_version"]
+        self.assertEqual(parse_run_event(v1_no_ver), v1_event)
+
+        for bad_ver in (0, 3, "1", "2", 2.0, True, False, None):
+            with self.subTest(bad_ver=repr(bad_ver)):
+                with self.assertRaises((ValidationError, ValueError)):
+                    parse_run_event({**v2_event.model_dump(), "schema_version": bad_ver})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = JsonlDecisionLog(Path(tmp) / "mixed.jsonl")
+            log.record(v1_event)
+            log.record(v2_event)
+            events = log.read()
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], RunEvent)
+            self.assertIsInstance(events[1], RunEventV2)
+            self.assertEqual(events, [v1_event, v2_event])
 
 
 if __name__ == "__main__":
