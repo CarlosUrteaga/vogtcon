@@ -26,10 +26,12 @@ from vogtcon import (
 from vogtcon.models import (
     OPERATION_DIGEST_EXCLUDED_METADATA,
     OPERATION_IDENTITY_VERSION,
+    ApprovedAgentConfiguration,
     ContractRulesV2,
     ContractRulesV3,
     HostFacts,
     PlannedEffect,
+    ResponseSchema,
     RuleBinding,
 )
 
@@ -744,13 +746,17 @@ class ContractV3ModelTests(unittest.TestCase):
         minimal["rules"] = []
         del minimal["metadata"]
         minimal_model = ContractRulesV3.model_validate(minimal)
-        self.assertEqual(minimal_model.rules, [])
+        self.assertEqual(minimal_model.rules, ())
         self.assertEqual(minimal_model.metadata, {})
+        self.assertIsInstance(minimal_model.metadata, MappingProxyType)
 
         b1 = RuleBinding(instance_id="r1", rule_type="tool.declared_only", phases=["runtime"])
         b2 = RuleBinding(instance_id="r2", rule_type="tool.declared_only", phases=["runtime"])
-        b1.params["k"] = "v"
+        self.assertIsInstance(b1.params, MappingProxyType)
+        self.assertEqual(b1.phases, ("runtime",))
         self.assertEqual(b2.params, {})
+        with self.assertRaises(TypeError):
+            b1.params["k"] = "v"
 
     def test_contract_document_dispatches_v3_and_preserves_original(self):
         data = v3_contract_data()
@@ -763,13 +769,147 @@ class ContractV3ModelTests(unittest.TestCase):
         document = ContractDocument(data)
         self.assertIsInstance(document.contract, ContractRulesV3)
         data["declared_tools"].append("mutated")
-        document.contract.declared_tools.append("model_mutated")
+        with self.assertRaises(AttributeError):
+            document.contract.declared_tools.append("model_mutated")
         returned = document.original
         returned["declared_tools"].append("returned_mutated")
 
         self.assertEqual(document.original, expected)
         self.assertNotIn("metadata", document.original)
         self.assertNotIn("params", document.original["rules"][0])
+
+    def test_v3_contract_and_rule_binding_are_deeply_immutable_and_serialize_to_native_json(
+        self,
+    ):
+        raw_input = {
+            "schema_version": 3,
+            "contract_id": "enforcement.v3.immutable",
+            "approved_agent_configurations": [
+                "sha256:example-agent",
+                {
+                    "fingerprint": "sha256:example-agent-2",
+                    "note": "approved",
+                    "tags": ["prod", {"tier": 1}],
+                },
+            ],
+            "declared_tools": ["send_notification", "transfer_funds"],
+            "response_schema": {
+                "required_fields": ["answer", "status"],
+                "description": "strict response",
+                "nested": {"formats": ["json", "text"]},
+            },
+            "memory_policy": "allowed-scope-only",
+            "validation_phases": ["pre_execution", "runtime", "post_execution"],
+            "rules": [
+                {
+                    "instance_id": "transfer-limit",
+                    "rule_type": "transfer.max_amount",
+                    "phases": ["runtime"],
+                    "params": {
+                        "max_amount": 500,
+                        "nested": {"currencies": ["MXN", "USD"], "flags": {"strict": True}},
+                    },
+                }
+            ],
+            "contract_fingerprint": "sha256:example-v3-contract",
+            "metadata": {
+                "owner": "security",
+                "audit": {"reviewers": ["alice", "bob"], "level": 3},
+            },
+        }
+        expected_dump = deepcopy(raw_input)
+        standalone_schema = ResponseSchema.model_validate(raw_input["response_schema"])
+        standalone_cfg = ApprovedAgentConfiguration.model_validate(
+            raw_input["approved_agent_configurations"][1]
+        )
+
+        contract = ContractRulesV3(
+            schema_version=3,
+            contract_id=raw_input["contract_id"],
+            approved_agent_configurations=[
+                raw_input["approved_agent_configurations"][0],
+                standalone_cfg,
+            ],
+            declared_tools=raw_input["declared_tools"],
+            response_schema=standalone_schema,
+            memory_policy=raw_input["memory_policy"],
+            validation_phases=raw_input["validation_phases"],
+            rules=[RuleBinding.model_validate(raw_input["rules"][0])],
+            contract_fingerprint=raw_input["contract_fingerprint"],
+            metadata=raw_input["metadata"],
+        )
+
+        # Caller mutates raw inputs and standalone models after construction
+        raw_input["declared_tools"].append("unapproved_tool")
+        raw_input["validation_phases"].append("runtime")
+        raw_input["rules"][0]["phases"].append("post_execution")
+        raw_input["rules"][0]["params"]["max_amount"] = 999999
+        raw_input["rules"][0]["params"]["nested"]["currencies"].append("EUR")
+        raw_input["metadata"]["owner"] = "tampered"
+        raw_input["metadata"]["audit"]["reviewers"].append("mallory")
+        standalone_schema.required_fields.append("injected_field")
+        standalone_schema.model_extra["description"] = "mutated"
+        standalone_cfg.model_extra["note"] = "mutated"
+
+        self.assertEqual(contract.model_dump(), expected_dump)
+        self.assertEqual(contract.model_dump(mode="json"), expected_dump)
+        self.assertEqual(json.loads(contract.model_dump_json()), expected_dump)
+        self.assertIsInstance(contract.response_schema, ResponseSchema)
+        self.assertIsInstance(
+            contract.approved_agent_configurations[1], ApprovedAgentConfiguration
+        )
+
+        # Direct mutation attempts on every collection/mapping path fail
+        with self.assertRaises(AttributeError):
+            contract.declared_tools.append("unapproved_tool")  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.validation_phases.append("runtime")  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.rules.append(contract.rules[0])  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.rules[0].phases.append("post_execution")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            contract.rules[0].params["max_amount"] = 999999  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            contract.rules[0].params["nested"]["flags"]["strict"] = False  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.rules[0].params["nested"]["currencies"].append("EUR")  # type: ignore[union-attr]
+        with self.assertRaises(AttributeError):
+            contract.response_schema.required_fields.append("extra")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            contract.response_schema.model_extra["description"] = "tampered"
+        with self.assertRaises(AttributeError):
+            contract.response_schema.model_extra["nested"]["formats"].append("xml")
+        with self.assertRaises(AttributeError):
+            contract.approved_agent_configurations.append("sha256:other")  # type: ignore[attr-defined]
+        cfg_item = contract.approved_agent_configurations[1]
+        assert isinstance(cfg_item, ApprovedAgentConfiguration)
+        with self.assertRaises(TypeError):
+            cfg_item.model_extra["note"] = "tampered"
+        with self.assertRaises(AttributeError):
+            cfg_item.model_extra["tags"].append("dev")
+        with self.assertRaises(TypeError):
+            cfg_item.model_extra["tags"][1]["tier"] = 99
+        with self.assertRaises(TypeError):
+            contract.metadata["owner"] = "attacker"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.metadata["audit"]["reviewers"].append("mallory")  # type: ignore[union-attr]
+
+        # deepcopy and model_copy preserve deep immutability and native dumps
+        self.assertEqual(deepcopy(contract), contract)
+        self.assertEqual(contract.model_copy(deep=True), contract)
+        updated = contract.model_copy(
+            update={
+                "declared_tools": ["only_tool"],
+                "metadata": {"nested": ["a", "b"]},
+            },
+            deep=True,
+        )
+        self.assertEqual(updated.declared_tools, ("only_tool",))
+        with self.assertRaises(AttributeError):
+            updated.metadata["nested"].append("c")  # type: ignore[union-attr]
+        self.assertIs(type(updated.model_dump()["declared_tools"]), list)
+        self.assertIs(type(updated.model_dump()["metadata"]["nested"]), list)
 
     def test_v3_rejects_missing_rules_and_legacy_or_enforcement_fields(self):
         missing_rules = v3_contract_data()

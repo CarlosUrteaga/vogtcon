@@ -22,7 +22,7 @@ from vogtcon.contracts import (
     compute_v3_contract_fingerprint,
     validate_contract_rules,
 )
-from vogtcon.models import ContractRulesV2, ContractRulesV3
+from vogtcon.models import ApprovedAgentConfiguration, ContractRulesV2, ContractRulesV3
 from vogtcon.rules import EmptyRuleParams, RuleTypeSpec
 
 
@@ -225,6 +225,8 @@ class _TransferLimitParams(BaseModel):
 
     max_amount: int = Field(ge=1)
     currency: str = "MXN"
+    allowed_channels: list[str] = Field(default_factory=lambda: ["wire"])
+    metadata_tags: dict[str, str] = Field(default_factory=dict)
 
 
 class _TransferLimitParamsAltDefault(BaseModel):
@@ -234,6 +236,8 @@ class _TransferLimitParamsAltDefault(BaseModel):
 
     max_amount: int = Field(ge=1)
     currency: str = "USD"
+    allowed_channels: list[str] = Field(default_factory=lambda: ["wire"])
+    metadata_tags: dict[str, str] = Field(default_factory=dict)
 
 
 def _make_custom_v3_catalog(params_model: type[BaseModel] = _TransferLimitParams) -> RuleCatalog:
@@ -332,6 +336,94 @@ class ContractV3LoadingTests(unittest.TestCase):
         doc_custom = self.load(yaml.safe_dump(custom_data), rule_catalog=catalog)
         self.assertIsInstance(doc_custom.contract, ContractRulesV3)
         self.assertEqual(doc_custom.original, custom_data)
+
+    def test_loaded_v3_contract_is_deeply_immutable_and_preserves_verified_fingerprint(
+        self,
+    ):
+        catalog = _make_custom_v3_catalog()
+        data = v3_contract(
+            rules=[
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                    "params": {},
+                },
+                {
+                    "instance_id": "mxn-cap",
+                    "rule_type": "transfer.max_amount",
+                    "phases": ["runtime"],
+                    "params": {
+                        "max_amount": 1000,
+                        "allowed_channels": ["wire", "spei"],
+                        "metadata_tags": {"region": "mx"},
+                    },
+                },
+            ],
+            rule_catalog=catalog,
+        )
+        data["approved_agent_configurations"] = [
+            "sha256:agent",
+            {"fingerprint": "sha256:agent-2", "env": "prod", "scopes": ["pay"]},
+        ]
+        data["response_schema"] = {
+            "required_fields": ["answer"],
+            "title": "TransferResponse",
+            "meta": {"strict": True, "versions": [3]},
+        }
+        data["metadata"] = {
+            "owner": "sí",
+            "nested": {"approvers": ["ops", "sec"]},
+        }
+        data["contract_fingerprint"] = compute_v3_contract_fingerprint(
+            ContractRulesV3.model_validate(data),
+            rule_catalog=catalog,
+        )
+        verified_fp = data["contract_fingerprint"]
+
+        document = self.load(json.dumps(data), rule_catalog=catalog)
+        contract = document.contract
+        self.assertIsInstance(contract, ContractRulesV3)
+        assert isinstance(contract, ContractRulesV3)
+
+        with self.assertRaises(AttributeError):
+            contract.declared_tools.append("unapproved_tool")  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.validation_phases.append("runtime")  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.rules.append(contract.rules[0])  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.rules[1].phases.append("post_execution")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            contract.rules[1].params["max_amount"] = 999999  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.rules[1].params["allowed_channels"].append("cash")  # type: ignore[union-attr]
+        with self.assertRaises(TypeError):
+            contract.rules[1].params["metadata_tags"]["region"] = "us"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.response_schema.required_fields.append("extra")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            contract.response_schema.model_extra["title"] = "Tampered"
+        with self.assertRaises(AttributeError):
+            contract.response_schema.model_extra["meta"]["versions"].append(4)
+        with self.assertRaises(AttributeError):
+            contract.approved_agent_configurations.append("sha256:rogue")  # type: ignore[attr-defined]
+        cfg = contract.approved_agent_configurations[1]
+        assert isinstance(cfg, ApprovedAgentConfiguration)
+        with self.assertRaises(TypeError):
+            cfg.model_extra["env"] = "dev"
+        with self.assertRaises(AttributeError):
+            cfg.model_extra["scopes"].append("admin")
+        with self.assertRaises(TypeError):
+            contract.metadata["owner"] = "tampered"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.metadata["nested"]["approvers"].append("rogue")  # type: ignore[union-attr]
+
+        self.assertEqual(contract.contract_fingerprint, verified_fp)
+        self.assertEqual(
+            compute_v3_contract_fingerprint(contract, rule_catalog=catalog),
+            verified_fp,
+        )
 
     def test_v3_rejects_unknown_rule_types_including_legacy_argument_and_benchmark_rules(
         self,

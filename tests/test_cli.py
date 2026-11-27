@@ -32,6 +32,7 @@ from vogtcon.cli import (
     EXIT_USAGE_OR_IO,
     EXIT_VALID,
     main,
+    validate_contract_file,
 )
 
 
@@ -1608,6 +1609,11 @@ class TestCliValidateV3(unittest.TestCase):
                 )
                 for item in data["rules"]:
                     self.assertNotIn("params", item)
+
+                code_direct, res_direct = validate_contract_file(path)
+                self.assertEqual(code_direct, EXIT_VALID)
+                self.assertIs(type(res_direct["data"]["validation_phases"]), list)
+                self.assertIs(type(res_direct["data"]["declared_tools"]), list)
 
         # Empty rules list is also structurally valid in v3
         empty_v3 = self._valid_v3_dict(rules=[])

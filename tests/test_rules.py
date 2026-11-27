@@ -305,6 +305,8 @@ class _StrictLimitParams(BaseModel):
 
     max_amount: int = Field(ge=1)
     currency: str = "MXN"
+    channels: list[str] = Field(default_factory=lambda: ["email"])
+    tags: dict[str, int] = Field(default_factory=dict)
 
 
 class RuleTypeRegistryTests(unittest.TestCase):
@@ -474,7 +476,37 @@ class RuleTypeRegistryTests(unittest.TestCase):
         validated = catalog.validate_rule_params("budget.limit", {"max_amount": 500})
         self.assertEqual(
             validated.model_dump(mode="json"),
-            {"max_amount": 500, "currency": "MXN"},
+            {
+                "max_amount": 500,
+                "currency": "MXN",
+                "channels": ["email"],
+                "tags": {},
+            },
+        )
+
+        from vogtcon.models import RuleBinding
+
+        binding = RuleBinding(
+            instance_id="b1",
+            rule_type="budget.limit",
+            phases=["runtime"],
+            params={
+                "max_amount": 500,
+                "channels": ["email", "sms"],
+                "tags": {"tier": 1},
+            },
+        )
+        validated_from_frozen = catalog.validate_rule_params(
+            "budget.limit", binding.params
+        )
+        self.assertEqual(
+            validated_from_frozen.model_dump(mode="json"),
+            {
+                "max_amount": 500,
+                "currency": "MXN",
+                "channels": ["email", "sms"],
+                "tags": {"tier": 1},
+            },
         )
 
         empty_validated = catalog.validate_rule_params("tool.declared_only", {})

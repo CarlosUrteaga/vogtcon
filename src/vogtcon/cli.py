@@ -81,9 +81,9 @@ def validate_contract_file(contract_path: str | Path) -> tuple[int, dict[str, An
             "contract_id": contract.contract_id,
             "contract_version": 3,
             "mode": None,
-            "validation_phases": contract.validation_phases,
+            "validation_phases": list(contract.validation_phases),
             "fingerprint": {"value": contract.contract_fingerprint, "verified": True},
-            "declared_tools": contract.declared_tools,
+            "declared_tools": list(contract.declared_tools),
             "runtime_rules": [
                 binding.rule_type
                 for binding in contract.rules

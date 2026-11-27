@@ -27,7 +27,10 @@ from pydantic import (
     Field,
     JsonValue,
     PlainSerializer,
+    SerializerFunctionWrapHandler,
+    WrapSerializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -102,11 +105,40 @@ def _thaw_json_object(value: FrozenJsonObject) -> JsonObject:
 
 if TYPE_CHECKING:
     _FrozenJsonObjectField: TypeAlias = FrozenJsonObject
+    _FrozenPhaseTupleField: TypeAlias = tuple[Phase, ...]
+    _FrozenRulePhasesField: TypeAlias = tuple[Phase, ...]
+    _FrozenNonEmptyStrTupleField: TypeAlias = tuple[NonEmptyString, ...]
 else:
     _FrozenJsonObjectField = Annotated[
         JsonObject,
         AfterValidator(_freeze_json_object),
         PlainSerializer(_thaw_json_object, return_type=JsonObject),
+    ]
+    _FrozenPhaseTupleField = Annotated[
+        list[Phase],
+        AfterValidator(tuple),
+        PlainSerializer(list, return_type=list[Phase]),
+    ]
+    _FrozenNonEmptyStrTupleField = Annotated[
+        list[NonEmptyString],
+        AfterValidator(tuple),
+        PlainSerializer(list, return_type=list[NonEmptyString]),
+    ]
+
+
+def _validate_and_freeze_rule_phases(value: list[Phase]) -> tuple[Phase, ...]:
+    if not value:
+        raise ValueError("RuleBinding phases must be non-empty")
+    if len(set(value)) != len(value):
+        raise ValueError("RuleBinding phases must not contain duplicates")
+    return tuple(value)
+
+
+if not TYPE_CHECKING:
+    _FrozenRulePhasesField = Annotated[
+        list[Phase],
+        AfterValidator(_validate_and_freeze_rule_phases),
+        PlainSerializer(list, return_type=list[Phase]),
     ]
 
 
@@ -136,13 +168,75 @@ class _ContractModel(_Model):
     model_config = ConfigDict(extra="allow")
     __pydantic_extra__: dict[str, JsonValue] = Field(init=False)
 
+    @model_serializer(mode="wrap")
+    def _serialize_contract_model(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        extra = getattr(self, "__pydantic_extra__", None)
+        if isinstance(extra, MappingProxyType):
+            object.__setattr__(self, "__pydantic_extra__", _thaw_json_object(extra))
+            try:
+                dumped = handler(self)
+            finally:
+                object.__setattr__(self, "__pydantic_extra__", extra)
+            thawed = _thaw_json_value(dumped)
+            assert isinstance(thawed, dict)
+            return thawed
+        return handler(self)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        if isinstance(self.__pydantic_extra__, MappingProxyType):
+            return self.__copy__()
+        return super().__deepcopy__(memo)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if isinstance(self.__pydantic_extra__, MappingProxyType):
+            extra = self.__pydantic_extra__
+            copied = super().model_copy(
+                update=dict(update) if update is not None else None,
+                deep=False,
+            )
+            object.__setattr__(copied, "__pydantic_extra__", extra)
+            return copied
+        return super().model_copy(
+            update=dict(update) if update is not None else None,
+            deep=deep,
+        )
+
 
 class ApprovedAgentConfiguration(_ContractModel):
     fingerprint: NonEmptyString
 
 
 class ResponseSchema(_ContractModel):
-    required_fields: list[NonEmptyString]
+    required_fields: Annotated[
+        list[NonEmptyString],
+        PlainSerializer(list, return_type=list[NonEmptyString]),
+    ]
+
+
+def _freeze_response_schema(schema: ResponseSchema) -> ResponseSchema:
+    frozen_extra = _freeze_json_object(dict(schema.__pydantic_extra__ or {}))
+    copied = super(_ContractModel, schema).model_copy(deep=False)
+    object.__setattr__(copied, "required_fields", tuple(schema.required_fields))
+    object.__setattr__(copied, "__pydantic_extra__", frozen_extra)
+    return copied
+
+
+def _freeze_approved_config(
+    item: NonEmptyString | ApprovedAgentConfiguration,
+) -> NonEmptyString | ApprovedAgentConfiguration:
+    if isinstance(item, ApprovedAgentConfiguration):
+        frozen_extra = _freeze_json_object(dict(item.__pydantic_extra__ or {}))
+        copied = super(_ContractModel, item).model_copy(deep=False)
+        object.__setattr__(copied, "__pydantic_extra__", frozen_extra)
+        return copied
+    return item
 
 
 class AgentFeedback(_ContractModel):
@@ -202,34 +296,72 @@ class RuleBinding(_Model):
 
     instance_id: InstanceId
     rule_type: NonEmptyString
-    phases: list[Phase]
-    params: JsonObject = Field(default_factory=dict)
+    phases: _FrozenRulePhasesField
+    params: _FrozenJsonObjectField = Field(
+        default_factory=dict, validate_default=True
+    )
 
-    @field_validator("phases")
-    @classmethod
-    def check_phases(cls, value: list[Phase]) -> list[Phase]:
-        if not value:
-            raise ValueError("RuleBinding phases must be non-empty")
-        if len(set(value)) != len(value):
-            raise ValueError("RuleBinding phases must not contain duplicates")
-        return value
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            frozen_update = dict(update)
+            if "phases" in frozen_update:
+                frozen_update["phases"] = _validate_and_freeze_rule_phases(
+                    list(frozen_update["phases"])
+                )
+            if "params" in frozen_update:
+                frozen_update["params"] = _freeze_json_object(
+                    dict(frozen_update["params"])
+                )
+            return super().model_copy(update=frozen_update, deep=False)
+        return self.__copy__()
+
+
+if TYPE_CHECKING:
+    _FrozenApprovedConfigsField: TypeAlias = tuple[
+        NonEmptyString | ApprovedAgentConfiguration, ...
+    ]
+    _FrozenRulesTupleField: TypeAlias = tuple[RuleBinding, ...]
+else:
+    _FrozenApprovedConfigsField = Annotated[
+        list[NonEmptyString | ApprovedAgentConfiguration],
+        AfterValidator(
+            lambda value: tuple(_freeze_approved_config(item) for item in value)
+        ),
+        WrapSerializer(lambda value, handler: handler(list(value))),
+    ]
+    _FrozenRulesTupleField = Annotated[
+        list[RuleBinding],
+        AfterValidator(tuple),
+        WrapSerializer(lambda value, handler: handler(list(value))),
+    ]
 
 
 class ContractRulesV3(_Model):
-    """Mode-independent v3 contract with parameterized rule bindings."""
+    """Mode-independent v3 contract with deeply immutable parameterized rule bindings."""
 
     schema_version: Literal[3]
     contract_id: NonEmptyString
-    approved_agent_configurations: list[
-        NonEmptyString | ApprovedAgentConfiguration
+    approved_agent_configurations: _FrozenApprovedConfigsField
+    declared_tools: _FrozenNonEmptyStrTupleField
+    response_schema: Annotated[
+        ResponseSchema,
+        AfterValidator(_freeze_response_schema),
     ]
-    declared_tools: list[NonEmptyString]
-    response_schema: ResponseSchema
     memory_policy: NonEmptyString
-    validation_phases: list[Phase]
-    rules: list[RuleBinding]
+    validation_phases: _FrozenPhaseTupleField
+    rules: _FrozenRulesTupleField
     contract_fingerprint: NonEmptyString
-    metadata: JsonObject = Field(default_factory=dict)
+    metadata: _FrozenJsonObjectField = Field(
+        default_factory=dict, validate_default=True
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -252,6 +384,53 @@ class ContractRulesV3(_Model):
                 f"Duplicate rule instance_id(s): {', '.join(sorted(duplicates))}"
             )
         return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            frozen_update = dict(update)
+            if "approved_agent_configurations" in frozen_update:
+                frozen_update["approved_agent_configurations"] = tuple(
+                    _freeze_approved_config(item)
+                    for item in frozen_update["approved_agent_configurations"]
+                )
+            if "declared_tools" in frozen_update:
+                frozen_update["declared_tools"] = tuple(
+                    frozen_update["declared_tools"]
+                )
+            if "response_schema" in frozen_update:
+                schema_val = frozen_update["response_schema"]
+                if not isinstance(schema_val, ResponseSchema):
+                    schema_val = ResponseSchema.model_validate(schema_val)
+                frozen_update["response_schema"] = _freeze_response_schema(
+                    schema_val
+                )
+            if "validation_phases" in frozen_update:
+                frozen_update["validation_phases"] = tuple(
+                    frozen_update["validation_phases"]
+                )
+            if "rules" in frozen_update:
+                frozen_update["rules"] = tuple(
+                    item
+                    if isinstance(item, RuleBinding)
+                    else RuleBinding.model_validate(item)
+                    for item in frozen_update["rules"]
+                )
+            if "metadata" in frozen_update:
+                frozen_update["metadata"] = _freeze_json_object(
+                    dict(frozen_update["metadata"])
+                )
+            copied = super().model_copy(update=frozen_update, deep=False)
+            copied.check_unique_instance_ids()
+            return copied
+        return self.__copy__()
 
 
 ContractSchema: TypeAlias = AgentContract | ContractRulesV2 | ContractRulesV3

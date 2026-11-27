@@ -12,7 +12,14 @@ from typing import TypeAlias
 
 from pydantic import BaseModel, ConfigDict
 
-from .models import GovernorInput, JsonObject, Phase, Violation
+from .models import (
+    FrozenJsonObject,
+    GovernorInput,
+    JsonObject,
+    Phase,
+    Violation,
+    _thaw_json_value,
+)
 
 RuleHandler: TypeAlias = Callable[[GovernorInput], bool | Violation | None]
 
@@ -242,9 +249,11 @@ class RuleCatalog:
     def rule_types(self) -> dict[str, RuleTypeSpec]:
         return dict(self._rule_types)
 
-    def validate_rule_params(self, rule_type: str, params: JsonObject) -> BaseModel:
+    def validate_rule_params(
+        self, rule_type: str, params: JsonObject | FrozenJsonObject
+    ) -> BaseModel:
         spec = self._rule_types[rule_type]
-        return spec.params_model.model_validate(params)
+        return spec.params_model.model_validate(_thaw_json_value(params))
 
     def _coerce_violation(
         self,
