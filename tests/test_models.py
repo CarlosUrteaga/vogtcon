@@ -1806,9 +1806,9 @@ remain independent of that checkout and of any developer-specific path.
 
 
 class PublicApiTests(unittest.TestCase):
-    def test_v041_and_stage1_exports_are_available_and_listed_in_all(self):
+    def test_v041_stage1_and_stage2_exports_are_available_and_listed_in_all(self):
         import vogtcon
-        from vogtcon import contracts, models, rules
+        from vogtcon import contracts, effects, models, records, rules
 
         historical_exports = (
             "load_contract",
@@ -1846,17 +1846,58 @@ class PublicApiTests(unittest.TestCase):
             "EmptyRuleParams",
             "RuleTypeSpec",
         )
+        stage2_model_exports = (
+            "EffectEventKind",
+            "EffectId",
+            "EffectRecord",
+            "EffectStatus",
+            "PolicyScopeId",
+            "ReconciliationStatus",
+            "TrajectoryEntry",
+            "TrajectoryView",
+        )
+        stage2_effects_exports = (
+            "CompensationRecord",
+            "ConcurrencyError",
+            "EffectGovernanceConfig",
+            "EffectGovernanceError",
+            "EffectObservationError",
+            "EffectObserver",
+            "EffectResolutionError",
+            "EffectResolver",
+            "EffectStore",
+            "InMemoryEffectStore",
+            "ObservationInput",
+            "ObservedEffect",
+            "ReconciliationError",
+            "ReconciliationRecord",
+            "ResolvedAction",
+            "ScopeSuspendedError",
+        )
+        stage2_records_exports = (
+            "RecordedEvent",
+            "RunEventV2",
+            "parse_run_event",
+        )
+        stage2_rules_exports = ("V3RuleHandler",)
+        stage2_exports = (
+            stage2_model_exports
+            + stage2_effects_exports
+            + stage2_records_exports
+            + stage2_rules_exports
+        )
 
         self.assertEqual(len(historical_exports), 22)
         self.assertEqual(len(stage1_exports), 10)
-        self.assertEqual(len(vogtcon.__all__), 32)
-        self.assertEqual(len(set(vogtcon.__all__)), 32)
+        self.assertEqual(len(stage2_exports), 28)
+        self.assertEqual(len(vogtcon.__all__), 60)
+        self.assertEqual(len(set(vogtcon.__all__)), 60)
         self.assertEqual(
             set(vogtcon.__all__),
-            set(historical_exports) | set(stage1_exports),
+            set(historical_exports) | set(stage1_exports) | set(stage2_exports),
         )
 
-        for name in historical_exports + stage1_exports:
+        for name in historical_exports + stage1_exports + stage2_exports:
             with self.subTest(symbol=name):
                 self.assertIn(name, vogtcon.__all__)
                 self.assertTrue(hasattr(vogtcon, name))
@@ -1872,10 +1913,20 @@ class PublicApiTests(unittest.TestCase):
             "OPERATION_IDENTITY_VERSION",
             "PlannedEffect",
             "RuleBinding",
+            *stage2_model_exports,
         ):
             self.assertIs(getattr(vogtcon, name), getattr(models, name))
-        for name in ("DEFAULT_RULE_TYPES", "EmptyRuleParams", "RuleTypeSpec"):
+        for name in (
+            "DEFAULT_RULE_TYPES",
+            "EmptyRuleParams",
+            "RuleTypeSpec",
+            *stage2_rules_exports,
+        ):
             self.assertIs(getattr(vogtcon, name), getattr(rules, name))
+        for name in stage2_effects_exports:
+            self.assertIs(getattr(vogtcon, name), getattr(effects, name))
+        for name in stage2_records_exports:
+            self.assertIs(getattr(vogtcon, name), getattr(records, name))
 
 
 if __name__ == "__main__":

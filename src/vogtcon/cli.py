@@ -205,6 +205,7 @@ def render_explain_text(
         else:
             lines.append("  -  pre_execution     missing")
 
+        rendered_reconciled_ids: set[str] = set()
         for act in run["actions"]:
             idx = act["action_index"]
             tool = act["tool_name"]
@@ -221,12 +222,15 @@ def render_explain_text(
             outcome = act["tool_outcome"]
             evidence = act["effect_evidence"]
             if act["tool_event_sequence"] is not None:
+                has_v2_obs = act.get("observation_sequence") is not None
                 if outcome == "completed":
                     ev_name = "tool_completed"
                     note = "callable returned; external delivery not verified"
+                    tool_ev_evidence = "not_verified" if has_v2_obs else evidence
                 elif outcome == "error":
                     ev_name = "tool_error"
                     note = "tool raised error; effect indeterminate"
+                    tool_ev_evidence = "indeterminate" if has_v2_obs else evidence
                 else:
                     recorded_ev = tool_events.get((run_id, idx)) if tool_events else None
                     if recorded_ev is None and run.get("terminal") == "tool_error" and act is run["actions"][-1]:
@@ -238,13 +242,62 @@ def render_explain_text(
                         note = "tool raised error without recorded decision; effect indeterminate"
                     else:
                         note = "tool event recorded without decision; effect indeterminate"
+                    tool_ev_evidence = evidence
                 lines.append(
-                    f"  {act['tool_event_sequence']}  action {idx:<3}  {ev_name}  {note} ({evidence})"
+                    f"  {act['tool_event_sequence']}  action {idx:<3}  {ev_name}  {note} ({tool_ev_evidence})"
                 )
             elif outcome == "prevented":
                 lines.append(f"  -  action {idx:<3}  not executed ({evidence})")
             else:
                 lines.append(f"  -  action {idx:<3}  tool outcome missing ({evidence})")
+
+            if act.get("observation_sequence") is not None:
+                eff_id = act.get("effect_id") or "-"
+                obs_status = (
+                    "uncertain"
+                    if act.get("reconciliation_sequence") is not None
+                    else (act.get("effect_status") or "unknown")
+                )
+                scope = act.get("policy_scope")
+                scope_note = f" scope={scope}" if scope is not None else ""
+                obs_evidence = (
+                    "indeterminate"
+                    if act.get("reconciliation_sequence") is not None
+                    else evidence
+                )
+                lines.append(
+                    f"  {act['observation_sequence']}  action {idx:<3}  effect_observed  {eff_id} status={obs_status}{scope_note} ({obs_evidence})"
+                )
+            if act.get("reconciliation_sequence") is not None:
+                eff_id = act.get("effect_id") or "-"
+                rec_status = act.get("effect_status") or "unknown"
+                ev_ref = act.get("reconciliation_evidence_ref")
+                ref_note = f" ref={ev_ref}" if ev_ref is not None else ""
+                rendered_reconciled_ids.add(eff_id)
+                lines.append(
+                    f"  {act['reconciliation_sequence']}  action {idx:<3}  effect_reconciled  {eff_id} status={rec_status}{ref_note} ({evidence})"
+                )
+
+        for rec in run.get("reconciliations") or ():
+            if rec["effect_id"] not in rendered_reconciled_ids:
+                scope_note = (
+                    f" scope={rec['policy_scope']}"
+                    if rec.get("policy_scope") is not None
+                    else ""
+                )
+                lines.append(
+                    f"  {rec['sequence']}  reconcile  effect_reconciled  {rec['effect_id']} status={rec['effect_status']}{scope_note} ref={rec['evidence_ref']}"
+                )
+
+        for comp in run.get("compensations") or ():
+            scope_note = (
+                f" scope={comp['policy_scope']}"
+                if comp.get("policy_scope") is not None
+                else ""
+            )
+            lines.append(
+                f"  {comp['sequence']}  compensate  effect_compensated  {comp['effect_id']} compensates={comp['compensates_effect_id']} tool={comp['tool_name']}{scope_note} ref={comp['evidence_ref']}"
+            )
 
         post = run["post_execution"]
         if post is not None:

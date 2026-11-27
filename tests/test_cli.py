@@ -18,11 +18,22 @@ import yaml
 
 from vogtcon import (
     ActionProposal,
+    CompensationRecord,
     ContractRulesV3,
+    EffectGovernanceConfig,
     EnforcementPolicy,
     ExecutionContext,
+    Governor,
+    HostFacts,
+    InMemoryEffectStore,
     JsonlDecisionLog,
+    ObservationInput,
+    ObservedEffect,
+    PlannedEffect,
+    ReconciliationRecord,
+    ResolvedAction,
     RunEvent,
+    RunEventV2,
     WorkflowController,
     compute_v3_contract_fingerprint,
 )
@@ -1259,7 +1270,7 @@ class TestCliExplainStage3(unittest.TestCase):
 
         # 3. Unsupported event schema_version on physical line 2
         bad_ver = json.loads(ev1.model_dump_json())
-        bad_ver["schema_version"] = 2
+        bad_ver["schema_version"] = 3
         self.log_path.write_text(
             f"{ev1.model_dump_json()}\n{json.dumps(bad_ver)}\n",
             encoding="utf-8",
@@ -1832,3 +1843,484 @@ class TestCliValidateV3(unittest.TestCase):
         self.assertEqual(first[0], EXIT_VALID)
         self.assertEqual(json.loads(first[1])["path"], dotted_path)
         self.assertEqual(self.contract_path.read_bytes(), raw)
+
+
+class TestCliExplainV2(unittest.TestCase):
+    def setUp(self) -> None:
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.workspace_dir = Path(workspace.name)
+        self.log_path = self.workspace_dir / "decisions_v2.jsonl"
+
+    def run_cli(self, args: list[str]) -> tuple[int, str, str]:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = main(args)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def _v3_contract(self) -> ContractRulesV3:
+        draft = ContractRulesV3.model_validate({
+            "schema_version": 3,
+            "contract_id": "example.governed.v3",
+            "approved_agent_configurations": ["agent-v3"],
+            "declared_tools": ["send_notification"],
+            "response_schema": {"required_fields": ["status"]},
+            "memory_policy": "none",
+            "validation_phases": ["pre_execution", "runtime", "post_execution"],
+            "rules": [
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "response-schema",
+                    "rule_type": "response.schema_complete",
+                    "phases": ["post_execution"],
+                },
+            ],
+            "contract_fingerprint": "sha256:placeholder",
+        })
+        return draft.model_copy(
+            update={"contract_fingerprint": compute_v3_contract_fingerprint(draft)}
+        )
+
+    def _v3_context(self, v3: ContractRulesV3) -> ExecutionContext:
+        return ExecutionContext(
+            state={"approval_granted": True},
+            available_tools=["send_notification"],
+            observed_agent_fingerprint="agent-v3",
+            observed_contract_fingerprint=v3.contract_fingerprint,
+        )
+
+    def _make_resolver(self, secret: str = ""):
+        class _Res:
+            def resolve(
+                self, proposal: ActionProposal, ctx: ExecutionContext
+            ) -> ResolvedAction:
+                return ResolvedAction(
+                    planned_effect=PlannedEffect(
+                        tool_name=proposal.tool_name,
+                        parameters={"recipient": f"ops{secret}@example.com"},
+                    ),
+                    host_facts=HostFacts(
+                        facts={**dict(ctx.state), **({"secret_fact": secret} if secret else {})}
+                    ),
+                )
+
+        return _Res()
+
+    def _make_observer(self, statuses: list[tuple[str, str | None]]):
+        it = iter(statuses)
+
+        class _Obs:
+            def observe(
+                self, observation: ObservationInput, *, tool_result: object = None
+            ) -> ObservedEffect:
+                status, ref = next(it)
+                return ObservedEffect(status=status, evidence_ref=ref)  # type: ignore[arg-type]
+
+        return _Obs()
+
+    def test_explain_v2_confirmed_confirmed_absent_reconcile_and_compensation(self) -> None:
+        v3 = self._v3_contract()
+        ctx = self._v3_context(v3)
+        store = InMemoryEffectStore()
+        recorder = JsonlDecisionLog(self.log_path)
+        secret_arg = "SECRET_ARG_SENTINEL_777"
+        secret_res = "SECRET_RES_SENTINEL_888"
+
+        controller = WorkflowController(
+            Governor(),
+            "run-v2-full",
+            v3,
+            recorder=recorder,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store,
+                resolver=self._make_resolver(secret="SECRET_HOST_FACT_999"),
+                observer=self._make_observer([
+                    ("confirmed", "obs-confirmed-1"),
+                    ("confirmed_absent", "obs-absent-2"),
+                    ("uncertain", "obs-uncertain-3"),
+                ]),
+                policy_scope="scope.cli",
+            ),
+        )
+        controller.begin(ctx)
+
+        # Action 1: confirmed
+        out1 = controller.execute(
+            ActionProposal(tool_name="send_notification", arguments={"msg": secret_arg}),
+            ctx,
+            lambda _p: secret_res,
+        )
+        assert out1.effect is not None
+
+        # Action 2: confirmed_absent
+        out2 = controller.execute(
+            ActionProposal(tool_name="send_notification", arguments={"msg": "two"}),
+            ctx,
+            lambda _p: "noop",
+        )
+        assert out2.effect is not None
+
+        # Action 3: tool_error -> uncertain -> host reconciliation -> compensation of action 1 -> finish
+        with self.assertRaises(RuntimeError):
+            controller.execute(
+                ActionProposal(tool_name="send_notification", arguments={"msg": "three"}),
+                ctx,
+                lambda _p: (_ for _ in ()).throw(RuntimeError("timeout")),
+            )
+        uncertain_id = store.uncertain_effects("scope.cli")[0]
+        controller.reconcile(
+            ReconciliationRecord(
+                effect_id=uncertain_id,
+                resolved_status="confirmed",
+                evidence_ref="gateway-audit-3",
+                policy_scope="scope.cli",
+            )
+        )
+        comp = controller.record_compensation(
+            CompensationRecord(
+                compensates_effect_id=out1.effect.effect_id,
+                tool_name="cancel_notification",
+                operation_digest=PlannedEffect(tool_name="cancel_notification").operation_digest(),
+                evidence_ref="comp-ref-1",
+                policy_scope="scope.cli",
+            )
+        )
+        controller.finish(ctx, {"status": "ok"})
+
+        code_j, out_j, err_j = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code_j, err_j), (0, ""))
+        res = json.loads(out_j)
+        self.assertEqual(res["output_version"], 1)
+        self.assertEqual(res["status"], "ok")
+        run = res["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "complete")
+        self.assertEqual(run["terminal"], "post_execution")
+
+        act1, act2, act3 = run["actions"]
+        self.assertEqual(act1["effect_evidence"], "confirmed_by_host_observation")
+        self.assertEqual(act1["effect_status"], "confirmed")
+        self.assertIsNotNone(act1["observation_sequence"])
+        self.assertEqual(act2["effect_evidence"], "confirmed_absent_by_host")
+        self.assertEqual(act2["effect_status"], "confirmed_absent")
+        self.assertEqual(act3["tool_outcome"], "error")
+        self.assertEqual(act3["effect_evidence"], "confirmed_by_reconciliation")
+        self.assertIsNotNone(act3["observation_sequence"])
+        self.assertIsNotNone(act3["reconciliation_sequence"])
+        self.assertEqual(act3["reconciliation_evidence_ref"], "gateway-audit-3")
+        self.assertEqual(len(run["compensations"]), 1)
+        self.assertEqual(run["compensations"][0]["effect_id"], comp.effect_id)
+        self.assertEqual(run["compensations"][0]["compensates_effect_id"], out1.effect.effect_id)
+        # Original confirmed action 1 remains untouched (INV-07)
+        self.assertEqual(act1["effect_status"], "confirmed")
+
+        # Text output distinguishes callable return not_verified from host-confirmed/reconciled effects
+        code_t, out_t, err_t = self.run_cli(["explain", str(self.log_path)])
+        self.assertEqual((code_t, err_t), (0, ""))
+        self.assertIn("not_verified", out_t)
+        self.assertIn("confirmed_by_host_observation", out_t)
+        self.assertIn("confirmed_absent_by_host", out_t)
+        self.assertIn("effect_observed", out_t)
+        self.assertIn("effect_reconciled", out_t)
+        self.assertIn("confirmed_by_reconciliation", out_t)
+        self.assertIn("effect_compensated", out_t)
+
+        # Zero secret leaks in JSON or text (INV-08)
+        for secret in (secret_arg, secret_res, "SECRET_HOST_FACT_999"):
+            self.assertNotIn(secret, out_j)
+            self.assertNotIn(secret, out_t)
+
+    def test_explain_v2_cross_run_reconciliation_and_run_id_filter(self) -> None:
+        v3 = self._v3_contract()
+        ctx = self._v3_context(v3)
+        store = InMemoryEffectStore()
+        recorder = JsonlDecisionLog(self.log_path)
+
+        c1 = WorkflowController(
+            Governor(),
+            "run-1",
+            v3,
+            recorder=recorder,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store,
+                resolver=self._make_resolver(),
+                observer=self._make_observer([("uncertain", "obs-u1")]),
+                policy_scope="scope.shared",
+            ),
+        )
+        c1.begin(ctx)
+        out1 = c1.execute(ActionProposal(tool_name="send_notification"), ctx, lambda _p: "maybe")
+        assert out1.effect is not None
+        c1.finish(ctx, {"status": "uncertain"})
+
+        c2 = WorkflowController(
+            Governor(),
+            "run-2",
+            v3,
+            recorder=recorder,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store,
+                resolver=self._make_resolver(),
+                observer=self._make_observer([("confirmed", "obs-c2")]),
+                policy_scope="scope.shared",
+            ),
+        )
+        c2.begin(ctx)
+        c2.reconcile(
+            ReconciliationRecord(
+                effect_id=out1.effect.effect_id,
+                resolved_status="confirmed_absent",
+                evidence_ref="cross-run-ref",
+                policy_scope="scope.shared",
+            )
+        )
+        c2.execute(ActionProposal(tool_name="send_notification"), ctx, lambda _p: "sent")
+        c2.finish(ctx, {"status": "ok"})
+
+        # Both runs together
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        runs = json.loads(out)["data"]["runs"]
+        self.assertEqual([r["run_id"] for r in runs], ["run-1", "run-2"])
+        self.assertEqual(runs[0]["actions"][0]["effect_evidence"], "indeterminate")
+        self.assertEqual(runs[1]["trace_integrity"], "complete")
+        self.assertEqual(len(runs[1]["reconciliations"]), 1)
+        self.assertEqual(runs[1]["reconciliations"][0]["effect_id"], out1.effect.effect_id)
+        self.assertEqual(runs[1]["reconciliations"][0]["effect_status"], "confirmed_absent")
+
+        # Filtered to --run-id run-2
+        code_f, out_f, err_f = self.run_cli(
+            ["explain", str(self.log_path), "--run-id", "run-2", "--json"]
+        )
+        self.assertEqual((code_f, err_f), (0, ""))
+        res_f = json.loads(out_f)
+        self.assertEqual(res_f["status"], "ok")
+        self.assertEqual(len(res_f["data"]["runs"][0]["reconciliations"]), 1)
+
+        code_t, out_t, err_t = self.run_cli(["explain", str(self.log_path), "--run-id", "run-2"])
+        self.assertEqual((code_t, err_t), (0, ""))
+        self.assertIn("effect_reconciled", out_t)
+        self.assertIn("cross-run-ref", out_t)
+
+    def test_explain_mixed_v1_and_v2_runs_preserves_exact_v1_schema(self) -> None:
+        digest = PlannedEffect(tool_name="send_notification").operation_digest()
+        events = [
+            RunEvent(
+                run_id="run-v1",
+                sequence=1,
+                contract_id="c-v1",
+                mode="guarded",
+                phase="pre_execution",
+                event_type="decision",
+            ),
+            RunEvent(
+                run_id="run-v1",
+                sequence=2,
+                contract_id="c-v1",
+                mode="guarded",
+                phase="runtime",
+                event_type="decision",
+                action_index=1,
+                tool_name="send_notification",
+                decision="allow",
+            ),
+            RunEvent(
+                run_id="run-v1",
+                sequence=3,
+                contract_id="c-v1",
+                mode="guarded",
+                phase="runtime",
+                event_type="tool_completed",
+                action_index=1,
+                tool_name="send_notification",
+                execution_status="completed",
+            ),
+            RunEvent(
+                run_id="run-v1",
+                sequence=4,
+                contract_id="c-v1",
+                mode="guarded",
+                phase="post_execution",
+                event_type="decision",
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=1,
+                contract_id="c-v2",
+                mode="guarded",
+                phase="pre_execution",
+                event_type="decision",
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=2,
+                contract_id="c-v2",
+                mode="guarded",
+                phase="runtime",
+                event_type="decision",
+                action_index=1,
+                tool_name="send_notification",
+                decision="allow",
+                effect_id="eff-000001",
+                operation_digest=digest,
+                effect_status="reserved",
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=3,
+                contract_id="c-v2",
+                mode="guarded",
+                phase="runtime",
+                event_type="tool_completed",
+                action_index=1,
+                tool_name="send_notification",
+                execution_status="completed",
+                effect_id="eff-000001",
+                operation_digest=digest,
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=4,
+                contract_id="c-v2",
+                mode="guarded",
+                phase="runtime",
+                event_type="effect_observed",
+                action_index=1,
+                tool_name="send_notification",
+                execution_status="completed",
+                effect_id="eff-000001",
+                operation_digest=digest,
+                effect_status="confirmed",
+            ),
+            RunEventV2(
+                run_id="run-v2",
+                sequence=5,
+                contract_id="c-v2",
+                mode="guarded",
+                phase="post_execution",
+                event_type="decision",
+            ),
+        ]
+        self.log_path.write_text(
+            "\n".join(ev.model_dump_json() for ev in events) + "\n", encoding="utf-8"
+        )
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        v1_run, v2_run = json.loads(out)["data"]["runs"]
+        self.assertEqual(
+            set(v1_run.keys()),
+            {
+                "run_id",
+                "contract_id",
+                "mode",
+                "trace_integrity",
+                "terminal",
+                "pre_execution",
+                "post_execution",
+                "actions",
+                "counts",
+            },
+        )
+        self.assertNotIn("effect_id", v1_run["actions"][0])
+        self.assertEqual(v1_run["actions"][0]["effect_evidence"], "not_verified")
+        self.assertIn("reconciliations", v2_run)
+        self.assertIn("compensations", v2_run)
+        self.assertEqual(v2_run["actions"][0]["effect_evidence"], "confirmed_by_host_observation")
+
+    def test_explain_v2_partial_and_inconsistent_cases(self) -> None:
+        digest = PlannedEffect(tool_name="send_notification").operation_digest()
+
+        def write_events(evs: list[RunEvent | RunEventV2]) -> None:
+            self.log_path.write_text(
+                "\n".join(ev.model_dump_json() for ev in evs) + "\n", encoding="utf-8"
+            )
+
+        # 1. Missing effect_observed WITH sequence gap -> partial, indeterminate
+        write_events([
+            RunEventV2(run_id="gap-obs", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="gap-obs", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-1", operation_digest=digest, effect_status="reserved"),
+            RunEventV2(run_id="gap-obs", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-1", operation_digest=digest),
+            RunEventV2(run_id="gap-obs", sequence=5, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        run = json.loads(out)["data"]["runs"][0]
+        self.assertEqual(run["trace_integrity"], "partial")
+        self.assertEqual(run["actions"][0]["effect_evidence"], "indeterminate")
+
+        # 2. Missing effect_observed WITHOUT sequence gap before post_execution -> inconsistent
+        write_events([
+            RunEventV2(run_id="nogap-obs", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="nogap-obs", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-1", operation_digest=digest, effect_status="reserved"),
+            RunEventV2(run_id="nogap-obs", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-1", operation_digest=digest),
+            RunEventV2(run_id="nogap-obs", sequence=4, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(out)["status"], "inconsistent_log")
+
+        # 3. Mixing v1 and v2 in same run_id -> inconsistent
+        write_events([
+            RunEvent(run_id="mix-run", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="mix-run", sequence=2, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(out)["status"], "inconsistent_log")
+
+        # 4. Duplicate effect_observed -> inconsistent
+        write_events([
+            RunEventV2(run_id="dup-obs", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="dup-obs", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-1", operation_digest=digest, effect_status="reserved"),
+            RunEventV2(run_id="dup-obs", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-1", operation_digest=digest),
+            RunEventV2(run_id="dup-obs", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-1", operation_digest=digest, effect_status="confirmed"),
+            RunEventV2(run_id="dup-obs", sequence=5, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-1", operation_digest=digest, effect_status="confirmed"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(out)["status"], "inconsistent_log")
+
+        # 5. Reconciling known confirmed effect (same run & cross run) -> inconsistent
+        write_events([
+            RunEventV2(run_id="rec-conf", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="rec-conf", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-c1", operation_digest=digest, effect_status="reserved"),
+            RunEventV2(run_id="rec-conf", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-c1", operation_digest=digest),
+            RunEventV2(run_id="rec-conf", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-c1", operation_digest=digest, effect_status="confirmed"),
+            RunEventV2(run_id="rec-conf", sequence=5, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_reconciled", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-c1", operation_digest=digest, effect_status="confirmed_absent", evidence_ref="bad-rec"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(out)["status"], "inconsistent_log")
+
+        # 6. Duplicate effect_reconciled across runs -> inconsistent
+        write_events([
+            RunEventV2(run_id="r-a", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="r-a", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-u1", operation_digest=digest, effect_status="reserved"),
+            RunEventV2(run_id="r-a", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-u1", operation_digest=digest),
+            RunEventV2(run_id="r-a", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="unknown", effect_id="eff-u1", operation_digest=digest, effect_status="uncertain"),
+            RunEventV2(run_id="r-a", sequence=5, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_reconciled", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-u1", operation_digest=digest, effect_status="confirmed", evidence_ref="rec-1"),
+            RunEventV2(run_id="r-b", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="r-b", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_reconciled", tool_name="send_notification", execution_status="completed", effect_id="eff-u1", operation_digest=digest, effect_status="confirmed_absent", evidence_ref="rec-2"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(out)["status"], "inconsistent_log")
+
+        # 7. Unsupported schema_version: 3 -> invalid_log
+        bad_line = json.loads(
+            RunEventV2(run_id="r-bad", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision").model_dump_json()
+        )
+        bad_line["schema_version"] = 3
+        self.log_path.write_text(json.dumps(bad_line) + "\n", encoding="utf-8")
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        res = json.loads(out)
+        self.assertEqual(res["status"], "invalid_log")
+        self.assertEqual(res["diagnostics"][0]["code"], "invalid_event")

@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .records import RunEvent
+from .records import RecordedEvent, RunEventV2, parse_run_event
 
 EXIT_OK = 0
 EXIT_INVALID_OR_INCONSISTENT = 1
@@ -129,8 +129,33 @@ def _classify_outcome(
 
 def _analyze_run(
     run_id: str,
-    items: list[tuple[int, RunEvent]],
+    items: list[tuple[int, RecordedEvent]],
+    *,
+    known_effects_across_runs: dict[str, dict[str, Any]] | None = None,
+    file_reconciled_lines: dict[str, list[tuple[str, int]]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, str]]:
+    has_v1 = any(not isinstance(ev, RunEventV2) for _, ev in items)
+    has_v2 = any(isinstance(ev, RunEventV2) for _, ev in items)
+    if has_v1 and has_v2:
+        first_is_v2 = isinstance(items[0][1], RunEventV2)
+        first_mix_line = next(
+            line_no
+            for line_no, ev in items
+            if isinstance(ev, RunEventV2) != first_is_v2
+        )
+        return _inconsistent_run(
+            run_id,
+            f"Run '{run_id}' mixes schema_version 1 and 2 at line {first_mix_line}",
+            line=first_mix_line,
+        )
+    if has_v2:
+        return _analyze_run_v2(
+            run_id,
+            [(line_no, ev) for line_no, ev in items if isinstance(ev, RunEventV2)],
+            known_effects_across_runs=known_effects_across_runs or {},
+            file_reconciled_lines=file_reconciled_lines or {},
+        )
+
     first_event = items[0][1]
     contract_id = first_event.contract_id
     mode = first_event.mode
@@ -401,13 +426,563 @@ def _analyze_run(
     )
 
 
+def _analyze_run_v2(
+    run_id: str,
+    items: list[tuple[int, RunEventV2]],
+    *,
+    known_effects_across_runs: dict[str, dict[str, Any]],
+    file_reconciled_lines: dict[str, list[tuple[str, int]]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, str]]:
+    first_event = items[0][1]
+    contract_id = first_event.contract_id
+    mode = first_event.mode
+
+    prev_seq: int | None = None
+    has_seq_gap = False
+    seq_gaps: list[tuple[int, int]] = []
+    terminal: str | None = None
+    pre_execution: dict[str, Any] | None = None
+    post_execution: dict[str, Any] | None = None
+
+    actions_order: list[int] = []
+    actions_map: dict[int, dict[str, Any]] = {}
+    last_blocked_by_tool: dict[str, int] = {}
+    prev_action_index: int | None = None
+    has_action_gap = False
+    missing_decision_demands: list[tuple[int, int, int]] = []
+
+    effects_by_id: dict[str, dict[str, Any]] = {}
+    observed_effect_ids: set[str] = set()
+    reconciled_in_run: set[str] = set()
+    compensated_effect_ids: set[str] = set()
+    reconciliations: list[dict[str, Any]] = []
+    compensations: list[dict[str, Any]] = []
+
+    for line_no, event in items:
+        if event.contract_id != contract_id or event.mode != mode:
+            return _inconsistent_run(
+                run_id,
+                f"Run '{run_id}' mixes contract_id or mode at line {line_no}",
+                line=line_no,
+            )
+
+        if prev_seq is None:
+            if event.sequence != 1:
+                has_seq_gap = True
+                seq_gaps.append((0, event.sequence))
+        else:
+            if event.sequence <= prev_seq:
+                return _inconsistent_run(
+                    run_id,
+                    f"Non-increasing sequence {event.sequence} at line {line_no}",
+                    line=line_no,
+                )
+            if event.sequence > prev_seq + 1:
+                has_seq_gap = True
+                seq_gaps.append((prev_seq, event.sequence))
+        prev_seq = event.sequence
+
+        if terminal is not None:
+            return _inconsistent_run(
+                run_id,
+                f"Event after terminal {terminal} at line {line_no}",
+                line=line_no,
+            )
+
+        if event.phase == "pre_execution":
+            if pre_execution is not None or actions_order or reconciliations or compensations:
+                return _inconsistent_run(
+                    run_id,
+                    f"Unexpected pre_execution event at line {line_no}",
+                    line=line_no,
+                )
+            pre_execution = {
+                "sequence": event.sequence,
+                "decision": None,
+                "violation_rules": list(event.violation_rules),
+            }
+            if mode == "strict" and event.violation_rules:
+                terminal = "pre_abort"
+            continue
+
+        if event.phase == "post_execution":
+            slot_demands = [(lo, hi) for lo, hi, _ in missing_decision_demands]
+            for act_idx in actions_order:
+                entry = actions_map[act_idx]
+                if entry["decision"] in ("allow", "allow_with_warning"):
+                    if entry["finalizer_type"] is None:
+                        slot_demands.append((entry["decision_sequence"] + 1, event.sequence - 1))
+                        if entry["observation_sequence"] is None:
+                            slot_demands.append((entry["decision_sequence"] + 1, event.sequence - 1))
+                    elif entry["observation_sequence"] is None:
+                        slot_demands.append((entry["tool_event_sequence"] + 1, event.sequence - 1))
+                elif entry["finalizer_type"] is not None and entry["observation_sequence"] is None:
+                    slot_demands.append((entry["tool_event_sequence"] + 1, event.sequence - 1))
+            if slot_demands and not _can_allocate_distinct_slots(seq_gaps, slot_demands):
+                return _inconsistent_run(
+                    run_id,
+                    "Insufficient distinct sequence slots for missing events before post_execution",
+                    line=line_no,
+                )
+            post_execution = {
+                "sequence": event.sequence,
+                "decision": None,
+                "violation_rules": list(event.violation_rules),
+            }
+            terminal = "post_execution"
+            continue
+
+        # Pre-action_index dispatch for reconciliation and compensation events
+        if event.event_type == "effect_reconciled":
+            assert event.effect_id is not None and event.effect_status is not None
+            eff_id = event.effect_id
+            if eff_id in reconciled_in_run or any(
+                prev_line < line_no
+                for _, prev_line in file_reconciled_lines.get(eff_id, ())
+            ):
+                return _inconsistent_run(
+                    run_id,
+                    f"Duplicate effect_reconciled for effect '{eff_id}' at line {line_no}",
+                    line=line_no,
+                )
+            if eff_id in effects_by_id:
+                eff_info = effects_by_id[eff_id]
+                if eff_info["observed_status"] != "uncertain":
+                    return _inconsistent_run(
+                        run_id,
+                        f"Cannot reconcile non-uncertain effect '{eff_id}' at line {line_no}",
+                        line=line_no,
+                    )
+                eff_info["reconciled_status"] = event.effect_status
+                eff_info["reconciliation_sequence"] = event.sequence
+                eff_info["reconciliation_evidence_ref"] = event.evidence_ref
+                act_entry = actions_map[eff_info["action_index"]]
+                act_entry["effect_status"] = event.effect_status
+                act_entry["reconciled"] = True
+                act_entry["reconciliation_sequence"] = event.sequence
+                act_entry["reconciliation_evidence_ref"] = event.evidence_ref
+            else:
+                cross_info = known_effects_across_runs.get(eff_id)
+                if cross_info is not None:
+                    if cross_info.get("observed_status") != "uncertain":
+                        return _inconsistent_run(
+                            run_id,
+                            f"Cannot reconcile non-uncertain effect '{eff_id}' at line {line_no}",
+                            line=line_no,
+                        )
+            reconciled_in_run.add(eff_id)
+            reconciliations.append({
+                "effect_id": eff_id,
+                "effect_status": event.effect_status,
+                "sequence": event.sequence,
+                "policy_scope": event.policy_scope,
+                "evidence_ref": event.evidence_ref,
+            })
+            continue
+
+        if event.event_type == "effect_compensated":
+            assert (
+                event.effect_id is not None
+                and event.compensates_effect_id is not None
+                and event.tool_name is not None
+            )
+            eff_id = event.effect_id
+            if eff_id == event.compensates_effect_id:
+                return _inconsistent_run(
+                    run_id,
+                    f"Effect '{eff_id}' cannot compensate itself at line {line_no}",
+                    line=line_no,
+                )
+            if eff_id in compensated_effect_ids:
+                return _inconsistent_run(
+                    run_id,
+                    f"Duplicate effect_compensated for effect '{eff_id}' at line {line_no}",
+                    line=line_no,
+                )
+            compensated_effect_ids.add(eff_id)
+            compensations.append({
+                "effect_id": eff_id,
+                "compensates_effect_id": event.compensates_effect_id,
+                "tool_name": event.tool_name,
+                "sequence": event.sequence,
+                "policy_scope": event.policy_scope,
+                "evidence_ref": event.evidence_ref,
+            })
+            continue
+
+        # Runtime action-bound events (decision, tool_completed, tool_error, effect_observed)
+        assert event.action_index is not None and event.tool_name is not None
+        act_idx = event.action_index
+        if event.event_type == "decision":
+            if act_idx in actions_map:
+                return _inconsistent_run(
+                    run_id,
+                    f"Duplicate or out-of-order decision for action {act_idx} at line {line_no}",
+                    line=line_no,
+                )
+            if prev_action_index is None:
+                if act_idx != 1:
+                    has_action_gap = True
+            else:
+                if act_idx <= prev_action_index:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Non-increasing action_index {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if act_idx > prev_action_index + 1:
+                    has_action_gap = True
+            if (
+                mode in ("guarded", "strict")
+                and event.violation_rules
+                and event.decision in ("allow", "allow_with_warning")
+            ):
+                return _inconsistent_run(
+                    run_id,
+                    f"Decision '{event.decision}' with violations in {mode} mode at line {line_no}",
+                    line=line_no,
+                )
+            prev_action_index = act_idx
+
+            prior_block = last_blocked_by_tool.get(event.tool_name)
+            if event.decision == "block":
+                last_blocked_by_tool[event.tool_name] = act_idx
+
+            actions_order.append(act_idx)
+            actions_map[act_idx] = {
+                "action_index": act_idx,
+                "tool_name": event.tool_name,
+                "decision": event.decision,
+                "decision_sequence": event.sequence,
+                "tool_event_sequence": None,
+                "finalizer_type": None,
+                "violation_rules": list(event.violation_rules),
+                "prior_same_tool_block_action_index": prior_block,
+                "effect_id": event.effect_id,
+                "policy_scope": event.policy_scope,
+                "operation_digest": event.operation_digest,
+                "effect_status": event.effect_status,
+                "observed_status": None,
+                "observation_sequence": None,
+                "observation_evidence_ref": None,
+                "reconciled": False,
+                "reconciliation_sequence": None,
+                "reconciliation_evidence_ref": None,
+            }
+            if event.effect_id is not None:
+                effects_by_id[event.effect_id] = {
+                    "action_index": act_idx,
+                    "policy_scope": event.policy_scope,
+                    "operation_digest": event.operation_digest,
+                    "observed_status": None,
+                    "reconciled_status": None,
+                }
+            if event.decision == "abort" or (mode == "strict" and event.violation_rules):
+                terminal = "runtime_abort"
+        elif event.event_type in ("tool_completed", "tool_error"):
+            if act_idx in actions_map:
+                entry = actions_map[act_idx]
+                if entry["finalizer_type"] is not None:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Duplicate tool event for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if entry["tool_name"] != event.tool_name:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Tool name mismatch for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if entry["decision"] in ("block", "abort"):
+                    return _inconsistent_run(
+                        run_id,
+                        f"Tool event recorded after {entry['decision']} at line {line_no}",
+                        line=line_no,
+                    )
+                if (
+                    entry["effect_id"] is not None
+                    and event.effect_id is not None
+                    and entry["effect_id"] != event.effect_id
+                ):
+                    return _inconsistent_run(
+                        run_id,
+                        f"Effect ID mismatch for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if entry["effect_id"] is None and event.effect_id is not None:
+                    entry["effect_id"] = event.effect_id
+                if entry["policy_scope"] is None and event.policy_scope is not None:
+                    entry["policy_scope"] = event.policy_scope
+                entry["tool_event_sequence"] = event.sequence
+                entry["finalizer_type"] = event.event_type
+            else:
+                if prev_action_index is not None and act_idx <= prev_action_index:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Non-increasing action_index {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if actions_order:
+                    prev_entry = actions_map[actions_order[-1]]
+                    lower_bound = (
+                        prev_entry["observation_sequence"]
+                        or prev_entry["tool_event_sequence"]
+                        or prev_entry["decision_sequence"]
+                    )
+                elif pre_execution is not None:
+                    lower_bound = pre_execution["sequence"]
+                else:
+                    lower_bound = 0
+                if not _has_gap_between(seq_gaps, lower_bound, event.sequence):
+                    return _inconsistent_run(
+                        run_id,
+                        f"Tool event without prior decision for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if (prev_action_index is None and act_idx != 1) or (
+                    prev_action_index is not None and act_idx > prev_action_index + 1
+                ):
+                    has_action_gap = True
+                missing_decision_demands.append((lower_bound + 1, event.sequence - 1, line_no))
+                prev_action_index = act_idx
+                actions_order.append(act_idx)
+                actions_map[act_idx] = {
+                    "action_index": act_idx,
+                    "tool_name": event.tool_name,
+                    "decision": None,
+                    "decision_sequence": None,
+                    "tool_event_sequence": event.sequence,
+                    "finalizer_type": event.event_type,
+                    "violation_rules": None,
+                    "prior_same_tool_block_action_index": None,
+                    "effect_id": event.effect_id,
+                    "policy_scope": event.policy_scope,
+                    "operation_digest": event.operation_digest,
+                    "effect_status": None,
+                    "observed_status": None,
+                    "observation_sequence": None,
+                    "observation_evidence_ref": None,
+                    "reconciled": False,
+                    "reconciliation_sequence": None,
+                    "reconciliation_evidence_ref": None,
+                }
+        elif event.event_type == "effect_observed":
+            assert event.effect_id is not None and event.effect_status is not None
+            eff_id = event.effect_id
+            if eff_id in observed_effect_ids:
+                return _inconsistent_run(
+                    run_id,
+                    f"Duplicate effect_observed for effect '{eff_id}' at line {line_no}",
+                    line=line_no,
+                )
+            if act_idx in actions_map:
+                entry = actions_map[act_idx]
+                if entry["observation_sequence"] is not None:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Duplicate effect_observed for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if entry["tool_name"] != event.tool_name:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Tool name mismatch on effect_observed for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if entry["decision"] in ("block", "abort"):
+                    return _inconsistent_run(
+                        run_id,
+                        f"effect_observed recorded after {entry['decision']} at line {line_no}",
+                        line=line_no,
+                    )
+                if entry["effect_id"] is not None and entry["effect_id"] != eff_id:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Effect ID mismatch on effect_observed for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                entry["effect_id"] = eff_id
+                entry["policy_scope"] = event.policy_scope
+                entry["operation_digest"] = event.operation_digest
+                entry["observed_status"] = event.effect_status
+                entry["effect_status"] = event.effect_status
+                entry["observation_sequence"] = event.sequence
+                entry["observation_evidence_ref"] = event.evidence_ref
+            else:
+                if prev_action_index is not None and act_idx <= prev_action_index:
+                    return _inconsistent_run(
+                        run_id,
+                        f"Non-increasing action_index {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if actions_order:
+                    prev_entry = actions_map[actions_order[-1]]
+                    lower_bound = (
+                        prev_entry["observation_sequence"]
+                        or prev_entry["tool_event_sequence"]
+                        or prev_entry["decision_sequence"]
+                    )
+                elif pre_execution is not None:
+                    lower_bound = pre_execution["sequence"]
+                else:
+                    lower_bound = 0
+                if not _has_gap_between(seq_gaps, lower_bound, event.sequence):
+                    return _inconsistent_run(
+                        run_id,
+                        f"effect_observed without prior decision for action {act_idx} at line {line_no}",
+                        line=line_no,
+                    )
+                if (prev_action_index is None and act_idx != 1) or (
+                    prev_action_index is not None and act_idx > prev_action_index + 1
+                ):
+                    has_action_gap = True
+                missing_decision_demands.append((lower_bound + 1, event.sequence - 1, line_no))
+                prev_action_index = act_idx
+                actions_order.append(act_idx)
+                actions_map[act_idx] = {
+                    "action_index": act_idx,
+                    "tool_name": event.tool_name,
+                    "decision": None,
+                    "decision_sequence": None,
+                    "tool_event_sequence": None,
+                    "finalizer_type": None,
+                    "violation_rules": None,
+                    "prior_same_tool_block_action_index": None,
+                    "effect_id": eff_id,
+                    "policy_scope": event.policy_scope,
+                    "operation_digest": event.operation_digest,
+                    "effect_status": event.effect_status,
+                    "observed_status": event.effect_status,
+                    "observation_sequence": event.sequence,
+                    "observation_evidence_ref": event.evidence_ref,
+                    "reconciled": False,
+                    "reconciliation_sequence": None,
+                    "reconciliation_evidence_ref": None,
+                }
+            observed_effect_ids.add(eff_id)
+            effects_by_id[eff_id] = {
+                "action_index": act_idx,
+                "policy_scope": event.policy_scope,
+                "operation_digest": event.operation_digest,
+                "observed_status": event.effect_status,
+                "reconciled_status": None,
+            }
+
+    if (
+        post_execution is None
+        and len(missing_decision_demands) > 1
+        and not _can_allocate_distinct_slots(
+            seq_gaps, [(lo, hi) for lo, hi, _ in missing_decision_demands]
+        )
+    ):
+        return _inconsistent_run(
+            run_id,
+            "Insufficient distinct sequence slots for missing decisions",
+            line=missing_decision_demands[-1][2],
+        )
+
+    if terminal is None and items[-1][1].event_type == "tool_error":
+        terminal = "tool_error"
+
+    actions: list[dict[str, Any]] = []
+    counts = {outcome: 0 for outcome in TOOL_OUTCOMES}
+    tool_events_for_run: dict[int, str] = {}
+    has_missing_v2_observation = False
+    for act_idx in actions_order:
+        raw = actions_map[act_idx]
+        tool_outcome, effect_evidence = _classify_outcome(
+            raw["decision"], raw["finalizer_type"]
+        )
+        if raw["reconciled"]:
+            effect_evidence = (
+                "confirmed_by_reconciliation"
+                if raw["effect_status"] == "confirmed"
+                else "confirmed_absent_by_reconciliation"
+            )
+        elif raw["observed_status"] is not None:
+            if raw["observed_status"] == "confirmed":
+                effect_evidence = "confirmed_by_host_observation"
+            elif raw["observed_status"] == "confirmed_absent":
+                effect_evidence = "confirmed_absent_by_host"
+            else:
+                effect_evidence = "indeterminate"
+        elif raw["finalizer_type"] is not None:
+            effect_evidence = "indeterminate"
+            has_missing_v2_observation = True
+
+        counts[tool_outcome] += 1
+        if raw["finalizer_type"] is not None:
+            tool_events_for_run[act_idx] = raw["finalizer_type"]
+
+        action_out: dict[str, Any] = {
+            "action_index": raw["action_index"],
+            "tool_name": raw["tool_name"],
+            "decision": raw["decision"],
+            "decision_sequence": raw["decision_sequence"],
+            "tool_event_sequence": raw["tool_event_sequence"],
+            "violation_rules": raw["violation_rules"],
+            "prior_same_tool_block_action_index": raw["prior_same_tool_block_action_index"],
+            "tool_outcome": tool_outcome,
+            "effect_evidence": effect_evidence,
+            "effect_id": raw["effect_id"],
+            "policy_scope": raw["policy_scope"],
+            "effect_status": raw["effect_status"],
+            "observation_sequence": raw["observation_sequence"],
+        }
+        if raw["reconciliation_sequence"] is not None:
+            action_out["reconciliation_sequence"] = raw["reconciliation_sequence"]
+            action_out["reconciliation_evidence_ref"] = raw["reconciliation_evidence_ref"]
+        actions.append(action_out)
+
+    is_complete = (
+        pre_execution is not None
+        and not has_seq_gap
+        and not has_action_gap
+        and not has_missing_v2_observation
+        and counts["unfinalized"] == 0
+        and counts["unknown"] == 0
+        and terminal is not None
+    )
+    trace_integrity = "complete" if is_complete else "partial"
+    diagnostics: list[dict[str, Any]] = []
+    if not is_complete:
+        diagnostics.append(
+            _diag(
+                "partial_log",
+                f"Run '{run_id}' has incomplete trace evidence",
+                run_id=run_id,
+            )
+        )
+
+    return (
+        {
+            "run_id": run_id,
+            "contract_id": contract_id,
+            "mode": mode,
+            "trace_integrity": trace_integrity,
+            "terminal": terminal,
+            "pre_execution": pre_execution,
+            "post_execution": post_execution,
+            "actions": actions,
+            "counts": counts,
+            "reconciliations": reconciliations,
+            "compensations": compensations,
+        },
+        diagnostics,
+        tool_events_for_run,
+    )
+
+
 def analyze_log_file(
     log_path: str | Path,
     *,
     run_id: str | None = None,
 ) -> tuple[int, dict[str, Any], dict[tuple[str, int], str]]:
     path = Path(log_path)
-    grouped: dict[str, list[tuple[int, RunEvent]]] = defaultdict(list)
+    grouped: dict[str, list[tuple[int, RecordedEvent]]] = defaultdict(list)
+    known_effects_across_runs: dict[str, dict[str, Any]] = {}
+    file_reconciled_lines: dict[str, list[tuple[str, int]]] = defaultdict(list)
 
     try:
         with path.open("r", encoding="utf-8") as source:
@@ -415,7 +990,7 @@ def analyze_log_file(
                 if not raw_line.strip():
                     continue
                 try:
-                    event = RunEvent.model_validate_json(raw_line)
+                    event = parse_run_event(raw_line)
                 except (ValidationError, ValueError):
                     return (
                         EXIT_INVALID_OR_INCONSISTENT,
@@ -429,6 +1004,18 @@ def analyze_log_file(
                         {},
                     )
                 grouped[event.run_id].append((line_no, event))
+                if isinstance(event, RunEventV2):
+                    if event.event_type == "effect_observed" and event.effect_id is not None:
+                        known_effects_across_runs.setdefault(
+                            event.effect_id,
+                            {
+                                "run_id": event.run_id,
+                                "observed_status": event.effect_status,
+                                "policy_scope": event.policy_scope,
+                            },
+                        )
+                    elif event.event_type == "effect_reconciled" and event.effect_id is not None:
+                        file_reconciled_lines[event.effect_id].append((event.run_id, line_no))
     except OSError as error:
         message = "Log file not found" if isinstance(error, FileNotFoundError) else "Cannot read log file"
         return (
@@ -485,7 +1072,12 @@ def analyze_log_file(
     has_inconsistent = False
 
     for selected_run_id, items in selected:
-        run_summary, run_diags, run_tool_events = _analyze_run(selected_run_id, items)
+        run_summary, run_diags, run_tool_events = _analyze_run(
+            selected_run_id,
+            items,
+            known_effects_across_runs=known_effects_across_runs,
+            file_reconciled_lines=file_reconciled_lines,
+        )
         runs.append(run_summary)
         diagnostics.extend(run_diags)
         for act_idx, ev_type in run_tool_events.items():
