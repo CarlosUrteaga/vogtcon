@@ -10,18 +10,23 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TypeAlias
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .models import (
+    ContractRulesV3,
     FrozenJsonObject,
     GovernorInput,
     JsonObject,
     Phase,
+    RuleBinding,
     Violation,
     _thaw_json_value,
 )
 
 RuleHandler: TypeAlias = Callable[[GovernorInput], bool | Violation | None]
+V3RuleHandler: TypeAlias = Callable[
+    [GovernorInput, BaseModel], bool | Violation | None
+]
 
 _VALID_PHASES: frozenset[Phase] = frozenset(
     {"pre_execution", "runtime", "post_execution"}
@@ -42,6 +47,7 @@ class RuleTypeSpec:
 
     allowed_phases: frozenset[Phase]
     params_model: type[BaseModel] = EmptyRuleParams
+    handler: V3RuleHandler | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -69,6 +75,8 @@ class RuleTypeSpec:
                 "RuleTypeSpec params_model must set strict=True, extra='forbid', "
                 "frozen=True, allow_inf_nan=False"
             )
+        if self.handler is not None and not callable(self.handler):
+            raise TypeError("RuleTypeSpec handler must be callable or None")
 
 RUNTIME_RULES: tuple[str, ...] = (
     "tool.declared_only",
@@ -161,6 +169,31 @@ def _check_forbidden_outcome_triggered(request: GovernorInput) -> bool:
     return bool(request.context.forbidden_outcomes_triggered)
 
 
+def _check_v3_tool_declared_only(
+    request: GovernorInput, _params: BaseModel
+) -> bool:
+    assert request.action is not None
+    tool = (
+        request.planned_effect.tool_name
+        if request.planned_effect is not None
+        else request.action.tool_name
+    )
+    return (
+        tool not in request.context.available_tools
+        or tool not in request.contract.declared_tools
+    )
+
+
+def _check_v3_response_schema_complete(
+    request: GovernorInput, _params: BaseModel
+) -> bool:
+    assert request.response is not None
+    return any(
+        key not in request.response
+        for key in request.contract.response_schema.required_fields
+    )
+
+
 DEFAULT_RUNTIME_RULES: Mapping[str, RuleHandler] = MappingProxyType({
     "tool.declared_only": _check_tool_declared_only,
     "ticket_requires_evidence": _check_ticket_requires_evidence,
@@ -180,10 +213,12 @@ DEFAULT_RULE_TYPES: Mapping[str, RuleTypeSpec] = MappingProxyType({
     "tool.declared_only": RuleTypeSpec(
         allowed_phases=frozenset({"runtime"}),
         params_model=EmptyRuleParams,
+        handler=_check_v3_tool_declared_only,
     ),
     "response.schema_complete": RuleTypeSpec(
         allowed_phases=frozenset({"post_execution"}),
         params_model=EmptyRuleParams,
+        handler=_check_v3_response_schema_complete,
     ),
 })
 
@@ -254,6 +289,102 @@ class RuleCatalog:
     ) -> BaseModel:
         spec = self._rule_types[rule_type]
         return spec.params_model.model_validate(_thaw_json_value(params))
+
+    def validate_v3_handlers(self, contract: ContractRulesV3) -> None:
+        if not isinstance(contract, ContractRulesV3):
+            raise TypeError("Expected a ContractRulesV3 instance")
+        for binding in contract.rules:
+            spec = self._rule_types.get(binding.rule_type)
+            if spec is None:
+                raise ValueError(f"Unknown rule type '{binding.rule_type}'")
+            if spec.handler is None:
+                raise ValueError(
+                    f"Rule type '{binding.rule_type}' has no evaluation handler configured"
+                )
+
+    def _coerce_v3_violation(
+        self,
+        binding: RuleBinding,
+        result: bool | Violation | None,
+        expected_phase: Phase,
+        expected_action: str | None,
+    ) -> Violation | None:
+        if result is None or result is False:
+            return None
+        if result is True:
+            return Violation(
+                rule=binding.instance_id,
+                rule_type=binding.rule_type,
+                phase=expected_phase,
+                action=expected_action,
+            )
+        if isinstance(result, Violation):
+            if result.rule != binding.instance_id:
+                raise ValueError(
+                    f"Rule '{binding.instance_id}' produced violation for '{result.rule}'"
+                )
+            if result.phase != expected_phase:
+                raise ValueError(
+                    f"Rule '{binding.instance_id}' produced violation with phase '{result.phase}', "
+                    f"expected '{expected_phase}'"
+                )
+            if result.action != expected_action:
+                raise ValueError(
+                    f"Rule '{binding.instance_id}' produced violation for action '{result.action}', "
+                    f"expected '{expected_action}'"
+                )
+            if result.rule_type is None:
+                return result.model_copy(update={"rule_type": binding.rule_type})
+            if result.rule_type != binding.rule_type:
+                raise ValueError(
+                    f"Rule '{binding.instance_id}' produced violation with rule_type "
+                    f"'{result.rule_type}', expected '{binding.rule_type}'"
+                )
+            return result
+        raise ValueError(
+            f"Rule '{binding.instance_id}' returned invalid output of type "
+            f"'{type(result).__name__}'; expected bool, Violation, or None"
+        )
+
+    def evaluate_v3(self, request: GovernorInput) -> list[Violation]:
+        if not isinstance(request.contract, ContractRulesV3):
+            raise TypeError("evaluate_v3 requires a ContractRulesV3 contract")
+        self.validate_v3_handlers(request.contract)
+        expected_action: str | None = None
+        if request.phase == "runtime":
+            assert request.action is not None
+            expected_action = (
+                request.planned_effect.tool_name
+                if request.planned_effect is not None
+                else request.action.tool_name
+            )
+        elif request.phase == "post_execution":
+            assert request.response is not None
+        violations: list[Violation] = []
+        for binding in request.contract.rules:
+            if request.phase not in binding.phases:
+                continue
+            spec = self._rule_types[binding.rule_type]
+            assert spec.handler is not None
+            try:
+                params = self.validate_rule_params(binding.rule_type, binding.params)
+            except ValidationError:
+                raise ValueError(
+                    f"Invalid parameters for rule instance '{binding.instance_id}' "
+                    f"(rule_type '{binding.rule_type}')"
+                ) from None
+            result = spec.handler(request, params)
+            violation = self._coerce_v3_violation(
+                binding, result, request.phase, expected_action
+            )
+            if violation is not None:
+                violations.append(violation)
+                if (
+                    request.phase == "runtime"
+                    and binding.rule_type == "tool.declared_only"
+                ):
+                    break
+        return violations
 
     def _coerce_violation(
         self,

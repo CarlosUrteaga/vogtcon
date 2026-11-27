@@ -29,10 +29,13 @@ from vogtcon.models import (
     ApprovedAgentConfiguration,
     ContractRulesV2,
     ContractRulesV3,
+    EffectRecord,
     HostFacts,
     PlannedEffect,
     ResponseSchema,
     RuleBinding,
+    TrajectoryEntry,
+    TrajectoryView,
 )
 
 
@@ -1204,19 +1207,31 @@ class SourceAgreementTests(unittest.TestCase):
         self.assertEqual(request.host_facts.facts["user_role"], "employee")
         self.assertFalse(request.host_facts.facts["approval_granted"])
 
-    def test_governor_input_rejects_v3_contracts_fail_closed(self):
+    def test_governor_input_accepts_v3_with_policy_and_rejects_missing_policy(self):
         v3_dict = v3_contract_data()
         v3_model = ContractRulesV3.model_validate(v3_dict)
-        for candidate in (v3_model, v3_dict, {"schema_version": 3}):
+        for candidate in (v3_model, v3_dict):
             with self.subTest(candidate=type(candidate).__name__):
-                data = input_data("runtime")
-                data["contract"] = candidate
-                data["policy"] = {"mode": "guarded"}
+                missing_policy = input_data("runtime")
+                missing_policy["contract"] = candidate
                 with self.assertRaisesRegex(
                     ValidationError,
-                    "v3 contracts are not yet executable; runtime evaluation is introduced in Stage 2",
+                    "v3 contracts require an enforcement policy",
                 ):
-                    GovernorInput.model_validate(data)
+                    GovernorInput.model_validate(missing_policy)
+
+                valid = input_data("runtime")
+                valid["contract"] = candidate
+                valid["policy"] = {"mode": "guarded"}
+                request = GovernorInput.model_validate(valid)
+                self.assertIsInstance(request.contract, ContractRulesV3)
+                self.assertEqual(request.effective_mode, "guarded")
+
+        malformed_v3 = input_data("runtime")
+        malformed_v3["contract"] = {"schema_version": 3}
+        malformed_v3["policy"] = {"mode": "guarded"}
+        with self.assertRaises(ValidationError):
+            GovernorInput.model_validate(malformed_v3)
 
         for unsupported in (4, "3", 3.0, True):
             with self.subTest(unsupported=repr(unsupported)):
@@ -1306,6 +1321,405 @@ class SourceAgreementTests(unittest.TestCase):
         self.assertIsInstance(promoted.context.state, MappingProxyType)
 
 
+class EffectAndTrajectoryModelTests(unittest.TestCase):
+    def _digest(self, suffix: str = "a") -> str:
+        return "sha256:" + (suffix * 64)[:64]
+
+    def test_effect_record_states_immutability_and_self_compensation_rejection(self):
+        caller_meta = {"channel": "email", "nested": {"tags": ["urgent"]}}
+        for status in ("reserved", "confirmed", "confirmed_absent", "uncertain"):
+            with self.subTest(status=status):
+                record = EffectRecord(
+                    effect_id=f"eff-{status}",
+                    run_id="run-1",
+                    policy_scope="scope.alpha",
+                    action_index=1,
+                    tool_name="send_notification",
+                    operation_digest=self._digest("a"),
+                    status=status,
+                    metadata=caller_meta,
+                )
+                self.assertEqual(record.status, status)
+                self.assertIsInstance(record.metadata, MappingProxyType)
+
+        record = EffectRecord(
+            effect_id="eff-001",
+            run_id="run-1",
+            policy_scope="scope.alpha",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=self._digest("b"),
+            status="confirmed",
+            metadata=caller_meta,
+        )
+        caller_meta["channel"] = "sms"
+        caller_meta["nested"]["tags"].append("mutated")
+        self.assertEqual(record.metadata["channel"], "email")
+        self.assertEqual(record.metadata["nested"]["tags"], ("urgent",))
+
+        with self.assertRaises(TypeError):
+            record.metadata["channel"] = "sms"
+        with self.assertRaises(AttributeError):
+            record.metadata["nested"]["tags"].append("x")
+
+        for dumped in (
+            record.model_dump(),
+            record.model_dump(mode="json"),
+            json.loads(record.model_dump_json()),
+        ):
+            self.assertIs(type(dumped["metadata"]), dict)
+            self.assertIs(type(dumped["metadata"]["nested"]["tags"]), list)
+
+        self.assertEqual(deepcopy(record), record)
+        copied = record.model_copy(
+            update={"metadata": {"updated": [1, 2]}}, deep=True
+        )
+        self.assertIsInstance(copied.metadata, MappingProxyType)
+        with self.assertRaises(AttributeError):
+            copied.metadata["updated"].append(3)
+
+        with self.assertRaisesRegex(ValidationError, "Effect cannot compensate itself"):
+            EffectRecord(
+                effect_id="eff-001",
+                run_id="run-1",
+                tool_name="refund",
+                operation_digest=self._digest("c"),
+                status="confirmed",
+                compensates_effect_id="eff-001",
+            )
+        with self.assertRaisesRegex(ValidationError, "Effect cannot compensate itself"):
+            record.model_copy(update={"compensates_effect_id": "eff-001"})
+
+        for bad_digest in ("md5:abc", "sha256:short", "sha256:" + "G" * 64, ""):
+            with self.subTest(bad_digest=bad_digest):
+                with self.assertRaises(ValidationError):
+                    EffectRecord(
+                        effect_id="eff-001",
+                        run_id="run-1",
+                        tool_name="send_notification",
+                        operation_digest=bad_digest,
+                        status="reserved",
+                    )
+
+    def test_trajectory_entry_kind_invariants_and_no_secret_leak_on_error(self):
+        digest = self._digest("d")
+        valid_entries = [
+            TrajectoryEntry(
+                sequence=1,
+                kind="reserved",
+                effect_id="eff-1",
+                run_id="run-1",
+                policy_scope="scope.a",
+                action_index=1,
+                tool_name="send_notification",
+                operation_digest=digest,
+                status="reserved",
+            ),
+            TrajectoryEntry(
+                sequence=2,
+                kind="observed",
+                effect_id="eff-1",
+                run_id="run-1",
+                policy_scope="scope.a",
+                action_index=1,
+                tool_name="send_notification",
+                operation_digest=digest,
+                status="uncertain",
+            ),
+            TrajectoryEntry(
+                sequence=3,
+                kind="reconciled",
+                effect_id="eff-1",
+                run_id="run-1",
+                policy_scope="scope.a",
+                tool_name="send_notification",
+                operation_digest=digest,
+                status="confirmed",
+                evidence_ref="audit-ticket-42",
+            ),
+            TrajectoryEntry(
+                sequence=4,
+                kind="compensated",
+                effect_id="eff-2",
+                run_id="run-1",
+                policy_scope="scope.a",
+                tool_name="revoke_notification",
+                operation_digest=self._digest("e"),
+                status="confirmed",
+                compensates_effect_id="eff-1",
+                evidence_ref="comp-ticket-9",
+            ),
+        ]
+        self.assertEqual([e.sequence for e in valid_entries], [1, 2, 3, 4])
+
+        invalid_cases = (
+            {"kind": "reserved", "status": "confirmed"},
+            {"kind": "reserved", "status": "reserved", "compensates_effect_id": "eff-0"},
+            {"kind": "observed", "status": "reserved"},
+            {"kind": "observed", "status": "confirmed", "compensates_effect_id": "eff-0"},
+            {"kind": "reconciled", "status": "uncertain", "evidence_ref": "ev-1"},
+            {"kind": "reconciled", "status": "confirmed", "evidence_ref": None},
+            {
+                "kind": "reconciled",
+                "status": "confirmed",
+                "evidence_ref": "ev-1",
+                "compensates_effect_id": "eff-0",
+            },
+            {"kind": "compensated", "status": "uncertain", "compensates_effect_id": "eff-0"},
+            {"kind": "compensated", "status": "confirmed", "compensates_effect_id": None},
+            {"kind": "compensated", "status": "confirmed", "compensates_effect_id": "eff-1"},
+            {"kind": "reserved", "status": "reserved", "sequence": 0},
+            {"kind": "reserved", "status": "reserved", "sequence": True},
+        )
+        secret_sentinel = "SECRET_TRAJECTORY_PAYLOAD_9911"
+        for overrides in invalid_cases:
+            with self.subTest(overrides=overrides):
+                payload = {
+                    "sequence": 1,
+                    "kind": "reserved",
+                    "effect_id": "eff-1",
+                    "run_id": "run-1",
+                    "tool_name": "send_notification",
+                    "operation_digest": digest,
+                    "status": "reserved",
+                    "metadata": {"secret": secret_sentinel},
+                    **overrides,
+                }
+                with self.assertRaises(ValidationError) as ctx:
+                    TrajectoryEntry.model_validate(payload)
+                self.assertNotIn(secret_sentinel, str(ctx.exception))
+
+    def test_trajectory_view_ordering_scope_suspension_and_deep_immutability(self):
+        d1 = self._digest("1")
+        d2 = self._digest("2")
+        e1 = TrajectoryEntry(
+            sequence=1,
+            kind="reserved",
+            effect_id="eff-1",
+            run_id="run-1",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=d1,
+            status="reserved",
+        )
+        e2 = TrajectoryEntry(
+            sequence=2,
+            kind="observed",
+            effect_id="eff-1",
+            run_id="run-1",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=d1,
+            status="confirmed",
+        )
+        e3 = TrajectoryEntry(
+            sequence=3,
+            kind="observed",
+            effect_id="eff-2",
+            run_id="run-2",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=d2,
+            status="uncertain",
+        )
+        r1 = EffectRecord(
+            effect_id="eff-1",
+            run_id="run-1",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=d1,
+            status="confirmed",
+        )
+        r2 = EffectRecord(
+            effect_id="eff-2",
+            run_id="run-2",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=d2,
+            status="uncertain",
+        )
+
+        entries_list = [e1, e2, e3]
+        effects_list = [r1, r2]
+        view = TrajectoryView(
+            policy_scope="scope.a",
+            entries=entries_list,
+            effects=effects_list,
+            suspended=True,
+            uncertain_effect_ids=("eff-2",),
+        )
+        entries_list.clear()
+        effects_list.clear()
+        self.assertEqual(len(view.entries), 3)
+        self.assertEqual(len(view.effects), 2)
+        self.assertIsInstance(view.entries, tuple)
+        self.assertIsInstance(view.effects, tuple)
+        self.assertIsInstance(view.uncertain_effect_ids, tuple)
+        self.assertEqual(view.effect_by_id("eff-1"), r1)
+        self.assertIsNone(view.effect_by_id("eff-missing"))
+        self.assertEqual(view.effects_by_status("uncertain"), (r2,))
+        self.assertEqual(view.effects_by_status("reserved"), ())
+
+        with self.assertRaises(AttributeError):
+            view.entries.append(e1)  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            view.effects.append(r1)  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            view.uncertain_effect_ids.append("eff-1")  # type: ignore[attr-defined]
+
+        for dumped in (
+            view.model_dump(),
+            view.model_dump(mode="json"),
+            json.loads(view.model_dump_json()),
+        ):
+            self.assertIs(type(dumped["entries"]), list)
+            self.assertIs(type(dumped["effects"]), list)
+            self.assertIs(type(dumped["uncertain_effect_ids"]), list)
+        self.assertEqual(view, TrajectoryView.model_validate_json(view.model_dump_json()))
+        self.assertEqual(deepcopy(view), view)
+
+        # Invariant rejections
+        with self.assertRaisesRegex(ValidationError, "must be suspended"):
+            TrajectoryView(
+                policy_scope="scope.a",
+                entries=[e1, e2, e3],
+                effects=[r1, r2],
+                suspended=False,
+                uncertain_effect_ids=["eff-2"],
+            )
+        with self.assertRaisesRegex(ValidationError, "must be suspended"):
+            view.model_copy(update={"suspended": False})
+
+        with self.assertRaisesRegex(ValidationError, "strictly increasing"):
+            TrajectoryView(entries=[e2, e1])
+
+        with self.assertRaisesRegex(ValidationError, "Duplicate effect_id"):
+            TrajectoryView(effects=[r1, r1])
+
+        with self.assertRaisesRegex(ValidationError, "must not contain duplicates"):
+            TrajectoryView(
+                effects=[r2],
+                suspended=True,
+                uncertain_effect_ids=["eff-2", "eff-2"],
+            )
+
+        with self.assertRaisesRegex(ValidationError, "must match uncertain effects"):
+            TrajectoryView(effects=[r2], suspended=True, uncertain_effect_ids=[])
+
+        wrong_scope_effect = r1.model_copy(update={"policy_scope": "scope.b"})
+        with self.assertRaisesRegex(ValidationError, "does not match view policy_scope"):
+            TrajectoryView(policy_scope="scope.a", effects=[wrong_scope_effect])
+
+        wrong_scope_entry = e1.model_copy(update={"policy_scope": "scope.b"})
+        with self.assertRaisesRegex(ValidationError, "does not match view policy_scope"):
+            TrajectoryView(policy_scope="scope.a", entries=[wrong_scope_entry])
+
+
+class GovernorInputV3AndTrajectoryTests(unittest.TestCase):
+    def test_legacy_dumps_omit_policy_scope_trajectory_and_violation_rule_type(self):
+        request = GovernorInput.model_validate(input_data("runtime"))
+        dumped = request.model_dump()
+        dumped_json = request.model_dump_json()
+        self.assertNotIn("policy_scope", dumped)
+        self.assertNotIn("trajectory", dumped)
+        self.assertNotIn('"policy_scope"', dumped_json)
+        self.assertNotIn('"trajectory"', dumped_json)
+
+        legacy_violation = Violation(
+            rule="tool.declared_only", phase="runtime", action="send_notification"
+        )
+        self.assertNotIn("rule_type", legacy_violation.model_dump())
+        self.assertNotIn('"rule_type"', legacy_violation.model_dump_json())
+
+        v3_violation = Violation(
+            rule="declared-tools",
+            rule_type="tool.declared_only",
+            phase="runtime",
+            action="send_notification",
+        )
+        self.assertEqual(v3_violation.model_dump()["rule_type"], "tool.declared_only")
+        self.assertEqual(
+            v3_violation, Violation.model_validate_json(v3_violation.model_dump_json())
+        )
+
+    def test_policy_scope_agreement_and_deeply_frozen_evaluation_views(self):
+        view_a = TrajectoryView(policy_scope="scope.alpha")
+        view_b = TrajectoryView(policy_scope="scope.beta")
+
+        conflict = input_data("runtime")
+        conflict["policy_scope"] = "scope.alpha"
+        conflict["trajectory"] = view_b
+        with self.assertRaisesRegex(
+            ValidationError,
+            r"trajectory\.policy_scope conflicts with policy_scope",
+        ):
+            GovernorInput.model_validate(conflict)
+
+        # Agreeing scope + v3 contract freezes all four ExecutionContext container fields
+        caller_tools = ["send_notification"]
+        caller_props = {"summary": {"items": [1, 2]}}
+        caller_outcomes = ["none"]
+        caller_ctx = ExecutionContext(
+            state={"nested": [1]},
+            available_tools=caller_tools,
+            final_properties=caller_props,
+            forbidden_outcomes_triggered=caller_outcomes,
+        )
+        request = GovernorInput(
+            run_id="run-v3-view",
+            contract=ContractRulesV3.model_validate(v3_contract_data()),
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=caller_ctx,
+            action=ActionProposal(tool_name="send_notification"),
+            policy_scope="scope.alpha",
+            trajectory=view_a,
+        )
+
+        # Standalone caller_ctx remains mutable; request.context is detached and deeply frozen
+        caller_tools.append("extra_tool")
+        caller_props["summary"]["items"].append(3)
+        caller_outcomes.append("bad_outcome")
+
+        self.assertEqual(request.context.available_tools, ("send_notification",))
+        self.assertEqual(request.context.final_properties["summary"]["items"], (1, 2))
+        self.assertEqual(request.context.forbidden_outcomes_triggered, ("none",))
+
+        with self.assertRaises(TypeError):
+            request.context.state["x"] = 1
+        with self.assertRaises(AttributeError):
+            request.context.available_tools.append("hack")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            request.context.final_properties["x"] = 1
+        with self.assertRaises(AttributeError):
+            request.context.final_properties["summary"]["items"].append(9)
+        with self.assertRaises(AttributeError):
+            request.context.forbidden_outcomes_triggered.append("hack")  # type: ignore[attr-defined]
+
+        for dumped in (
+            request.model_dump(),
+            request.model_dump(mode="json"),
+            json.loads(request.model_dump_json()),
+        ):
+            self.assertIs(type(dumped["context"]["available_tools"]), list)
+            self.assertIs(type(dumped["context"]["final_properties"]), dict)
+            self.assertIs(type(dumped["context"]["forbidden_outcomes_triggered"]), list)
+
+        self.assertEqual(
+            request, GovernorInput.model_validate_json(request.model_dump_json())
+        )
+        self.assertEqual(request.model_copy(deep=True), request)
+        with self.assertRaisesRegex(
+            ValueError, r"trajectory\.policy_scope conflicts with policy_scope"
+        ):
+            request.model_copy(update={"trajectory": view_b})
+
+
 class DecisionModelTests(unittest.TestCase):
     def test_preserves_all_historical_runtime_decision_names(self):
         for decision in ("allow", "allow_with_warning", "block", "abort"):
@@ -1392,9 +1806,9 @@ remain independent of that checkout and of any developer-specific path.
 
 
 class PublicApiTests(unittest.TestCase):
-    def test_v041_and_stage1_exports_are_available_and_listed_in_all(self):
+    def test_v041_stage1_and_stage2_exports_are_available_and_listed_in_all(self):
         import vogtcon
-        from vogtcon import contracts, models, rules
+        from vogtcon import contracts, effects, models, records, rules
 
         historical_exports = (
             "load_contract",
@@ -1432,17 +1846,58 @@ class PublicApiTests(unittest.TestCase):
             "EmptyRuleParams",
             "RuleTypeSpec",
         )
+        stage2_model_exports = (
+            "EffectEventKind",
+            "EffectId",
+            "EffectRecord",
+            "EffectStatus",
+            "PolicyScopeId",
+            "ReconciliationStatus",
+            "TrajectoryEntry",
+            "TrajectoryView",
+        )
+        stage2_effects_exports = (
+            "CompensationRecord",
+            "ConcurrencyError",
+            "EffectGovernanceConfig",
+            "EffectGovernanceError",
+            "EffectObservationError",
+            "EffectObserver",
+            "EffectResolutionError",
+            "EffectResolver",
+            "EffectStore",
+            "InMemoryEffectStore",
+            "ObservationInput",
+            "ObservedEffect",
+            "ReconciliationError",
+            "ReconciliationRecord",
+            "ResolvedAction",
+            "ScopeSuspendedError",
+        )
+        stage2_records_exports = (
+            "RecordedEvent",
+            "RunEventV2",
+            "parse_run_event",
+        )
+        stage2_rules_exports = ("V3RuleHandler",)
+        stage2_exports = (
+            stage2_model_exports
+            + stage2_effects_exports
+            + stage2_records_exports
+            + stage2_rules_exports
+        )
 
         self.assertEqual(len(historical_exports), 22)
         self.assertEqual(len(stage1_exports), 10)
-        self.assertEqual(len(vogtcon.__all__), 32)
-        self.assertEqual(len(set(vogtcon.__all__)), 32)
+        self.assertEqual(len(stage2_exports), 28)
+        self.assertEqual(len(vogtcon.__all__), 60)
+        self.assertEqual(len(set(vogtcon.__all__)), 60)
         self.assertEqual(
             set(vogtcon.__all__),
-            set(historical_exports) | set(stage1_exports),
+            set(historical_exports) | set(stage1_exports) | set(stage2_exports),
         )
 
-        for name in historical_exports + stage1_exports:
+        for name in historical_exports + stage1_exports + stage2_exports:
             with self.subTest(symbol=name):
                 self.assertIn(name, vogtcon.__all__)
                 self.assertTrue(hasattr(vogtcon, name))
@@ -1458,10 +1913,20 @@ class PublicApiTests(unittest.TestCase):
             "OPERATION_IDENTITY_VERSION",
             "PlannedEffect",
             "RuleBinding",
+            *stage2_model_exports,
         ):
             self.assertIs(getattr(vogtcon, name), getattr(models, name))
-        for name in ("DEFAULT_RULE_TYPES", "EmptyRuleParams", "RuleTypeSpec"):
+        for name in (
+            "DEFAULT_RULE_TYPES",
+            "EmptyRuleParams",
+            "RuleTypeSpec",
+            *stage2_rules_exports,
+        ):
             self.assertIs(getattr(vogtcon, name), getattr(rules, name))
+        for name in stage2_effects_exports:
+            self.assertIs(getattr(vogtcon, name), getattr(effects, name))
+        for name in stage2_records_exports:
+            self.assertIs(getattr(vogtcon, name), getattr(records, name))
 
 
 if __name__ == "__main__":

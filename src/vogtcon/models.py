@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Self, TypeAlia
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     JsonValue,
@@ -37,11 +38,23 @@ from pydantic import (
 Mode = Literal["no_contract", "advisory", "guarded", "strict"]
 Phase = Literal["pre_execution", "runtime", "post_execution"]
 Decision = Literal["allow", "allow_with_warning", "block", "abort"]
+EffectStatus = Literal["reserved", "confirmed", "confirmed_absent", "uncertain"]
+EffectEventKind = Literal["reserved", "observed", "reconciled", "compensated"]
+ReconciliationStatus = Literal["confirmed", "confirmed_absent"]
 NonEmptyString = Annotated[str, Field(min_length=1)]
 InstanceId = Annotated[
     str,
     Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
 ]
+EffectId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
+PolicyScopeId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
+Sha256Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 JsonObject = dict[str, JsonValue]
 FrozenJsonValue: TypeAlias = (
     None
@@ -547,6 +560,251 @@ class PlannedEffect(_Model):
         return _canonical_sha256(self.canonical_operation())
 
 
+class EffectRecord(_Model):
+    """Materialized snapshot of a governed effect in an authoritative store."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    effect_id: EffectId
+    run_id: NonEmptyString
+    policy_scope: PolicyScopeId | None = None
+    action_index: Annotated[int, Field(ge=1)] | None = None
+    tool_name: NonEmptyString
+    operation_digest: Sha256Digest
+    status: EffectStatus
+    compensates_effect_id: EffectId | None = None
+    evidence_ref: NonEmptyString | None = None
+    metadata: _FrozenJsonObjectField = Field(
+        default_factory=dict, validate_default=True
+    )
+
+    @model_validator(mode="after")
+    def check_self_compensation(self) -> Self:
+        if (
+            self.compensates_effect_id is not None
+            and self.compensates_effect_id == self.effect_id
+        ):
+            raise ValueError("Effect cannot compensate itself")
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            for key, val in update.items():
+                merged[key] = _thaw_json_value(val) if key == "metadata" else val
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
+class TrajectoryEntry(_Model):
+    """Immutable append-only lifecycle transition for a governed effect."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    sequence: Annotated[int, Field(ge=1)]
+    kind: EffectEventKind
+    effect_id: EffectId
+    run_id: NonEmptyString
+    policy_scope: PolicyScopeId | None = None
+    action_index: Annotated[int, Field(ge=1)] | None = None
+    tool_name: NonEmptyString
+    operation_digest: Sha256Digest
+    status: EffectStatus
+    compensates_effect_id: EffectId | None = None
+    evidence_ref: NonEmptyString | None = None
+    metadata: _FrozenJsonObjectField = Field(
+        default_factory=dict, validate_default=True
+    )
+
+    @model_validator(mode="after")
+    def check_entry_shape(self) -> Self:
+        if self.kind == "reserved":
+            if self.status != "reserved":
+                raise ValueError("reserved trajectory entry requires status='reserved'")
+            if self.compensates_effect_id is not None:
+                raise ValueError(
+                    "reserved trajectory entry cannot set compensates_effect_id"
+                )
+        elif self.kind == "observed":
+            if self.status not in ("confirmed", "confirmed_absent", "uncertain"):
+                raise ValueError(
+                    "observed trajectory entry requires status in "
+                    "('confirmed', 'confirmed_absent', 'uncertain')"
+                )
+            if self.compensates_effect_id is not None:
+                raise ValueError(
+                    "observed trajectory entry cannot set compensates_effect_id"
+                )
+        elif self.kind == "reconciled":
+            if self.status not in ("confirmed", "confirmed_absent"):
+                raise ValueError(
+                    "reconciled trajectory entry requires status in "
+                    "('confirmed', 'confirmed_absent')"
+                )
+            if self.evidence_ref is None:
+                raise ValueError(
+                    "reconciled trajectory entry requires evidence_ref"
+                )
+            if self.compensates_effect_id is not None:
+                raise ValueError(
+                    "reconciled trajectory entry cannot set compensates_effect_id"
+                )
+        elif self.kind == "compensated":
+            if self.status != "confirmed":
+                raise ValueError(
+                    "compensated trajectory entry requires status='confirmed'"
+                )
+            if self.compensates_effect_id is None:
+                raise ValueError(
+                    "compensated trajectory entry requires compensates_effect_id"
+                )
+            if self.compensates_effect_id == self.effect_id:
+                raise ValueError("Effect cannot compensate itself")
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            for key, val in update.items():
+                merged[key] = _thaw_json_value(val) if key == "metadata" else val
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
+def _tuple_to_list_if_tuple(value: object) -> object:
+    return list(value) if isinstance(value, tuple) else value
+
+
+if TYPE_CHECKING:
+    _FrozenTrajectoryEntriesField: TypeAlias = tuple[TrajectoryEntry, ...]
+    _FrozenEffectRecordsField: TypeAlias = tuple[EffectRecord, ...]
+    _FrozenEffectIdTupleField: TypeAlias = tuple[EffectId, ...]
+else:
+    _FrozenTrajectoryEntriesField = Annotated[
+        list[TrajectoryEntry],
+        BeforeValidator(_tuple_to_list_if_tuple),
+        AfterValidator(tuple),
+        WrapSerializer(lambda value, handler: handler(list(value))),
+    ]
+    _FrozenEffectRecordsField = Annotated[
+        list[EffectRecord],
+        BeforeValidator(_tuple_to_list_if_tuple),
+        AfterValidator(tuple),
+        WrapSerializer(lambda value, handler: handler(list(value))),
+    ]
+    _FrozenEffectIdTupleField = Annotated[
+        list[EffectId],
+        BeforeValidator(_tuple_to_list_if_tuple),
+        AfterValidator(tuple),
+        PlainSerializer(list, return_type=list[EffectId]),
+    ]
+
+
+class TrajectoryView(_Model):
+    """Deeply immutable read-only trajectory snapshot for rule evaluation."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    policy_scope: PolicyScopeId | None = None
+    entries: _FrozenTrajectoryEntriesField = Field(
+        default_factory=tuple, validate_default=True
+    )
+    effects: _FrozenEffectRecordsField = Field(
+        default_factory=tuple, validate_default=True
+    )
+    suspended: bool = False
+    uncertain_effect_ids: _FrozenEffectIdTupleField = Field(
+        default_factory=tuple, validate_default=True
+    )
+
+    @model_validator(mode="after")
+    def check_trajectory_invariants(self) -> Self:
+        prev_sequence = 0
+        for entry in self.entries:
+            if entry.sequence <= prev_sequence:
+                raise ValueError(
+                    "TrajectoryView entries must have strictly increasing sequence numbers"
+                )
+            prev_sequence = entry.sequence
+            if self.policy_scope is not None and entry.policy_scope != self.policy_scope:
+                raise ValueError(
+                    "TrajectoryView entry policy_scope does not match view policy_scope"
+                )
+
+        seen_effect_ids: set[str] = set()
+        for effect in self.effects:
+            if effect.effect_id in seen_effect_ids:
+                raise ValueError(
+                    f"Duplicate effect_id in TrajectoryView: '{effect.effect_id}'"
+                )
+            seen_effect_ids.add(effect.effect_id)
+            if self.policy_scope is not None and effect.policy_scope != self.policy_scope:
+                raise ValueError(
+                    "TrajectoryView effect policy_scope does not match view policy_scope"
+                )
+
+        if len(set(self.uncertain_effect_ids)) != len(self.uncertain_effect_ids):
+            raise ValueError(
+                "TrajectoryView uncertain_effect_ids must not contain duplicates"
+            )
+        expected_uncertain = tuple(
+            effect.effect_id for effect in self.effects if effect.status == "uncertain"
+        )
+        if self.uncertain_effect_ids != expected_uncertain:
+            raise ValueError(
+                "TrajectoryView uncertain_effect_ids must match uncertain effects in order"
+            )
+        if self.uncertain_effect_ids and not self.suspended:
+            raise ValueError("TrajectoryView with uncertain effects must be suspended")
+        return self
+
+    def effect_by_id(self, effect_id: str) -> EffectRecord | None:
+        for effect in self.effects:
+            if effect.effect_id == effect_id:
+                return effect
+        return None
+
+    def effects_by_status(self, status: EffectStatus) -> tuple[EffectRecord, ...]:
+        return tuple(effect for effect in self.effects if effect.status == status)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged: dict[str, Any] = {
+                "policy_scope": self.policy_scope,
+                "entries": list(self.entries),
+                "effects": list(self.effects),
+                "suspended": self.suspended,
+                "uncertain_effect_ids": list(self.uncertain_effect_ids),
+            }
+            merged.update(update)
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
 class ExecutionContext(_Model):
     """Facts supplied by the runtime, distinct from agent action arguments.
 
@@ -558,20 +816,72 @@ that a role or approval is genuine. Keep state flexible for tool-specific facts.
         JsonObject,
         PlainSerializer(_thaw_json_object, return_type=JsonObject),
     ]
-    available_tools: list[NonEmptyString]
+    available_tools: Annotated[
+        list[NonEmptyString],
+        PlainSerializer(list, return_type=list[NonEmptyString]),
+    ]
     observed_agent_fingerprint: NonEmptyString | None = None
     observed_contract_fingerprint: NonEmptyString | None = None
-    final_properties: JsonObject = Field(default_factory=dict)
-    forbidden_outcomes_triggered: list[NonEmptyString] = Field(default_factory=list)
+    final_properties: Annotated[
+        JsonObject,
+        PlainSerializer(_thaw_json_object, return_type=JsonObject),
+    ] = Field(default_factory=dict)
+    forbidden_outcomes_triggered: Annotated[
+        list[NonEmptyString],
+        PlainSerializer(list, return_type=list[NonEmptyString]),
+    ] = Field(default_factory=list)
+
+    def _has_frozen_containers(self) -> bool:
+        return (
+            isinstance(self.state, MappingProxyType)
+            or isinstance(self.final_properties, MappingProxyType)
+            or isinstance(self.available_tools, tuple)
+            or isinstance(self.forbidden_outcomes_triggered, tuple)
+        )
+
+    def _as_frozen_view(self) -> Self:
+        if (
+            isinstance(self.state, MappingProxyType)
+            and isinstance(self.final_properties, MappingProxyType)
+            and isinstance(self.available_tools, tuple)
+            and isinstance(self.forbidden_outcomes_triggered, tuple)
+        ):
+            return self.__copy__()
+        return super().model_copy(
+            update={
+                "state": _freeze_json_object(dict(self.state)),
+                "available_tools": tuple(self.available_tools),
+                "final_properties": _freeze_json_object(dict(self.final_properties)),
+                "forbidden_outcomes_triggered": tuple(
+                    self.forbidden_outcomes_triggered
+                ),
+            },
+            deep=False,
+        )
 
     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
-        if isinstance(self.state, MappingProxyType):
+        if self._has_frozen_containers():
             return super().model_copy(
                 update={
-                    "available_tools": deepcopy(self.available_tools, memo),
-                    "final_properties": deepcopy(self.final_properties, memo),
-                    "forbidden_outcomes_triggered": deepcopy(
-                        self.forbidden_outcomes_triggered, memo
+                    "state": (
+                        self.state
+                        if isinstance(self.state, MappingProxyType)
+                        else deepcopy(self.state, memo)
+                    ),
+                    "available_tools": (
+                        self.available_tools
+                        if isinstance(self.available_tools, tuple)
+                        else deepcopy(self.available_tools, memo)
+                    ),
+                    "final_properties": (
+                        self.final_properties
+                        if isinstance(self.final_properties, MappingProxyType)
+                        else deepcopy(self.final_properties, memo)
+                    ),
+                    "forbidden_outcomes_triggered": (
+                        self.forbidden_outcomes_triggered
+                        if isinstance(self.forbidden_outcomes_triggered, tuple)
+                        else deepcopy(self.forbidden_outcomes_triggered, memo)
                     ),
                 },
                 deep=False,
@@ -584,20 +894,21 @@ that a role or approval is genuine. Keep state flexible for tool-specific facts.
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
     ) -> Self:
-        if deep and isinstance(self.state, MappingProxyType):
-            copied_update: dict[str, Any] = {
-                "available_tools": deepcopy(self.available_tools),
-                "final_properties": deepcopy(self.final_properties),
-                "forbidden_outcomes_triggered": deepcopy(
-                    self.forbidden_outcomes_triggered
-                ),
-            }
+        if deep and self._has_frozen_containers():
+            base = self.__deepcopy__()
             if update is not None:
-                for key, val in update.items():
-                    copied_update[key] = (
-                        val if isinstance(val, MappingProxyType) else deepcopy(val)
+                copied_update = {
+                    key: (
+                        val
+                        if isinstance(val, (MappingProxyType, tuple))
+                        else deepcopy(val)
                     )
-            return super().model_copy(update=copied_update, deep=False)
+                    for key, val in update.items()
+                }
+                return super(ExecutionContext, base).model_copy(
+                    update=copied_update, deep=False
+                )
+            return base
         return super().model_copy(
             update=dict(update) if update is not None else None,
             deep=deep,
@@ -608,14 +919,14 @@ class GovernorInput(_Model):
     """Phase-specific evaluation request; incomplete post-evidence is valid input.
 
 The integration computes final properties/outcomes; this model does not read an
-oracle. V2 rules require a separate ``policy``; a legacy contract retains its
+oracle. V2 and V3 rules require a separate ``policy``; a legacy contract retains its
 embedded mode. IDs are supplied by the runtime and are not proof of authorization.
 """
 
     model_config = ConfigDict(hide_input_in_errors=True)
 
     run_id: NonEmptyString
-    contract: AgentContract | ContractRulesV2
+    contract: ContractSchema
     phase: Phase
     context: ExecutionContext
     action: ActionProposal | None = None
@@ -624,31 +935,27 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
     policy: EnforcementPolicy | None = Field(default=None, exclude_if=lambda value: value is None)
     host_facts: HostFacts | None = Field(default=None, exclude_if=lambda value: value is None)
     planned_effect: PlannedEffect | None = Field(default=None, exclude_if=lambda value: value is None)
+    policy_scope: PolicyScopeId | None = Field(default=None, exclude_if=lambda value: value is None)
+    trajectory: TrajectoryView | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("contract", mode="before")
     @classmethod
-    def dispatch_contract(cls, value: object) -> AgentContract | ContractRulesV2:
+    def dispatch_contract(cls, value: object) -> ContractSchema:
         if isinstance(value, AgentContract):
             if "schema_version" in (value.model_extra or {}):
                 raise ValueError("Unsupported contract schema_version")
             return value
-        if isinstance(value, ContractRulesV2):
+        if isinstance(value, (ContractRulesV2, ContractRulesV3)):
             return value
-        if isinstance(value, ContractRulesV3):
-            raise ValueError(
-                "v3 contracts are not yet executable; runtime evaluation is introduced in Stage 2"
-            )
         if isinstance(value, dict):
             if "schema_version" not in value:
                 return AgentContract.model_validate(value)
             if type(value["schema_version"]) is int and value["schema_version"] == 2:
                 return ContractRulesV2.model_validate(value)
             if type(value["schema_version"]) is int and value["schema_version"] == 3:
-                raise ValueError(
-                    "v3 contracts are not yet executable; runtime evaluation is introduced in Stage 2"
-                )
+                return ContractRulesV3.model_validate(value)
             raise ValueError("Unsupported contract schema_version")
-        raise ValueError("contract must be a v1 or v2 contract")
+        raise ValueError("contract must be a v1, v2, or v3 contract")
 
     @property
     def effective_mode(self) -> Mode:
@@ -657,6 +964,23 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
             return self.policy.mode
         assert isinstance(self.contract, AgentContract)
         return self.contract.mode
+
+    def _validate_policy_binding(self) -> None:
+        if isinstance(self.contract, ContractRulesV2):
+            if self.policy is None:
+                raise ValueError("v2 contracts require an enforcement policy")
+        elif isinstance(self.contract, ContractRulesV3):
+            if self.policy is None:
+                raise ValueError("v3 contracts require an enforcement policy")
+        elif self.policy is not None and self.policy.mode != self.contract.mode:
+            raise ValueError("Enforcement policy conflicts with legacy contract mode")
+
+    def _requires_frozen_evaluation_view(self) -> bool:
+        return (
+            self.host_facts is not None
+            or self.trajectory is not None
+            or isinstance(self.contract, ContractRulesV3)
+        )
 
     def validate_source_agreement(self) -> None:
         """Verify phase and value agreement across legacy and host-supplied inputs."""
@@ -670,6 +994,13 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
                     )
         elif self.planned_effect is not None:
             raise ValueError("planned_effect is only accepted for runtime evaluation")
+        if (
+            self.policy_scope is not None
+            and self.trajectory is not None
+            and self.trajectory.policy_scope is not None
+            and self.trajectory.policy_scope != self.policy_scope
+        ):
+            raise ValueError("trajectory.policy_scope conflicts with policy_scope")
         if self.host_facts is not None:
             conflicts = [
                 key
@@ -684,11 +1015,7 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
 
     @model_validator(mode="after")
     def check_phase_inputs(self) -> Self:
-        if isinstance(self.contract, ContractRulesV2):
-            if self.policy is None:
-                raise ValueError("v2 contracts require an enforcement policy")
-        elif self.policy is not None and self.policy.mode != self.contract.mode:
-            raise ValueError("Enforcement policy conflicts with legacy contract mode")
+        self._validate_policy_binding()
         if self.phase == "runtime":
             if self.action is None:
                 raise ValueError("runtime evaluation requires an action")
@@ -706,11 +1033,8 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
                 raise ValueError("post-execution evaluation requires a response mapping")
         elif self.response is not None or self.run_ledger is not None:
             raise ValueError("response and run_ledger are only accepted after execution")
-        if self.host_facts is not None:
-            frozen_context = self.context.model_copy(
-                update={"state": _freeze_json_object(self.context.state)}
-            )
-            object.__setattr__(self, "context", frozen_context)
+        if self._requires_frozen_evaluation_view():
+            object.__setattr__(self, "context", self.context._as_frozen_view())
         return self
 
     def model_copy(
@@ -723,19 +1047,18 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
             update=dict(update) if update is not None else None,
             deep=deep,
         )
+        copied._validate_policy_binding()
         copied.validate_source_agreement()
-        if copied.host_facts is not None and not isinstance(
-            copied.context.state, MappingProxyType
-        ):
-            frozen_context = copied.context.model_copy(
-                update={"state": _freeze_json_object(copied.context.state)}
-            )
-            object.__setattr__(copied, "context", frozen_context)
+        if copied._requires_frozen_evaluation_view():
+            object.__setattr__(copied, "context", copied.context._as_frozen_view())
         return copied
 
 
 class Violation(_Model):
     rule: NonEmptyString
+    rule_type: NonEmptyString | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     phase: Phase
     severity: NonEmptyString = "high"
     action: NonEmptyString | None = None
