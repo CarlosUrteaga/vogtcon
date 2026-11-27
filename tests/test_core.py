@@ -7,7 +7,8 @@ import unittest
 from copy import deepcopy
 
 from vogtcon import (
-    AgentContract, DeterministicEvaluator, GovernanceDecision, Governor, GovernorInput,
+    ActionProposal, AgentContract, DeterministicEvaluator, ExecutionContext,
+    GovernanceDecision, Governor, GovernorInput,
 )
 from vogtcon.models import HostFacts, PlannedEffect
 
@@ -291,6 +292,61 @@ class EvaluationTests(unittest.TestCase):
                                 [v.rule for v in enriched_decision.violations],
                                 ["authorization.role_required"],
                             )
+
+    def test_post_construction_context_state_mutation_cannot_bypass_source_agreement(self):
+        evaluator = DeterministicEvaluator()
+        caller_state = {"approval_granted": False}
+        ctx = ExecutionContext(state=caller_state, available_tools=TOOLS.copy())
+        request = GovernorInput(
+            run_id="run-agreement-guard",
+            contract=AgentContract.model_validate(contract_data("guarded")),
+            phase="runtime",
+            context=ctx,
+            action=ActionProposal(
+                tool_name="send_notification",
+                arguments={"sensitive": True},
+            ),
+            host_facts=HostFacts(facts={"approval_granted": False}),
+            planned_effect=PlannedEffect(tool_name="send_notification"),
+        )
+        self.assertEqual(evaluator.evaluate(request).decision, "block")
+
+        with self.assertRaises(TypeError):
+            request.context.state["approval_granted"] = True
+
+        # Mutating caller's original dict or standalone ExecutionContext does not flip decision
+        caller_state["approval_granted"] = True
+        ctx.state["approval_granted"] = True
+        self.assertEqual(evaluator.evaluate(request).decision, "block")
+
+        # Defense-in-depth: even low-level attribute tampering fails closed at evaluate()
+        for mode in ("guarded", "no_contract"):
+            tampered_request = request.model_copy(
+                update={"contract": AgentContract.model_validate(contract_data(mode))},
+                deep=True,
+            )
+            object.__setattr__(
+                tampered_request.context,
+                "state",
+                {"approval_granted": True},
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                r"host_facts conflicts with context\.state for key\(s\): approval_granted",
+            ):
+                evaluator.evaluate(tampered_request)
+
+        tampered_effect_request = request.model_copy()
+        object.__setattr__(
+            tampered_effect_request,
+            "planned_effect",
+            PlannedEffect(tool_name="approve_request"),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"planned_effect\.tool_name conflicts with action\.tool_name",
+        ):
+            evaluator.evaluate(tampered_effect_request)
 
 
 if __name__ == "__main__":

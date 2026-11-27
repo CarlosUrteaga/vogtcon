@@ -375,12 +375,54 @@ The caller is responsible for sourcing trustworthy state. A schema cannot prove
 that a role or approval is genuine. Keep state flexible for tool-specific facts.
 """
 
-    state: JsonObject
+    state: Annotated[
+        JsonObject,
+        PlainSerializer(_thaw_json_object, return_type=JsonObject),
+    ]
     available_tools: list[NonEmptyString]
     observed_agent_fingerprint: NonEmptyString | None = None
     observed_contract_fingerprint: NonEmptyString | None = None
     final_properties: JsonObject = Field(default_factory=dict)
     forbidden_outcomes_triggered: list[NonEmptyString] = Field(default_factory=list)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        if isinstance(self.state, MappingProxyType):
+            return super().model_copy(
+                update={
+                    "available_tools": deepcopy(self.available_tools, memo),
+                    "final_properties": deepcopy(self.final_properties, memo),
+                    "forbidden_outcomes_triggered": deepcopy(
+                        self.forbidden_outcomes_triggered, memo
+                    ),
+                },
+                deep=False,
+            )
+        return super().__deepcopy__(memo)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if deep and isinstance(self.state, MappingProxyType):
+            copied_update: dict[str, Any] = {
+                "available_tools": deepcopy(self.available_tools),
+                "final_properties": deepcopy(self.final_properties),
+                "forbidden_outcomes_triggered": deepcopy(
+                    self.forbidden_outcomes_triggered
+                ),
+            }
+            if update is not None:
+                for key, val in update.items():
+                    copied_update[key] = (
+                        val if isinstance(val, MappingProxyType) else deepcopy(val)
+                    )
+            return super().model_copy(update=copied_update, deep=False)
+        return super().model_copy(
+            update=dict(update) if update is not None else None,
+            deep=deep,
+        )
 
 
 class GovernorInput(_Model):
@@ -437,6 +479,30 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
         assert isinstance(self.contract, AgentContract)
         return self.contract.mode
 
+    def validate_source_agreement(self) -> None:
+        """Verify phase and value agreement across legacy and host-supplied inputs."""
+        if self.phase == "runtime":
+            if self.planned_effect is not None:
+                if self.action is None:
+                    raise ValueError("runtime evaluation requires an action")
+                if self.planned_effect.tool_name != self.action.tool_name:
+                    raise ValueError(
+                        "planned_effect.tool_name conflicts with action.tool_name"
+                    )
+        elif self.planned_effect is not None:
+            raise ValueError("planned_effect is only accepted for runtime evaluation")
+        if self.host_facts is not None:
+            conflicts = [
+                key
+                for key in sorted(set(self.context.state) & set(self.host_facts.facts))
+                if _canonical_json(self.context.state[key])
+                != _canonical_json(self.host_facts.facts[key])
+            ]
+            if conflicts:
+                raise ValueError(
+                    f"host_facts conflicts with context.state for key(s): {', '.join(conflicts)}"
+                )
+
     @model_validator(mode="after")
     def check_phase_inputs(self) -> Self:
         if isinstance(self.contract, ContractRulesV2):
@@ -447,17 +513,9 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
         if self.phase == "runtime":
             if self.action is None:
                 raise ValueError("runtime evaluation requires an action")
-            if (
-                self.planned_effect is not None
-                and self.action is not None
-                and self.planned_effect.tool_name != self.action.tool_name
-            ):
-                raise ValueError("planned_effect.tool_name conflicts with action.tool_name")
-        else:
-            if self.action is not None:
-                raise ValueError("action is only accepted for runtime evaluation")
-            if self.planned_effect is not None:
-                raise ValueError("planned_effect is only accepted for runtime evaluation")
+        elif self.action is not None:
+            raise ValueError("action is only accepted for runtime evaluation")
+        self.validate_source_agreement()
         if self.phase == "pre_execution":
             if (
                 self.context.observed_agent_fingerprint is None
@@ -470,17 +528,31 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
         elif self.response is not None or self.run_ledger is not None:
             raise ValueError("response and run_ledger are only accepted after execution")
         if self.host_facts is not None:
-            conflicts = [
-                key
-                for key in sorted(set(self.context.state) & set(self.host_facts.facts))
-                if _canonical_json(self.context.state[key])
-                != _canonical_json(self.host_facts.facts[key])
-            ]
-            if conflicts:
-                raise ValueError(
-                    f"host_facts conflicts with context.state for key(s): {', '.join(conflicts)}"
-                )
+            frozen_context = self.context.model_copy(
+                update={"state": _freeze_json_object(self.context.state)}
+            )
+            object.__setattr__(self, "context", frozen_context)
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        copied = super().model_copy(
+            update=dict(update) if update is not None else None,
+            deep=deep,
+        )
+        copied.validate_source_agreement()
+        if copied.host_facts is not None and not isinstance(
+            copied.context.state, MappingProxyType
+        ):
+            frozen_context = copied.context.model_copy(
+                update={"state": _freeze_json_object(copied.context.state)}
+            )
+            object.__setattr__(copied, "context", frozen_context)
+        return copied
 
 
 class Violation(_Model):

@@ -930,11 +930,19 @@ class SourceAgreementTests(unittest.TestCase):
         self.assertEqual(request, GovernorInput.model_validate_json(request.model_dump_json()))
         self.assertEqual(deepcopy(request), request)
         for dumped in (request.model_dump(), request.model_dump(mode="json")):
+            self.assertIs(type(dumped["context"]["state"]), dict)
+            self.assertIs(type(dumped["context"]["state"]["nested"]["b"]), list)
             self.assertIs(type(dumped["host_facts"]["facts"]), dict)
             self.assertIs(type(dumped["host_facts"]["facts"]["nested"]["b"]), list)
             self.assertIs(type(dumped["planned_effect"]["parameters"]), dict)
 
         assert request.host_facts is not None
+        with self.assertRaises(TypeError):
+            request.context.state["user_role"] = "admin"
+        with self.assertRaises(AttributeError):
+            request.context.state["nested"]["b"].append(3)
+        with self.assertRaises(TypeError):
+            request.context.state["nested"]["a"]["x"] = "tampered"
         with self.assertRaises(TypeError):
             request.host_facts.facts["user_role"] = "admin"
         with self.assertRaises(AttributeError):
@@ -1080,6 +1088,82 @@ class SourceAgreementTests(unittest.TestCase):
                     "Unsupported contract schema_version",
                 ):
                     GovernorInput.model_validate(data)
+
+    def test_context_state_is_detached_and_frozen_with_host_facts_and_model_copy(self):
+        caller_state = {
+            "approval_granted": False,
+            "nested": {"scope": "read", "items": [1, 2]},
+        }
+        caller_ctx = ExecutionContext(
+            state=caller_state,
+            available_tools=["send_notification"],
+        )
+        request = GovernorInput(
+            run_id="run-ctx-freeze",
+            contract=AgentContract.model_validate(contract_data("guarded")),
+            phase="runtime",
+            context=caller_ctx,
+            action=ActionProposal(
+                tool_name="send_notification",
+                arguments={"sensitive": True},
+            ),
+            host_facts=HostFacts(facts={"approval_granted": False}),
+        )
+
+        # Standalone ExecutionContext remains mutable for legacy callers,
+        # while request.context is detached and deeply frozen.
+        caller_state["approval_granted"] = True
+        caller_state["nested"]["scope"] = "write"
+        caller_state["nested"]["items"].append(3)
+        caller_ctx.state["extra"] = "legacy-mutable"
+
+        self.assertIsInstance(request.context.state, MappingProxyType)
+        self.assertFalse(request.context.state["approval_granted"])
+        self.assertNotIn("extra", request.context.state)
+        self.assertEqual(request.context.state["nested"]["scope"], "read")
+        self.assertEqual(request.context.state["nested"]["items"], (1, 2))
+
+        with self.assertRaises(TypeError):
+            request.context.state["approval_granted"] = True
+        with self.assertRaises(TypeError):
+            request.context.state["nested"]["scope"] = "write"
+        with self.assertRaises(AttributeError):
+            request.context.state["nested"]["items"].append(99)
+
+        for dumped in (
+            request.model_dump(),
+            request.model_dump(mode="json"),
+            json.loads(request.model_dump_json()),
+        ):
+            self.assertIs(type(dumped["context"]["state"]), dict)
+            self.assertIs(type(dumped["context"]["state"]["nested"]), dict)
+            self.assertIs(type(dumped["context"]["state"]["nested"]["items"]), list)
+
+        deep_copied = request.model_copy(update={"run_id": "run-ctx-freeze-2"}, deep=True)
+        self.assertEqual(deep_copied.run_id, "run-ctx-freeze-2")
+        self.assertIsInstance(deep_copied.context.state, MappingProxyType)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"host_facts conflicts with context\.state for key\(s\): approval_granted",
+        ):
+            request.model_copy(
+                update={
+                    "context": ExecutionContext(
+                        state={"approval_granted": True},
+                        available_tools=["send_notification"],
+                    )
+                }
+            )
+
+        # Legacy request without host_facts stays untouched unless host_facts is attached
+        legacy_request = GovernorInput.model_validate(input_data("runtime"))
+        self.assertIs(type(legacy_request.context.state), dict)
+        promoted = legacy_request.model_copy(
+            update={"host_facts": HostFacts(facts={"user_role": "employee"})}
+        )
+        self.assertIs(type(legacy_request.context.state), dict)
+        self.assertIsInstance(promoted.context.state, MappingProxyType)
 
 
 class DecisionModelTests(unittest.TestCase):
