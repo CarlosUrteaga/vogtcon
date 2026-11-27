@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from vogtcon.effects import (
+    ApprovalReuseError,
     CompensationRecord,
     ConcurrencyError,
     EffectGovernanceConfig,
@@ -27,7 +28,14 @@ from vogtcon.effects import (
     ResolvedAction,
     ScopeSuspendedError,
 )
-from vogtcon.models import ActionProposal, ExecutionContext, HostFacts, PlannedEffect
+from vogtcon.models import (
+    ActionProposal,
+    ExecutionContext,
+    HostApproval,
+    HostFacts,
+    PlannedEffect,
+    RetrievedEvidence,
+)
 
 
 def _sample_digest(seed: str = "a") -> str:
@@ -946,6 +954,334 @@ class CompensationTests(unittest.TestCase):
                     evidence_ref="ref-4",
                     policy_scope="scope.other",
                 ),
+            )
+
+
+class ApprovalStoreTests(unittest.TestCase):
+    def test_resolved_action_authorization_fields_and_deep_immutability(self) -> None:
+        effect = PlannedEffect(
+            tool_name="send_notification",
+            parameters={"destination": "ops@example.com"},
+        )
+        approval = HostApproval(
+            approval_id="app-100",
+            operation_digest=effect.operation_digest(),
+            requester_id="alice",
+            approver_id="bob",
+            approver_authorities=["notify.approve"],
+            policy_scope="scope.ops",
+            issued_at="2026-11-27T10:00:00Z",
+            expires_at="2026-11-27T11:00:00Z",
+        )
+        ev_list = [RetrievedEvidence(evidence_id="doc-1", source="kb")]
+        resolved = ResolvedAction(
+            planned_effect=effect,
+            policy_scope="scope.ops",
+            requester_id="alice",
+            evaluated_at="2026-11-27T10:05:00Z",
+            approval=approval,
+            retrieved_evidence=ev_list,
+        )
+        ev_list.clear()
+        assert resolved.retrieved_evidence is not None
+        self.assertEqual(len(resolved.retrieved_evidence), 1)
+        self.assertIsInstance(resolved.retrieved_evidence, tuple)
+        self.assertEqual(deepcopy(resolved), resolved)
+        copied = resolved.model_copy(update={"requester_id": "carol"})
+        self.assertEqual(copied.requester_id, "carol")
+        self.assertEqual(copied.approval, approval)
+
+    def test_single_use_consume_uncertain_lock_reconcile_retry_and_compensation(
+        self,
+    ) -> None:
+        store = InMemoryEffectStore()
+        d1 = _sample_digest("1")
+        d2 = _sample_digest("2")
+
+        # Non-null policy_scope required for bound approval
+        with self.assertRaisesRegex(ValueError, "non-null policy_scope"):
+            store.reserve(
+                run_id="run-1",
+                policy_scope=None,
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d1,
+                approval_id="app-null",
+            )
+
+        # 1. Reserve -> confirmed -> consumed -> replay rejected (including across runs)
+        r1 = store.reserve(
+            run_id="run-1",
+            policy_scope="scope.pay",
+            action_index=1,
+            tool_name="transfer",
+            operation_digest=d1,
+            approval_id="app-single",
+        )
+        self.assertEqual(r1.approval_id, "app-single")
+        self.assertEqual(
+            store.snapshot("scope.pay").approval_by_id("app-single").status,  # type: ignore[union-attr]
+            "reserved",
+        )
+
+        # While reserved, cross-scope, modified digest, or single_use downgrade rejected
+        with self.assertRaisesRegex(ApprovalReuseError, "different operation_digest"):
+            store.reserve(
+                run_id="run-2",
+                policy_scope="scope.other",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d2,
+                approval_id="app-single",
+            )
+        with self.assertRaisesRegex(ApprovalReuseError, "different policy_scope"):
+            store.reserve(
+                run_id="run-2",
+                policy_scope="scope.other",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d1,
+                approval_id="app-single",
+            )
+
+        c1 = store.record_observation(
+            effect_id=r1.effect_id, status="confirmed", evidence_ref="tx-1"
+        )
+        self.assertEqual(c1.approval_id, "app-single")
+        self.assertEqual(
+            store.snapshot("scope.pay").approval_by_id("app-single").status,  # type: ignore[union-attr]
+            "consumed",
+        )
+        self.assertEqual(store.snapshot("scope.other").approvals, ())
+
+        # Replay in same or new run rejected; downgrade to single_use=False rejected
+        with self.assertRaisesRegex(ApprovalReuseError, "already been consumed"):
+            store.reserve(
+                run_id="run-2",
+                policy_scope="scope.pay",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d1,
+                approval_id="app-single",
+            )
+        with self.assertRaisesRegex(ApprovalReuseError, "cannot change single_use"):
+            store.reserve(
+                run_id="run-2",
+                policy_scope="scope.pay",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d1,
+                approval_id="app-single",
+                approval_single_use=False,
+            )
+
+        # Compensation does NOT release consumed approval (INV-07)
+        store.record_compensation(
+            run_id="run-2",
+            compensation=CompensationRecord(
+                compensates_effect_id=c1.effect_id,
+                tool_name="refund",
+                operation_digest=_sample_digest("9"),
+                evidence_ref="refund-1",
+                policy_scope="scope.pay",
+            ),
+        )
+        self.assertEqual(
+            store.snapshot("scope.pay").approval_by_id("app-single").status,  # type: ignore[union-attr]
+            "consumed",
+        )
+        with self.assertRaisesRegex(ApprovalReuseError, "already been consumed"):
+            store.reserve(
+                run_id="run-3",
+                policy_scope="scope.pay",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d1,
+                approval_id="app-single",
+            )
+
+        # 2. Uncertain -> locked_uncertain -> reconcile confirmed -> permanently consumed
+        r2 = store.reserve(
+            run_id="run-2",
+            policy_scope="scope.unc",
+            action_index=1,
+            tool_name="transfer",
+            operation_digest=d2,
+            approval_id="app-unc-confirm",
+        )
+        store.record_observation(
+            effect_id=r2.effect_id, status="uncertain", evidence_ref="timeout"
+        )
+        self.assertEqual(
+            store.snapshot("scope.unc").approval_by_id("app-unc-confirm").status,  # type: ignore[union-attr]
+            "locked_uncertain",
+        )
+        with self.assertRaises(ScopeSuspendedError):
+            store.reserve(
+                run_id="run-3",
+                policy_scope="scope.unc",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d2,
+                approval_id="app-unc-confirm",
+            )
+        # Defense-in-depth: even if scope suspension were bypassed, locked_uncertain still rejects reuse
+        store._effects[r2.effect_id] = store._effects[r2.effect_id].model_copy(
+            update={"status": "confirmed_absent"}
+        )
+        with self.assertRaisesRegex(
+            ApprovalReuseError, "locked by an unresolved uncertain effect"
+        ):
+            store.reserve(
+                run_id="run-3",
+                policy_scope="scope.unc",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d2,
+                approval_id="app-unc-confirm",
+            )
+        store._effects[r2.effect_id] = store._effects[r2.effect_id].model_copy(
+            update={"status": "uncertain"}
+        )
+        reconciled_c = store.reconcile(
+            ReconciliationRecord(
+                effect_id=r2.effect_id,
+                resolved_status="confirmed",
+                evidence_ref="audit-confirmed",
+                policy_scope="scope.unc",
+            )
+        )
+        self.assertEqual(reconciled_c.approval_id, "app-unc-confirm")
+        with self.assertRaisesRegex(ApprovalReuseError, "already been consumed"):
+            store.reserve(
+                run_id="run-3",
+                policy_scope="scope.unc",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d2,
+                approval_id="app-unc-confirm",
+            )
+
+        # 3. Uncertain -> reconcile confirmed_absent -> released_absent -> retry gating
+        d3 = _sample_digest("3")
+        r3 = store.reserve(
+            run_id="run-3",
+            policy_scope="scope.retry",
+            action_index=1,
+            tool_name="transfer",
+            operation_digest=d3,
+            approval_id="app-retry",
+        )
+        store.record_observation(
+            effect_id=r3.effect_id, status="uncertain", evidence_ref="timeout-3"
+        )
+        store.reconcile(
+            ReconciliationRecord(
+                effect_id=r3.effect_id,
+                resolved_status="confirmed_absent",
+                evidence_ref="audit-absent",
+                policy_scope="scope.retry",
+            )
+        )
+        self.assertEqual(
+            store.snapshot("scope.retry").approval_by_id("app-retry").status,  # type: ignore[union-attr]
+            "released_absent",
+        )
+
+        # Retry disallowed by default
+        with self.assertRaisesRegex(
+            ApprovalReuseError, "after confirmed absence is not permitted"
+        ):
+            store.reserve(
+                run_id="run-4",
+                policy_scope="scope.retry",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d3,
+                approval_id="app-retry",
+                allow_retry_after_confirmed_absent=False,
+            )
+
+        # Retry with modified operation_digest ALWAYS rejected even when retry allowed
+        with self.assertRaisesRegex(ApprovalReuseError, "different operation_digest"):
+            store.reserve(
+                run_id="run-4",
+                policy_scope="scope.retry",
+                action_index=1,
+                tool_name="transfer",
+                operation_digest=d1,
+                approval_id="app-retry",
+                allow_retry_after_confirmed_absent=True,
+            )
+
+        # Retry with identical operation_digest & policy_scope succeeds and increments retry_count
+        r3_retry = store.reserve(
+            run_id="run-4",
+            policy_scope="scope.retry",
+            action_index=1,
+            tool_name="transfer",
+            operation_digest=d3,
+            approval_id="app-retry",
+            allow_retry_after_confirmed_absent=True,
+        )
+        app_retry_state = store.snapshot("scope.retry").approval_by_id("app-retry")
+        assert app_retry_state is not None
+        self.assertEqual(app_retry_state.status, "reserved")
+        self.assertEqual(app_retry_state.retry_count, 1)
+        store.record_observation(
+            effect_id=r3_retry.effect_id, status="confirmed", evidence_ref="tx-retry-ok"
+        )
+        self.assertEqual(
+            store.snapshot("scope.retry").approval_by_id("app-retry").status,  # type: ignore[union-attr]
+            "consumed",
+        )
+
+
+class ApprovalConcurrencyTests(unittest.TestCase):
+    def test_multithread_barrier_single_use_approval_prevents_double_spend(
+        self,
+    ) -> None:
+        digest = _sample_digest("7")
+        for _ in range(25):
+            store = InMemoryEffectStore()
+            barrier = threading.Barrier(2)
+            successes: list[str] = []
+            errors: list[Exception] = []
+            out_lock = threading.Lock()
+
+            def worker(idx: int) -> None:
+                barrier.wait(timeout=5.0)
+                try:
+                    rec = store.reserve(
+                        run_id=f"run-{idx}",
+                        policy_scope="scope.race",
+                        action_index=1,
+                        tool_name="transfer_funds",
+                        operation_digest=digest,
+                        approval_id="app-race-1",
+                    )
+                    store.record_observation(
+                        effect_id=rec.effect_id,
+                        status="confirmed",
+                        evidence_ref=f"tx-{idx}",
+                    )
+                    with out_lock:
+                        successes.append(rec.effect_id)
+                except (ConcurrencyError, ApprovalReuseError) as exc:
+                    with out_lock:
+                        errors.append(exc)
+
+            t1 = threading.Thread(target=worker, args=(1,))
+            t2 = threading.Thread(target=worker, args=(2,))
+            t1.start()
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+
+            self.assertEqual(len(successes), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(
+                len(store.snapshot("scope.race").effects_by_status("confirmed")), 1
             )
 
 

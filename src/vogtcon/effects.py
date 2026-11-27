@@ -16,19 +16,27 @@ from pydantic import ConfigDict, Field, model_validator
 
 from .models import (
     ActionProposal,
+    ApprovalId,
+    ApprovalStateRecord,
+    ApprovalUsageStatus,
     EffectId,
     EffectRecord,
     ExecutionContext,
     FrozenJsonObject,
+    HostApproval,
     HostFacts,
     JsonObject,
     NonEmptyString,
     PlannedEffect,
     PolicyScopeId,
+    PrincipalId,
     ReconciliationStatus,
+    RetrievedEvidence,
     Sha256Digest,
+    TimestampStr,
     TrajectoryEntry,
     TrajectoryView,
+    _FrozenEvidenceTupleField,
     _FrozenJsonObjectField,
     _Model,
     _thaw_json_object,
@@ -106,14 +114,22 @@ class EffectObservationError(EffectGovernanceError):
     """Raised when the host EffectObserver fails or returns an invalid output."""
 
 
+class ApprovalReuseError(EffectGovernanceError):
+    """Raised when an approval cannot be reserved due to replay, lock, or binding mismatch."""
+
+
 class ResolvedAction(_Model):
-    """Host-resolved planned effect, trusted host facts, and optional policy scope."""
+    """Host-resolved planned effect, trusted host facts, and optional authorization context."""
 
     model_config = ConfigDict(hide_input_in_errors=True)
 
     planned_effect: PlannedEffect
     host_facts: HostFacts = Field(default_factory=HostFacts)
     policy_scope: PolicyScopeId | None = None
+    requester_id: PrincipalId | None = None
+    evaluated_at: TimestampStr | None = None
+    approval: HostApproval | None = None
+    retrieved_evidence: _FrozenEvidenceTupleField | None = None
 
     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
         return self.__copy__()
@@ -129,6 +145,14 @@ class ResolvedAction(_Model):
                 "planned_effect": self.planned_effect,
                 "host_facts": self.host_facts,
                 "policy_scope": self.policy_scope,
+                "requester_id": self.requester_id,
+                "evaluated_at": self.evaluated_at,
+                "approval": self.approval,
+                "retrieved_evidence": (
+                    list(self.retrieved_evidence)
+                    if self.retrieved_evidence is not None
+                    else None
+                ),
             }
             merged.update(update)
             return type(self).model_validate(merged)
@@ -312,6 +336,9 @@ class EffectStore(Protocol):
         operation_digest: str,
         metadata: JsonObject | FrozenJsonObject | None = None,
         expected_last_sequence: int | None = None,
+        approval_id: ApprovalId | None = None,
+        approval_single_use: bool = True,
+        allow_retry_after_confirmed_absent: bool = False,
     ) -> EffectRecord: ...
 
     def record_observation(
@@ -376,6 +403,7 @@ class InMemoryEffectStore:
         self._in_flight_by_scope: dict[PolicyScopeId | None, EffectId] = {}
         self._entries: list[TrajectoryEntry] = []
         self._effects: dict[EffectId, EffectRecord] = {}
+        self._approvals: dict[ApprovalId, ApprovalStateRecord] = {}
         self._next_effect_num: int = 0
 
     @contextmanager
@@ -418,12 +446,22 @@ class InMemoryEffectStore:
                 for record in effects
                 if record.status == "uncertain"
             ]
+            approvals = (
+                [
+                    rec
+                    for rec in self._approvals.values()
+                    if rec.policy_scope == policy_scope
+                ]
+                if policy_scope is not None
+                else []
+            )
             return TrajectoryView(
                 policy_scope=policy_scope,
                 entries=entries,
                 effects=effects,
                 suspended=bool(uncertain_ids),
                 uncertain_effect_ids=uncertain_ids,
+                approvals=approvals,
             )
 
     def uncertain_effects(
@@ -450,6 +488,9 @@ class InMemoryEffectStore:
         operation_digest: str,
         metadata: JsonObject | FrozenJsonObject | None = None,
         expected_last_sequence: int | None = None,
+        approval_id: ApprovalId | None = None,
+        approval_single_use: bool = True,
+        allow_retry_after_confirmed_absent: bool = False,
     ) -> EffectRecord:
         _validate_policy_scope_id(policy_scope)
         if expected_last_sequence is not None and (
@@ -458,6 +499,14 @@ class InMemoryEffectStore:
         ):
             raise ValueError(
                 "expected_last_sequence must be a non-negative integer"
+            )
+        if type(approval_single_use) is not bool:
+            raise TypeError("approval_single_use must be a bool")
+        if type(allow_retry_after_confirmed_absent) is not bool:
+            raise TypeError("allow_retry_after_confirmed_absent must be a bool")
+        if approval_id is not None and policy_scope is None:
+            raise ValueError(
+                "Bound approval reservation requires a non-null policy_scope"
             )
         with self._acquire_lock():
             uncertain_ids = self._uncertain_effects_unlocked(policy_scope)
@@ -486,6 +535,59 @@ class InMemoryEffectStore:
                     )
             candidate_id = f"eff-{self._next_effect_num + 1:06d}"
             candidate_seq = len(self._entries) + 1
+            candidate_approval: ApprovalStateRecord | None = None
+            if approval_id is not None:
+                assert policy_scope is not None
+                existing_approval = self._approvals.get(approval_id)
+                if existing_approval is not None:
+                    if existing_approval.operation_digest != operation_digest:
+                        raise ApprovalReuseError(
+                            f"Approval '{approval_id}' cannot be reused with a different operation_digest"
+                        )
+                    if existing_approval.policy_scope != policy_scope:
+                        raise ApprovalReuseError(
+                            f"Approval '{approval_id}' is bound to a different policy_scope"
+                        )
+                    if existing_approval.single_use != approval_single_use:
+                        raise ApprovalReuseError(
+                            f"Approval '{approval_id}' cannot change single_use mode once bound"
+                        )
+                    if existing_approval.status == "reserved":
+                        raise ConcurrencyError(
+                            f"Approval '{approval_id}' is currently reserved by an active effect"
+                        )
+                    if existing_approval.status == "locked_uncertain":
+                        raise ApprovalReuseError(
+                            f"Approval '{approval_id}' is locked by an unresolved uncertain effect"
+                        )
+                    if existing_approval.status == "consumed" and (
+                        existing_approval.single_use or approval_single_use
+                    ):
+                        raise ApprovalReuseError(
+                            f"Single-use approval '{approval_id}' has already been consumed"
+                        )
+                    if (
+                        existing_approval.status == "released_absent"
+                        and existing_approval.single_use
+                        and not allow_retry_after_confirmed_absent
+                    ):
+                        raise ApprovalReuseError(
+                            f"Retry of single-use approval '{approval_id}' after confirmed absence is not permitted by policy"
+                        )
+                candidate_approval = ApprovalStateRecord(
+                    approval_id=approval_id,
+                    operation_digest=operation_digest,
+                    policy_scope=policy_scope,
+                    status="reserved",
+                    effect_id=candidate_id,
+                    single_use=approval_single_use,
+                    retry_count=(
+                        existing_approval.retry_count + 1
+                        if existing_approval is not None
+                        and existing_approval.status == "released_absent"
+                        else 0
+                    ),
+                )
             thawed_meta = (
                 _thaw_json_value(metadata) if metadata is not None else {}
             )
@@ -499,6 +601,7 @@ class InMemoryEffectStore:
                 tool_name=tool_name,
                 operation_digest=operation_digest,
                 status="reserved",
+                approval_id=approval_id,
                 metadata=thawed_meta,
             )
             record = EffectRecord(
@@ -509,12 +612,16 @@ class InMemoryEffectStore:
                 tool_name=tool_name,
                 operation_digest=operation_digest,
                 status="reserved",
+                approval_id=approval_id,
                 metadata=thawed_meta,
             )
             self._next_effect_num += 1
             self._entries.append(entry)
             self._effects[candidate_id] = record
             self._in_flight_by_scope[policy_scope] = candidate_id
+            if candidate_approval is not None:
+                assert approval_id is not None
+                self._approvals[approval_id] = candidate_approval
             return record
 
     def record_observation(
@@ -560,6 +667,7 @@ class InMemoryEffectStore:
                 tool_name=existing.tool_name,
                 operation_digest=existing.operation_digest,
                 status=status,
+                approval_id=existing.approval_id,
                 evidence_ref=evidence_ref,
                 metadata=entry_meta,
             )
@@ -571,11 +679,32 @@ class InMemoryEffectStore:
                 tool_name=existing.tool_name,
                 operation_digest=existing.operation_digest,
                 status=status,
+                approval_id=existing.approval_id,
                 evidence_ref=evidence_ref,
                 metadata=merged_meta,
             )
+            updated_approval: ApprovalStateRecord | None = None
+            if (
+                existing.approval_id is not None
+                and existing.approval_id in self._approvals
+            ):
+                prev_approval = self._approvals[existing.approval_id]
+                mapped_status: ApprovalUsageStatus = {
+                    "confirmed": "consumed",
+                    "uncertain": "locked_uncertain",
+                    "confirmed_absent": "released_absent",
+                }[status]
+                updated_approval = prev_approval.model_copy(
+                    update={
+                        "status": mapped_status,
+                        "effect_id": existing.effect_id,
+                    }
+                )
             self._entries.append(entry)
             self._effects[effect_id] = updated
+            if updated_approval is not None:
+                assert existing.approval_id is not None
+                self._approvals[existing.approval_id] = updated_approval
             if self._in_flight_by_scope.get(existing.policy_scope) == effect_id:
                 del self._in_flight_by_scope[existing.policy_scope]
             return updated
@@ -614,6 +743,7 @@ class InMemoryEffectStore:
                 tool_name=existing.tool_name,
                 operation_digest=existing.operation_digest,
                 status=record.resolved_status,
+                approval_id=existing.approval_id,
                 evidence_ref=record.evidence_ref,
                 metadata=entry_meta,
             )
@@ -625,11 +755,32 @@ class InMemoryEffectStore:
                 tool_name=existing.tool_name,
                 operation_digest=existing.operation_digest,
                 status=record.resolved_status,
+                approval_id=existing.approval_id,
                 evidence_ref=record.evidence_ref,
                 metadata=merged_meta,
             )
+            updated_approval: ApprovalStateRecord | None = None
+            if (
+                existing.approval_id is not None
+                and existing.approval_id in self._approvals
+            ):
+                prev_approval = self._approvals[existing.approval_id]
+                reconciled_status: ApprovalUsageStatus = (
+                    "consumed"
+                    if record.resolved_status == "confirmed"
+                    else "released_absent"
+                )
+                updated_approval = prev_approval.model_copy(
+                    update={
+                        "status": reconciled_status,
+                        "effect_id": existing.effect_id,
+                    }
+                )
             self._entries.append(entry)
             self._effects[existing.effect_id] = updated
+            if updated_approval is not None:
+                assert existing.approval_id is not None
+                self._approvals[existing.approval_id] = updated_approval
             return updated
 
     def record_compensation(
