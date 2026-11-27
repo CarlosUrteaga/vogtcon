@@ -2162,18 +2162,46 @@ class PublicApiTests(unittest.TestCase):
             + stage2_records_exports
             + stage2_rules_exports
         )
+        stage3_model_exports = (
+            "ApprovalId",
+            "ApprovalStateRecord",
+            "ApprovalStatus",
+            "ApprovalUsageStatus",
+            "EvidenceId",
+            "HostApproval",
+            "PrincipalId",
+            "RetrievedEvidence",
+            "TimestampStr",
+        )
+        stage3_effects_exports = ("ApprovalReuseError",)
+        stage3_rules_exports = (
+            "BoundApprovalParams",
+            "DestinationAllowlistParams",
+            "RetrievedEvidenceParams",
+        )
+        stage3_exports = (
+            stage3_model_exports
+            + stage3_effects_exports
+            + stage3_rules_exports
+        )
 
         self.assertEqual(len(historical_exports), 22)
         self.assertEqual(len(stage1_exports), 10)
         self.assertEqual(len(stage2_exports), 28)
-        self.assertEqual(len(vogtcon.__all__), 60)
-        self.assertEqual(len(set(vogtcon.__all__)), 60)
+        self.assertEqual(len(stage3_exports), 13)
+        self.assertEqual(len(vogtcon.__all__), 73)
+        self.assertEqual(len(set(vogtcon.__all__)), 73)
         self.assertEqual(
             set(vogtcon.__all__),
-            set(historical_exports) | set(stage1_exports) | set(stage2_exports),
+            set(historical_exports)
+            | set(stage1_exports)
+            | set(stage2_exports)
+            | set(stage3_exports),
         )
 
-        for name in historical_exports + stage1_exports + stage2_exports:
+        for name in (
+            historical_exports + stage1_exports + stage2_exports + stage3_exports
+        ):
             with self.subTest(symbol=name):
                 self.assertIn(name, vogtcon.__all__)
                 self.assertTrue(hasattr(vogtcon, name))
@@ -2190,6 +2218,7 @@ class PublicApiTests(unittest.TestCase):
             "PlannedEffect",
             "RuleBinding",
             *stage2_model_exports,
+            *stage3_model_exports,
         ):
             self.assertIs(getattr(vogtcon, name), getattr(models, name))
         for name in (
@@ -2197,9 +2226,10 @@ class PublicApiTests(unittest.TestCase):
             "EmptyRuleParams",
             "RuleTypeSpec",
             *stage2_rules_exports,
+            *stage3_rules_exports,
         ):
             self.assertIs(getattr(vogtcon, name), getattr(rules, name))
-        for name in stage2_effects_exports:
+        for name in (*stage2_effects_exports, *stage3_effects_exports):
             self.assertIs(getattr(vogtcon, name), getattr(effects, name))
         for name in stage2_records_exports:
             self.assertIs(getattr(vogtcon, name), getattr(records, name))

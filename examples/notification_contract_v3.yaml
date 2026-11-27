@@ -1,0 +1,55 @@
+# Copyright (c) 2026 Jorge Carlos Urteaga Reyesvera
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 3
+contract_id: example.notification.v3
+approved_agent_configurations:
+  - notification-agent-v3
+declared_tools:
+  - send_notification
+response_schema:
+  required_fields:
+    - status
+memory_policy: none
+validation_phases:
+  - pre_execution
+  - runtime
+  - post_execution
+rules:
+  - instance_id: declared_tools
+    rule_type: tool.declared_only
+    phases:
+      - runtime
+    params: {}
+  - instance_id: destination_policy
+    rule_type: destination.allowlist
+    phases:
+      - runtime
+    params:
+      tools:
+        - send_notification
+      allowed_destinations:
+        - ops@example.com
+        - alerts@example.com
+      destination_param: recipient
+      source: planned_effect
+  - instance_id: sensitive_approval
+    rule_type: approval.bound_required
+    phases:
+      - runtime
+    params:
+      tools:
+        - send_notification
+      required_authorities:
+        - notification_approver
+      authority_match: any
+      sensitivity_fact_key: sensitive
+      allow_self_approval: false
+      require_single_use: true
+      allow_retry_after_confirmed_absent: true
+  - instance_id: response_fields
+    rule_type: response.schema_complete
+    phases:
+      - post_execution
+    params: {}
+contract_fingerprint: sha256:221161901b316e3a7ea0ad1de28cc4ce75c9d1ab690e48fcfed752ce2d994d05

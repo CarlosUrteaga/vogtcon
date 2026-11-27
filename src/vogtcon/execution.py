@@ -19,6 +19,7 @@ from typing import Generic, Self, TypeVar
 from .contracts import load_contract
 from .core import Governor
 from .effects import (
+    ApprovalReuseError,
     CompensationRecord,
     ConcurrencyError,
     EffectGovernanceConfig,
@@ -34,6 +35,7 @@ from .effects import (
 from .models import (
     ActionProposal,
     AgentContract,
+    ApprovalId,
     ContractRulesV2,
     ContractRulesV3,
     ContractSchema,
@@ -42,14 +44,19 @@ from .models import (
     ExecutionContext,
     GovernanceDecision,
     GovernorInput,
+    HostApproval,
     HostFacts,
     JsonObject,
     PlannedEffect,
     PolicyScopeId,
+    PrincipalId,
+    RetrievedEvidence,
+    TimestampStr,
     TrajectoryView,
+    _thaw_json_value,
 )
 from .records import RunEvent, RunEventV2, RunRecorder
-from .rules import RuleCatalog
+from .rules import BoundApprovalParams, RuleCatalog
 from .telemetry import TelemetryObserver
 
 T = TypeVar("T")
@@ -292,6 +299,7 @@ class WorkflowController:
         effect_id: str | None = None,
         operation_digest: str | None = None,
         effect_status: str | None = None,
+        approval_id: ApprovalId | None = None,
         compensates_effect_id: str | None = None,
         evidence_ref: str | None = None,
     ) -> None:
@@ -301,30 +309,31 @@ class WorkflowController:
         trace_id, span_id = (
             self._telemetry.current_ids() if self._telemetry is not None else (None, None)
         )
-        self._recorder.record(
-            RunEventV2.model_validate({
-                "schema_version": 2,
-                "run_id": self._run_id,
-                "sequence": self._sequence,
-                "contract_id": self._contract.contract_id,
-                "mode": self._mode,
-                "phase": phase,
-                "event_type": event_type,
-                "action_index": action_index,
-                "tool_name": tool_name,
-                "decision": decision.decision if decision is not None else None,
-                "violation_rules": [v.rule for v in decision.violations] if decision is not None else [],
-                "execution_status": execution_status,
-                "policy_scope": policy_scope,
-                "effect_id": effect_id,
-                "operation_digest": operation_digest,
-                "effect_status": effect_status,
-                "compensates_effect_id": compensates_effect_id,
-                "evidence_ref": evidence_ref,
-                "trace_id": trace_id,
-                "span_id": span_id,
-            })
-        )
+        event_payload: dict[str, object] = {
+            "schema_version": 2,
+            "run_id": self._run_id,
+            "sequence": self._sequence,
+            "contract_id": self._contract.contract_id,
+            "mode": self._mode,
+            "phase": phase,
+            "event_type": event_type,
+            "action_index": action_index,
+            "tool_name": tool_name,
+            "decision": decision.decision if decision is not None else None,
+            "violation_rules": [v.rule for v in decision.violations] if decision is not None else [],
+            "execution_status": execution_status,
+            "policy_scope": policy_scope,
+            "effect_id": effect_id,
+            "operation_digest": operation_digest,
+            "effect_status": effect_status,
+            "compensates_effect_id": compensates_effect_id,
+            "evidence_ref": evidence_ref,
+            "trace_id": trace_id,
+            "span_id": span_id,
+        }
+        if approval_id is not None:
+            event_payload["approval_id"] = approval_id
+        self._recorder.record(RunEventV2.model_validate(event_payload))
 
     @property
     def state(self) -> str:
@@ -338,6 +347,32 @@ class WorkflowController:
     def contract(self) -> ContractSchema:
         return self._contract.model_copy(deep=True)
 
+    def _allow_approval_retry_after_absent(
+        self,
+        tool_name: str,
+        host_facts: HostFacts | None,
+    ) -> bool:
+        if not isinstance(self._contract, ContractRulesV3):
+            return False
+        matching_flags: list[bool] = []
+        for binding in self._contract.rules:
+            if (
+                "runtime" not in binding.phases
+                or binding.rule_type != "approval.bound_required"
+            ):
+                continue
+            params = BoundApprovalParams.model_validate(_thaw_json_value(binding.params))
+            if tool_name not in params.tools:
+                continue
+            if (
+                params.sensitivity_fact_key is not None
+                and host_facts is not None
+                and host_facts.facts.get(params.sensitivity_fact_key) is False
+            ):
+                continue
+            matching_flags.append(params.allow_retry_after_confirmed_absent)
+        return bool(matching_flags) and all(matching_flags)
+
     def _request(
         self,
         phase: str,
@@ -350,6 +385,10 @@ class WorkflowController:
         planned_effect: PlannedEffect | None = None,
         policy_scope: PolicyScopeId | None = None,
         trajectory: TrajectoryView | None = None,
+        requester_id: PrincipalId | None = None,
+        evaluated_at: TimestampStr | None = None,
+        approval: HostApproval | None = None,
+        retrieved_evidence: tuple[RetrievedEvidence, ...] | None = None,
     ) -> GovernorInput:
         payload: dict[str, object] = {
             "run_id": self._run_id,
@@ -369,6 +408,14 @@ class WorkflowController:
             payload["policy_scope"] = policy_scope
         if trajectory is not None:
             payload["trajectory"] = trajectory
+        if requester_id is not None:
+            payload["requester_id"] = requester_id
+        if evaluated_at is not None:
+            payload["evaluated_at"] = evaluated_at
+        if approval is not None:
+            payload["approval"] = approval
+        if retrieved_evidence is not None:
+            payload["retrieved_evidence"] = list(retrieved_evidence)
         return GovernorInput.model_validate(payload)
 
     def begin(self, context: ExecutionContext) -> GovernanceDecision:
@@ -488,6 +535,10 @@ class WorkflowController:
                     planned_effect=resolved.planned_effect,
                     policy_scope=effective_scope,
                     trajectory=trajectory,
+                    requester_id=resolved.requester_id,
+                    evaluated_at=resolved.evaluated_at,
+                    approval=resolved.approval,
+                    retrieved_evidence=resolved.retrieved_evidence,
                 )
                 eval_req = request.model_copy(deep=True)
                 check_span = self._telemetry.span(
@@ -545,6 +596,20 @@ class WorkflowController:
 
             # Stage 3: Reservation
             next_action_index = self._action_index + 1
+            has_approval_violation = any(
+                v.rule_type == "approval.bound_required" for v in decision.violations
+            )
+            reserve_kwargs: dict[str, object] = {}
+            if resolved.approval is not None and not (
+                decision.decision == "allow_with_warning" and has_approval_violation
+            ):
+                reserve_kwargs = {
+                    "approval_id": resolved.approval.approval_id,
+                    "approval_single_use": resolved.approval.single_use,
+                    "allow_retry_after_confirmed_absent": self._allow_approval_retry_after_absent(
+                        tool_name, resolved.host_facts
+                    ),
+                }
             try:
                 reserved = cfg.store.reserve(
                     run_id=self._run_id,
@@ -553,8 +618,9 @@ class WorkflowController:
                     tool_name=tool_name,
                     operation_digest=operation_digest,
                     expected_last_sequence=expected_last_sequence,
+                    **reserve_kwargs,  # type: ignore[arg-type]
                 )
-            except (ScopeSuspendedError, ConcurrencyError):
+            except (ScopeSuspendedError, ConcurrencyError, ApprovalReuseError):
                 raise
             except Exception:
                 self._state = "aborted"
@@ -574,6 +640,7 @@ class WorkflowController:
                     effect_id=reserved.effect_id,
                     operation_digest=reserved.operation_digest,
                     effect_status="reserved",
+                    approval_id=reserved.approval_id,
                 )
             except Exception:
                 try:
@@ -656,6 +723,7 @@ class WorkflowController:
                             effect_id=final_record.effect_id,
                             operation_digest=final_record.operation_digest,
                             effect_status=final_record.status,
+                            approval_id=final_record.approval_id,
                             evidence_ref=final_record.evidence_ref,
                         )
                     except Exception:
@@ -713,6 +781,7 @@ class WorkflowController:
                         effect_id=uncertain_record.effect_id,
                         operation_digest=uncertain_record.operation_digest,
                         effect_status="uncertain",
+                        approval_id=uncertain_record.approval_id,
                         evidence_ref=uncertain_record.evidence_ref,
                     )
                 except Exception:
@@ -756,6 +825,7 @@ class WorkflowController:
                     effect_id=final_record.effect_id,
                     operation_digest=final_record.operation_digest,
                     effect_status=final_record.status,
+                    approval_id=final_record.approval_id,
                     evidence_ref=final_record.evidence_ref,
                 )
             except Exception:
@@ -855,6 +925,7 @@ class WorkflowController:
                     effect_id=reconciled.effect_id,
                     operation_digest=reconciled.operation_digest,
                     effect_status=reconciled.status,
+                    approval_id=reconciled.approval_id,
                     evidence_ref=reconciled.evidence_ref,
                 )
             except Exception:

@@ -12,6 +12,7 @@ from pathlib import Path
 from vogtcon import (
     ActionProposal,
     AgentContract,
+    ApprovalReuseError,
     CompensationRecord,
     ConcurrencyError,
     ContractRulesV2,
@@ -26,6 +27,7 @@ from vogtcon import (
     Governor,
     GovernorInput,
     GovernanceDecision,
+    HostApproval,
     HostFacts,
     InMemoryEffectStore,
     JsonlDecisionLog,
@@ -36,6 +38,7 @@ from vogtcon import (
     ReconciliationRecord,
     RecordedEvent,
     ResolvedAction,
+    RetrievedEvidence,
     RuleCatalog,
     RuleTypeSpec,
     RunEvent,
@@ -1680,6 +1683,858 @@ class ReconciliationWorkflowTests(unittest.TestCase):
         self.assertEqual(len(invocations), 1)
         self.assertEqual(len(store.snapshot("scope.barrier").effects), 1)
         self.assertTrue(all(ctrl.state == "active" for ctrl in controllers))
+
+
+class BoundAuthorizationExecutionTests(unittest.TestCase):
+    def _auth_v3_contract(
+        self,
+        *,
+        allow_retry_after_confirmed_absent: bool = True,
+        extra_approval_binding: dict | None = None,
+    ) -> ContractRulesV3:
+        rules: list[dict] = [
+            {
+                "instance_id": "declared-tools",
+                "rule_type": "tool.declared_only",
+                "phases": ["runtime"],
+                "params": {},
+            },
+            {
+                "instance_id": "dest-allow",
+                "rule_type": "destination.allowlist",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "allowed_destinations": ["ops@example.com", "alerts@example.com"],
+                    "destination_param": "recipient",
+                    "source": "planned_effect",
+                },
+            },
+            {
+                "instance_id": "bound-approval",
+                "rule_type": "approval.bound_required",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "required_authorities": ["notification_approver"],
+                    "authority_match": "any",
+                    "sensitivity_fact_key": "sensitive",
+                    "allow_self_approval": False,
+                    "require_single_use": True,
+                    "allow_retry_after_confirmed_absent": allow_retry_after_confirmed_absent,
+                },
+            },
+            {
+                "instance_id": "evidence-check",
+                "rule_type": "evidence.retrieved_required",
+                "phases": ["runtime"],
+                "params": {
+                    "tools": ["send_notification"],
+                    "min_count": 1,
+                    "allowed_sources": ["policy_kb"],
+                    "require_content_digest": True,
+                    "claim_param": "evidence_ids",
+                },
+            },
+            {
+                "instance_id": "response-schema",
+                "rule_type": "response.schema_complete",
+                "phases": ["post_execution"],
+                "params": {},
+            },
+        ]
+        if extra_approval_binding is not None:
+            rules.insert(3, extra_approval_binding)
+        draft = ContractRulesV3.model_validate({
+            "schema_version": 3,
+            "contract_id": "test.bound.auth.v3",
+            "approved_agent_configurations": ["agent-v1"],
+            "declared_tools": ["send_notification"],
+            "response_schema": {"required_fields": ["status"]},
+            "memory_policy": "none",
+            "validation_phases": ["pre_execution", "runtime", "post_execution"],
+            "rules": rules,
+            "contract_fingerprint": "sha256:placeholder",
+        })
+        return draft.model_copy(
+            update={"contract_fingerprint": compute_v3_contract_fingerprint(draft)}
+        )
+
+    def _evidence(self, evidence_id: str = "ev-001") -> tuple[RetrievedEvidence, ...]:
+        return (
+            RetrievedEvidence(
+                evidence_id=evidence_id,
+                source="policy_kb",
+                content_digest="sha256:" + ("a" * 64),
+                retrieved_at="2026-06-01T10:00:00Z",
+            ),
+        )
+
+    def _planned(
+        self,
+        *,
+        recipient: str = "alerts@example.com",
+        evidence_ids: list[str] | None = None,
+    ) -> PlannedEffect:
+        return PlannedEffect(
+            tool_name="send_notification",
+            parameters={
+                "recipient": recipient,
+                "evidence_ids": evidence_ids if evidence_ids is not None else ["ev-001"],
+            },
+            defaults={"channel": "email"},
+        )
+
+    def _approval(
+        self,
+        planned: PlannedEffect,
+        *,
+        approval_id: str = "appr-001",
+        policy_scope: str = "scope.auth",
+        requester_id: str = "req-1",
+        approver_id: str = "mgr-1",
+        approver_authorities: tuple[str, ...] = ("notification_approver",),
+        issued_at: str = "2026-06-01T10:00:00Z",
+        expires_at: str = "2026-06-01T11:00:00Z",
+        status: str = "active",
+        single_use: bool = True,
+    ) -> HostApproval:
+        return HostApproval(
+            approval_id=approval_id,
+            operation_digest=planned.operation_digest(),
+            policy_scope=policy_scope,
+            requester_id=requester_id,
+            approver_id=approver_id,
+            approver_authorities=list(approver_authorities),
+            issued_at=issued_at,
+            expires_at=expires_at,
+            status=status,  # type: ignore[arg-type]
+            single_use=single_use,
+        )
+
+    def test_legitimate_bound_flow_consumes_approval_and_records_approval_id(self):
+        v3 = self._auth_v3_contract()
+        ctx = _v3_context(v3, state={})
+        planned = self._planned()
+        approval = self._approval(planned)
+        store = InMemoryEffectStore()
+        calls: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = JsonlDecisionLog(Path(tmpdir) / "bound.jsonl")
+            controller = WorkflowController(
+                Governor(),
+                "run-legit",
+                v3,
+                recorder=log,
+                policy=EnforcementPolicy(mode="guarded"),
+                effect_governance=EffectGovernanceConfig(
+                    store=store,
+                    resolver=_CallbackResolver(
+                        lambda _a, _c: ResolvedAction(
+                            planned_effect=planned,
+                            host_facts=HostFacts(
+                                facts={
+                                    "sensitive": True,
+                                    "requester_id": "req-1",
+                                    "approval_id": "appr-001",
+                                }
+                            ),
+                            policy_scope="scope.auth",
+                            requester_id="req-1",
+                            evaluated_at="2026-06-01T10:30:00Z",
+                            approval=approval,
+                            retrieved_evidence=self._evidence(),
+                        )
+                    ),
+                    observer=_CallbackObserver(
+                        lambda _in, _res: ObservedEffect(
+                            status="confirmed", evidence_ref="gw-101"
+                        )
+                    ),
+                    policy_scope="scope.auth",
+                ),
+            )
+            self.assertEqual(controller.begin(ctx).violations, [])
+            outcome = controller.execute(
+                ActionProposal(
+                    tool_name="send_notification",
+                    arguments={"recipient": "alerts@example.com", "sensitive": False},
+                ),
+                ctx,
+                lambda _p: calls.append("sent") or "ok",
+            )
+            self.assertTrue(outcome.executed)
+            assert outcome.effect is not None
+            self.assertEqual(outcome.effect.status, "confirmed")
+            self.assertEqual(outcome.effect.approval_id, "appr-001")
+            self.assertEqual(calls, ["sent"])
+            self.assertEqual(controller.finish(ctx, {"status": "ok"}).violations, [])
+
+            snap = store.snapshot("scope.auth")
+            appr_state = snap.approval_by_id("appr-001")
+            self.assertIsNotNone(appr_state)
+            assert appr_state is not None
+            self.assertEqual(appr_state.status, "consumed")
+
+            events = log.read()
+            self.assertEqual(
+                [ev.event_type for ev in events],
+                ["decision", "decision", "tool_completed", "effect_observed", "decision"],
+            )
+            self.assertEqual(events[1].approval_id, "appr-001")
+            self.assertIsNone(events[2].approval_id)
+            self.assertEqual(events[3].approval_id, "appr-001")
+
+            # Single-use replay on a second controller with a different run_id (INV-11) is blocked
+            controller2 = WorkflowController(
+                Governor(),
+                "run-replay",
+                v3,
+                policy=EnforcementPolicy(mode="guarded"),
+                effect_governance=EffectGovernanceConfig(
+                    store=store,
+                    resolver=_CallbackResolver(
+                        lambda _a, _c: ResolvedAction(
+                            planned_effect=planned,
+                            host_facts=HostFacts(
+                                facts={
+                                    "sensitive": True,
+                                    "requester_id": "req-1",
+                                    "approval_id": "appr-001",
+                                }
+                            ),
+                            policy_scope="scope.auth",
+                            requester_id="req-1",
+                            evaluated_at="2026-06-01T10:35:00Z",
+                            approval=approval,
+                            retrieved_evidence=self._evidence(),
+                        )
+                    ),
+                    observer=_CallbackObserver(
+                        lambda _in, _res: ObservedEffect(status="confirmed")
+                    ),
+                    policy_scope="scope.auth",
+                ),
+            )
+            controller2.begin(ctx)
+            replay = controller2.execute(
+                ActionProposal(tool_name="send_notification"),
+                ctx,
+                lambda _p: calls.append("replayed"),
+            )
+            self.assertFalse(replay.executed)
+            self.assertEqual(replay.decision.decision, "block")
+            self.assertEqual([v.rule for v in replay.decision.violations], ["bound-approval"])
+            self.assertEqual(calls, ["sent"])
+
+    def test_rejects_tampered_authorization_evidence_destination_and_spoofed_sensitivity(self):
+        v3 = self._auth_v3_contract()
+        ctx = _v3_context(v3, state={})
+        valid_planned = self._planned()
+        valid_approval = self._approval(valid_planned)
+
+        cases = [
+            (
+                "modified_destination_after_approval",
+                self._planned(recipient="ops@example.com"),
+                valid_approval,
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "foreign_requester_id",
+                valid_planned,
+                valid_approval,
+                "req-foreign",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "wrong_policy_scope",
+                valid_planned,
+                self._approval(valid_planned, policy_scope="scope.other"),
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "disallowed_self_approval",
+                valid_planned,
+                self._approval(valid_planned, approver_id="req-1"),
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "missing_authority",
+                valid_planned,
+                self._approval(valid_planned, approver_authorities=("viewer",)),
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "expired_approval",
+                valid_planned,
+                valid_approval,
+                "req-1",
+                "2026-06-01T11:00:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "future_approval",
+                valid_planned,
+                valid_approval,
+                "req-1",
+                "2026-06-01T09:59:59Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "revoked_approval",
+                valid_planned,
+                self._approval(valid_planned, status="revoked"),
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+            (
+                "invented_evidence_id",
+                self._planned(evidence_ids=["ev-invented"]),
+                self._approval(self._planned(evidence_ids=["ev-invented"])),
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence("ev-001"),
+                True,
+                "evidence-check",
+            ),
+            (
+                "disallowed_destination",
+                self._planned(recipient="attacker@evil.example"),
+                self._approval(self._planned(recipient="attacker@evil.example")),
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "dest-allow",
+            ),
+            (
+                "agent_claims_not_sensitive_when_host_sensitive_true",
+                valid_planned,
+                None,
+                "req-1",
+                "2026-06-01T10:30:00Z",
+                self._evidence(),
+                True,
+                "bound-approval",
+            ),
+        ]
+
+        for mode in ("guarded", "strict"):
+            for (
+                label,
+                planned_eff,
+                appr,
+                req_id,
+                eval_at,
+                ev_tuple,
+                sensitive,
+                expected_rule,
+            ) in cases:
+                with self.subTest(mode=mode, case=label):
+                    calls: list[str] = []
+                    controller = WorkflowController(
+                        Governor(),
+                        f"run-{mode}-{label}",
+                        v3,
+                        policy=EnforcementPolicy(mode=mode),
+                        effect_governance=EffectGovernanceConfig(
+                            store=InMemoryEffectStore(),
+                            resolver=_CallbackResolver(
+                                lambda _a, _c, pe=planned_eff, ap=appr, ri=req_id, ea=eval_at, ev=ev_tuple, sens=sensitive: ResolvedAction(
+                                    planned_effect=pe,
+                                    host_facts=HostFacts(
+                                        facts={
+                                            "sensitive": sens,
+                                            "requester_id": ri,
+                                            **(
+                                                {"approval_id": ap.approval_id}
+                                                if ap is not None
+                                                else {}
+                                            ),
+                                        }
+                                    ),
+                                    policy_scope="scope.auth",
+                                    requester_id=ri,
+                                    evaluated_at=ea,
+                                    approval=ap,
+                                    retrieved_evidence=ev,
+                                )
+                            ),
+                            observer=_CallbackObserver(
+                                lambda _in, _res: ObservedEffect(status="confirmed")
+                            ),
+                            policy_scope="scope.auth",
+                        ),
+                    )
+                    controller.begin(ctx)
+                    outcome = controller.execute(
+                        ActionProposal(
+                            tool_name="send_notification",
+                            arguments={"sensitive": False, "evidence_ids": ["ev-001"]},
+                        ),
+                        ctx,
+                        lambda _p: calls.append("called"),
+                    )
+                    self.assertFalse(outcome.executed)
+                    self.assertIsNone(outcome.effect)
+                    self.assertEqual(
+                        outcome.decision.decision,
+                        "abort" if mode == "strict" else "block",
+                    )
+                    self.assertIn(
+                        expected_rule, [v.rule for v in outcome.decision.violations]
+                    )
+                    self.assertEqual(calls, [])
+
+    def test_uncertain_locks_approval_and_reconciliation_gates_retry_and_consumption(self):
+        v3_retry = self._auth_v3_contract(allow_retry_after_confirmed_absent=True)
+        v3_no_retry = self._auth_v3_contract(allow_retry_after_confirmed_absent=False)
+        ctx_retry = _v3_context(v3_retry, state={})
+        planned = self._planned()
+        appr = self._approval(planned, approval_id="appr-unc-1")
+
+        # Part A: tool raises -> observer uncertain -> locked_uncertain -> reconcile confirmed -> permanently consumed
+        store_a = InMemoryEffectStore()
+        rec_a: list[RecordedEvent] = []
+
+        class ListRecA:
+            def record(self, ev: RecordedEvent) -> None:
+                rec_a.append(ev)
+
+        ctrl_a = WorkflowController(
+            Governor(),
+            "run-unc-confirm",
+            v3_retry,
+            recorder=ListRecA(),
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store_a,
+                resolver=_CallbackResolver(
+                    lambda _a, _c: ResolvedAction(
+                        planned_effect=planned,
+                        host_facts=HostFacts(facts={"sensitive": True}),
+                        policy_scope="scope.auth",
+                        requester_id="req-1",
+                        evaluated_at="2026-06-01T10:30:00Z",
+                        approval=appr,
+                        retrieved_evidence=self._evidence(),
+                    )
+                ),
+                observer=_CallbackObserver(
+                    lambda _in, _res: ObservedEffect(
+                        status="uncertain", evidence_ref="obs-unc"
+                    )
+                ),
+                policy_scope="scope.auth",
+            ),
+        )
+        ctrl_a.begin(ctx_retry)
+        with self.assertRaisesRegex(RuntimeError, "gw-timeout"):
+            ctrl_a.execute(
+                ActionProposal(tool_name="send_notification"),
+                ctx_retry,
+                lambda _p: (_ for _ in ()).throw(RuntimeError("gw-timeout")),
+            )
+        self.assertEqual(
+            store_a.snapshot("scope.auth").approval_by_id("appr-unc-1").status,
+            "locked_uncertain",
+        )
+        self.assertEqual(rec_a[-1].event_type, "effect_observed")
+        self.assertEqual(rec_a[-1].approval_id, "appr-unc-1")
+
+        with self.assertRaises(ScopeSuspendedError):
+            ctrl_a.execute(
+                ActionProposal(tool_name="send_notification"), ctx_retry, lambda _p: "nope"
+            )
+
+        unc_id = store_a.uncertain_effects("scope.auth")[0]
+        reconciled = ctrl_a.reconcile(
+            ReconciliationRecord(
+                effect_id=unc_id,
+                resolved_status="confirmed",
+                evidence_ref="gw-confirmed-audit",
+                policy_scope="scope.auth",
+            )
+        )
+        self.assertEqual(reconciled.approval_id, "appr-unc-1")
+        self.assertEqual(rec_a[-1].event_type, "effect_reconciled")
+        self.assertEqual(rec_a[-1].approval_id, "appr-unc-1")
+        self.assertEqual(
+            store_a.snapshot("scope.auth").approval_by_id("appr-unc-1").status,
+            "consumed",
+        )
+        # Compensation of confirmed effect does NOT restore consumed approval
+        ctrl_a.record_compensation(
+            CompensationRecord(
+                compensates_effect_id=unc_id,
+                tool_name="cancel_notification",
+                operation_digest=PlannedEffect(tool_name="cancel_notification").operation_digest(),
+                evidence_ref="comp-1",
+                policy_scope="scope.auth",
+            )
+        )
+        self.assertEqual(
+            store_a.snapshot("scope.auth").approval_by_id("appr-unc-1").status,
+            "consumed",
+        )
+        retry_after_confirm = ctrl_a.execute(
+            ActionProposal(tool_name="send_notification"), ctx_retry, lambda _p: "nope"
+        )
+        self.assertFalse(retry_after_confirm.executed)
+        self.assertEqual(retry_after_confirm.decision.decision, "block")
+
+        # Part B: observer fails -> uncertain -> reconcile confirmed_absent -> released_absent
+        store_b = InMemoryEffectStore()
+        rec_b: list[RecordedEvent] = []
+
+        class ListRecB:
+            def record(self, ev: RecordedEvent) -> None:
+                rec_b.append(ev)
+
+        appr_b = self._approval(planned, approval_id="appr-unc-2")
+        obs_mode = {"fail": True}
+        eval_state = {"at": "2026-06-01T10:30:00Z", "planned": planned}
+        ctrl_b = WorkflowController(
+            Governor(),
+            "run-unc-absent",
+            v3_retry,
+            recorder=ListRecB(),
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store_b,
+                resolver=_CallbackResolver(
+                    lambda _a, _c: ResolvedAction(
+                        planned_effect=eval_state["planned"],
+                        host_facts=HostFacts(facts={"sensitive": True}),
+                        policy_scope="scope.auth",
+                        requester_id="req-1",
+                        evaluated_at=eval_state["at"],
+                        approval=appr_b,
+                        retrieved_evidence=self._evidence(),
+                    )
+                ),
+                observer=_CallbackObserver(
+                    lambda _in, _res: (
+                        (_ for _ in ()).throw(RuntimeError("obs-crash"))
+                        if obs_mode["fail"]
+                        else ObservedEffect(status="confirmed", evidence_ref="retry-ok")
+                    )
+                ),
+                policy_scope="scope.auth",
+            ),
+        )
+        ctrl_b.begin(ctx_retry)
+        with self.assertRaises(EffectObservationError):
+            ctrl_b.execute(ActionProposal(tool_name="send_notification"), ctx_retry, lambda _p: "ret")
+        self.assertEqual(rec_b[-1].event_type, "effect_observed")
+        self.assertEqual(rec_b[-1].approval_id, "appr-unc-2")
+        ctrl_b.reconcile(
+            ReconciliationRecord(
+                effect_id=store_b.uncertain_effects("scope.auth")[0],
+                resolved_status="confirmed_absent",
+                evidence_ref="gw-absent-audit",
+                policy_scope="scope.auth",
+            )
+        )
+        self.assertEqual(
+            store_b.snapshot("scope.auth").approval_by_id("appr-unc-2").status,
+            "released_absent",
+        )
+
+        # Retry rejected when contract has allow_retry_after_confirmed_absent=False
+        ctrl_no_retry = WorkflowController(
+            Governor(),
+            "run-no-retry",
+            v3_no_retry,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store_b,
+                resolver=_CallbackResolver(
+                    lambda _a, _c: ResolvedAction(
+                        planned_effect=planned,
+                        host_facts=HostFacts(facts={"sensitive": True}),
+                        policy_scope="scope.auth",
+                        requester_id="req-1",
+                        evaluated_at="2026-06-01T10:40:00Z",
+                        approval=appr_b,
+                        retrieved_evidence=self._evidence(),
+                    )
+                ),
+                observer=_CallbackObserver(lambda _in, _res: ObservedEffect(status="confirmed")),
+                policy_scope="scope.auth",
+            ),
+        )
+        ctrl_no_retry.begin(_v3_context(v3_no_retry, state={}))
+        denied_no_retry = ctrl_no_retry.execute(
+            ActionProposal(tool_name="send_notification"),
+            _v3_context(v3_no_retry, state={}),
+            lambda _p: "nope",
+        )
+        self.assertFalse(denied_no_retry.executed)
+
+        # Retry rejected if expired or modified
+        obs_mode["fail"] = False
+        eval_state["at"] = "2026-06-01T11:00:00Z"
+        expired_retry = ctrl_b.execute(
+            ActionProposal(tool_name="send_notification"), ctx_retry, lambda _p: "nope"
+        )
+        self.assertFalse(expired_retry.executed)
+
+        eval_state["at"] = "2026-06-01T10:45:00Z"
+        eval_state["planned"] = self._planned(recipient="ops@example.com")
+        modified_retry = ctrl_b.execute(
+            ActionProposal(tool_name="send_notification"), ctx_retry, lambda _p: "nope"
+        )
+        self.assertFalse(modified_retry.executed)
+
+        # Identical operation while unexpired succeeds and permanently consumes approval
+        eval_state["planned"] = planned
+        ok_retry = ctrl_b.execute(
+            ActionProposal(tool_name="send_notification"), ctx_retry, lambda _p: "sent-retry"
+        )
+        self.assertTrue(ok_retry.executed)
+        assert ok_retry.effect is not None
+        self.assertEqual(ok_retry.effect.status, "confirmed")
+        self.assertEqual(
+            store_b.snapshot("scope.auth").approval_by_id("appr-unc-2").status,
+            "consumed",
+        )
+
+    def test_multithread_toctou_double_spend_single_use_approval_allows_at_most_one(self):
+        v3 = self._auth_v3_contract()
+        ctx = _v3_context(v3, state={})
+        planned = self._planned()
+        approval = self._approval(planned, approval_id="appr-race-1")
+        store = InMemoryEffectStore()
+        barrier = threading.Barrier(2, timeout=5.0)
+        base_gov = Governor()
+
+        class BarrierEvaluator:
+            def evaluate(self, request: GovernorInput) -> GovernanceDecision:
+                decision = base_gov.evaluate(request)
+                if request.phase == "runtime":
+                    barrier.wait()
+                return decision
+
+        invocations: list[str] = []
+        outcomes: list[str] = []
+        lock = threading.Lock()
+        controllers: list[WorkflowController] = []
+
+        for label in ("c1", "c2"):
+            ctrl = WorkflowController(
+                Governor(evaluator=BarrierEvaluator()),
+                f"run-race-{label}",
+                v3,
+                policy=EnforcementPolicy(mode="guarded"),
+                effect_governance=EffectGovernanceConfig(
+                    store=store,
+                    resolver=_CallbackResolver(
+                        lambda _a, _c: ResolvedAction(
+                            planned_effect=planned,
+                            host_facts=HostFacts(facts={"sensitive": True}),
+                            policy_scope="scope.auth",
+                            requester_id="req-1",
+                            evaluated_at="2026-06-01T10:30:00Z",
+                            approval=approval,
+                            retrieved_evidence=self._evidence(),
+                        )
+                    ),
+                    observer=_CallbackObserver(
+                        lambda _in, _res: ObservedEffect(status="confirmed", evidence_ref="race-ok")
+                    ),
+                    policy_scope="scope.auth",
+                ),
+            )
+            ctrl.begin(ctx)
+            controllers.append(ctrl)
+
+        def run_one(label: str, ctrl: WorkflowController) -> None:
+            try:
+                out = ctrl.execute(
+                    ActionProposal(tool_name="send_notification"),
+                    ctx,
+                    lambda _p: (lock.acquire(), invocations.append(label), lock.release()) and label,
+                )
+                assert out.executed
+                with lock:
+                    outcomes.append("executed")
+            except (ConcurrencyError, ApprovalReuseError):
+                with lock:
+                    outcomes.append("rejected_operational")
+
+        threads = [
+            threading.Thread(target=run_one, args=(lbl, ctrl))
+            for lbl, ctrl in zip(("c1", "c2"), controllers)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(sorted(outcomes), ["executed", "rejected_operational"])
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(
+            store.snapshot("scope.auth").approval_by_id("appr-race-1").status,
+            "consumed",
+        )
+
+    def test_advisory_violation_preserves_consumed_approval_and_pre_record_failure_releases_absent(self):
+        v3 = self._auth_v3_contract()
+        ctx = _v3_context(v3, state={})
+        planned = self._planned()
+        appr = self._approval(planned, approval_id="appr-adv-1")
+
+        # 1. Pre-invocation recorder failure releases approval as released_absent without tool call
+        store_rec = InMemoryEffectStore()
+        calls: list[str] = []
+        rec_count = 0
+
+        class FailSecond:
+            def record(self, _ev: RecordedEvent) -> None:
+                nonlocal rec_count
+                rec_count += 1
+                if rec_count == 2:
+                    raise OSError("pre-record failure")
+
+        ctrl_fail = WorkflowController(
+            Governor(),
+            "run-pre-rec-appr",
+            v3,
+            recorder=FailSecond(),
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store_rec,
+                resolver=_CallbackResolver(
+                    lambda _a, _c: ResolvedAction(
+                        planned_effect=planned,
+                        host_facts=HostFacts(facts={"sensitive": True}),
+                        policy_scope="scope.auth",
+                        requester_id="req-1",
+                        evaluated_at="2026-06-01T10:30:00Z",
+                        approval=appr,
+                        retrieved_evidence=self._evidence(),
+                    )
+                ),
+                observer=_CallbackObserver(lambda _in, _res: ObservedEffect(status="confirmed")),
+                policy_scope="scope.auth",
+            ),
+        )
+        ctrl_fail.begin(ctx)
+        with self.assertRaisesRegex(OSError, "pre-record failure"):
+            ctrl_fail.execute(
+                ActionProposal(tool_name="send_notification"),
+                ctx,
+                lambda _p: calls.append("called"),
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            store_rec.snapshot("scope.auth").approval_by_id("appr-adv-1").status,
+            "released_absent",
+        )
+
+        # 2. Consume approval cleanly, then run advisory mode with consumed approval (INV-12)
+        ctrl_ok = WorkflowController(
+            Governor(),
+            "run-consume-first",
+            v3,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store_rec,
+                resolver=_CallbackResolver(
+                    lambda _a, _c: ResolvedAction(
+                        planned_effect=planned,
+                        host_facts=HostFacts(facts={"sensitive": True}),
+                        policy_scope="scope.auth",
+                        requester_id="req-1",
+                        evaluated_at="2026-06-01T10:35:00Z",
+                        approval=appr,
+                        retrieved_evidence=self._evidence(),
+                    )
+                ),
+                observer=_CallbackObserver(lambda _in, _res: ObservedEffect(status="confirmed")),
+                policy_scope="scope.auth",
+            ),
+        )
+        ctrl_ok.begin(ctx)
+        self.assertTrue(
+            ctrl_ok.execute(
+                ActionProposal(tool_name="send_notification"),
+                ctx,
+                lambda _p: calls.append("first") or "ok",
+            ).executed
+        )
+        self.assertEqual(
+            store_rec.snapshot("scope.auth").approval_by_id("appr-adv-1").status,
+            "consumed",
+        )
+
+        ctrl_adv = WorkflowController(
+            Governor(),
+            "run-advisory-consumed",
+            v3,
+            policy=EnforcementPolicy(mode="advisory"),
+            effect_governance=EffectGovernanceConfig(
+                store=store_rec,
+                resolver=_CallbackResolver(
+                    lambda _a, _c: ResolvedAction(
+                        planned_effect=planned,
+                        host_facts=HostFacts(facts={"sensitive": True}),
+                        policy_scope="scope.auth",
+                        requester_id="req-1",
+                        evaluated_at="2026-06-01T10:40:00Z",
+                        approval=appr,
+                        retrieved_evidence=self._evidence(),
+                    )
+                ),
+                observer=_CallbackObserver(lambda _in, _res: ObservedEffect(status="confirmed")),
+                policy_scope="scope.auth",
+            ),
+        )
+        ctrl_adv.begin(ctx)
+        adv_out = ctrl_adv.execute(
+            ActionProposal(tool_name="send_notification"),
+            ctx,
+            lambda _p: calls.append("advisory") or "warned",
+        )
+        self.assertTrue(adv_out.executed)
+        self.assertEqual(adv_out.decision.decision, "allow_with_warning")
+        self.assertEqual([v.rule for v in adv_out.decision.violations], ["bound-approval"])
+        assert adv_out.effect is not None
+        self.assertIsNone(adv_out.effect.approval_id)
+        self.assertEqual(
+            store_rec.snapshot("scope.auth").approval_by_id("appr-adv-1").status,
+            "consumed",
+        )
 
 
 if __name__ == "__main__":

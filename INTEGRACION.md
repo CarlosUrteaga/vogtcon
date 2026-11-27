@@ -457,6 +457,32 @@ ya realizadas no se revierten si falla la salida final del agente, tampoco en `s
 No se demuestra aquí un buffer de commit/descarte tras postcheck. Consulta el
 [reporte CFDI](examples/REPORTE_CFDI_SAT.md) y la [procedencia de fixtures](examples/cfdi_fixtures/README.md).
 
+## Autorización vinculada a la operación (contratos v3)
+
+Los contratos v3 (`schema_version: 3`) introducen reglas tipadas y parametrizadas evaluadas estrictamente sobre hechos confiables del host (`HostFacts`, `PlannedEffect`, `HostApproval`, `RetrievedEvidence` y `TrajectoryView`), sin leer afirmaciones no confiables de `ActionProposal.arguments`.
+
+Para ejecutar un contrato v3 en `WorkflowController` es obligatorio proporcionar tanto `EnforcementPolicy` como `EffectGovernanceConfig(store, resolver, observer, policy_scope=...)`:
+
+- `EffectResolver` traduce la propuesta del agente a un `ResolvedAction` con `PlannedEffect` (cuyo `operation_digest()` identifica canónicamente la herramienta y sus parámetros efectivos), `HostFacts` clasificados por el host, `requester_id`, `evaluated_at`, `HostApproval` opcional y `RetrievedEvidence` opcional.
+- `EffectObserver` clasifica el efecto observado tras la invocación (`confirmed`, `confirmed_absent` o `uncertain`). Retornar de la función de herramienta no equivale a confirmar el efecto externo.
+- `InMemoryEffectStore` mantiene la trayectoria append-only por `policy_scope`, impide reutilizar aprobaciones de un solo uso entre corridas que compartan el mismo almacén y suspende el alcance afectado ante efectos `uncertain` hasta que el host invoque `reconcile(...)`.
+
+Consulta el ejemplo autocontenido sin proveedores en [notification_contract_v3.yaml](examples/notification_contract_v3.yaml) y [notification_agent_v3.py](examples/notification_agent_v3.py), verificable con `vogtcon validate examples/notification_contract_v3.yaml`.
+
+### Reglas v3 integradas de autorización
+
+1. **`approval.bound_required`**: exige una `HostApproval` activa vinculada al `operation_digest`, `policy_scope` y `requester_id` exactos:
+   - La sensibilidad se deriva de `HostFacts` (`sensitivity_fact_key`), reemplazando la bandera declarada por el agente `arguments["sensitive"]`.
+   - `approver_id != requester_id` es necesario cuando `allow_self_approval: false`, pero nunca suficiente por sí solo: el aprobador debe contar explícitamente con las autoridades requeridas (`approver_authorities`).
+   - Las aprobaciones de un solo uso (`single_use: true`) se reservan atómicamente en `EffectStore`, se consumen al confirmarse el efecto, quedan bloqueadas (`locked_uncertain`) si el efecto resulta incierto y solo permiten reintentar exactamente el mismo `operation_digest` tras `confirmed_absent` cuando el contrato habilita `allow_retry_after_confirmed_absent: true` y la aprobación sigue vigente. Registrar una compensación (`record_compensation`) nunca reactiva una aprobación ya consumida.
+   - Las ventanas de vigencia (`issued_at <= evaluated_at < expires_at`) se comparan exclusivamente contra el `evaluated_at` explícito con zona horaria suministrado por el host; la biblioteca no consulta el reloj del sistema.
+2. **`destination.allowlist`**: valida que el destino efectivo (leído de `PlannedEffect.effective_parameters` o `HostFacts`, nunca de `ActionProposal.arguments`) pertenezca a la lista explícita `allowed_destinations`.
+3. **`evidence.retrieved_required`**: verifica únicamente que el host haya suministrado referencias de evidencia recuperada (`RetrievedEvidence`) que cumplan `min_count`, `allowed_sources`, `require_content_digest` y, si aplica, coincidencia de identificadores reclamados. **Límite explícito:** recuperar una fuente demuestra existencia y procedencia en el host, pero **no** demuestra relevancia semántica ni corrección factual de la respuesta.
+
+### Política de deprecación de reglas históricas v1/v2
+
+Las reglas heredadas de contratos v1 y v2 que inspeccionan argumentos del agente o constantes fijas (`sensitive_requires_approval`, `ticket_requires_evidence`, `memory.scope_allowed`, `authorization.role_required`) se conservan intactas y sin eliminar identificadores para preservar compatibilidad histórica y reproducción de benchmarks. Sin embargo, quedan **deprecadas para integraciones nuevas**: adopta contratos v3 con `approval.bound_required`, `destination.allowlist` y `evidence.retrieved_required` alimentados desde el host.
+
 ## Alcance actual
 
-La biblioteca incluye una puerta determinista, contratos v1 y v2, reglas propias, registro local y observación OpenTelemetry. No incluye todavía un CLI de producto, un adaptador automático para cualquier framework de agentes ni un Governor basado en LLM. La integración requiere conectar explícitamente cada herramienta con efectos a la puerta. Los contratos v1 históricos conservan `mode` dentro del YAML; con v2 el modo se pasa mediante `EnforcementPolicy` por corrida.
+La biblioteca incluye una puerta determinista, contratos v1, v2 y v3 (`schema_version: 3`), reglas propias y reglas v3 integradas de autorización vinculada a la operación, registro local JSONL (`RunEvent` v1 y `RunEventV2`), CLI local (`vogtcon validate` y `vogtcon explain`), almacén secuencial en memoria `InMemoryEffectStore` (no persistente ante caídas de proceso) y observación OpenTelemetry. No incluye reglas composicionales de ventana o límites acumulados, almacenamiento transaccional distribuido, atestación criptográfica de aprobaciones, verificación semántica de evidencia, un adaptador automático para cualquier framework de agentes ni un Governor basado en LLM. La integración requiere conectar explícitamente cada herramienta con efectos a la puerta. Los contratos v1 históricos conservan `mode` dentro del YAML; con v2 y v3 el modo se pasa mediante `EnforcementPolicy` por corrida.
