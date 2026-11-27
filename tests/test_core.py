@@ -7,10 +7,11 @@ import unittest
 from copy import deepcopy
 
 from vogtcon import (
-    ActionProposal, AgentContract, DeterministicEvaluator, ExecutionContext,
-    GovernanceDecision, Governor, GovernorInput,
+    ActionProposal, AgentContract, ContractRulesV3, DeterministicEvaluator,
+    EmptyRuleParams, EnforcementPolicy, ExecutionContext, GovernanceDecision,
+    Governor, GovernorInput, HostFacts, PlannedEffect, RuleCatalog, RuleTypeSpec,
 )
-from vogtcon.models import HostFacts, PlannedEffect
+from vogtcon.models import EffectRecord, TrajectoryEntry, TrajectoryView
 
 
 TOOLS = ["search_policy", "create_ticket", "approve_request", "store_memory", "send_notification"]
@@ -347,6 +348,258 @@ class EvaluationTests(unittest.TestCase):
             r"planned_effect\.tool_name conflicts with action\.tool_name",
         ):
             evaluator.evaluate(tampered_effect_request)
+
+
+class V3EvaluationTests(unittest.TestCase):
+    def _v3_contract(self, rules: list[dict] | None = None) -> ContractRulesV3:
+        return ContractRulesV3.model_validate(
+            {
+                "schema_version": 3,
+                "contract_id": "example.v3",
+                "approved_agent_configurations": ["agent-v3"],
+                "declared_tools": ["send_notification"],
+                "response_schema": {"required_fields": ["answer", "status"]},
+                "memory_policy": "none",
+                "validation_phases": ["pre_execution", "runtime", "post_execution"],
+                "rules": (
+                    rules
+                    if rules is not None
+                    else [
+                        {
+                            "instance_id": "declared-only",
+                            "rule_type": "tool.declared_only",
+                            "phases": ["runtime"],
+                        },
+                        {
+                            "instance_id": "schema-complete",
+                            "rule_type": "response.schema_complete",
+                            "phases": ["post_execution"],
+                        },
+                    ]
+                ),
+                "contract_fingerprint": "sha256:" + "a" * 64,
+            }
+        )
+
+    def test_v3_evaluates_across_phases_and_modes_deterministically(self):
+        contract = self._v3_contract()
+        evaluator = DeterministicEvaluator()
+
+        for mode, runtime_decision, has_violations in (
+            ("no_contract", "allow", False),
+            ("advisory", "allow_with_warning", True),
+            ("guarded", "block", True),
+            ("strict", "abort", True),
+        ):
+            with self.subTest(mode=mode):
+                pre_req = GovernorInput(
+                    run_id="r-v3",
+                    contract=contract,
+                    phase="pre_execution",
+                    policy=EnforcementPolicy(mode=mode),
+                    context=ExecutionContext(
+                        state={},
+                        available_tools=["send_notification"],
+                        observed_agent_fingerprint="wrong-agent",
+                        observed_contract_fingerprint=contract.contract_fingerprint,
+                    ),
+                )
+                pre_res = evaluator.evaluate(pre_req)
+                self.assertEqual(
+                    [v.rule for v in pre_res.violations],
+                    ["agent.configuration_fingerprint_match"] if has_violations else [],
+                )
+
+                rt_req = GovernorInput(
+                    run_id="r-v3",
+                    contract=contract,
+                    phase="runtime",
+                    policy=EnforcementPolicy(mode=mode),
+                    context=ExecutionContext(
+                        state={}, available_tools=["undeclared_tool"]
+                    ),
+                    action=ActionProposal(tool_name="undeclared_tool"),
+                    planned_effect=PlannedEffect(tool_name="undeclared_tool"),
+                )
+                before_dump = deepcopy(rt_req.model_dump())
+                rt_res = evaluator.evaluate(rt_req)
+                self.assertEqual(rt_res.decision, runtime_decision)
+                self.assertEqual(
+                    [(v.rule, v.rule_type) for v in rt_res.violations],
+                    [("declared-only", "tool.declared_only")] if has_violations else [],
+                )
+                self.assertEqual(evaluator.evaluate(rt_req), rt_res)
+                self.assertEqual(rt_req.model_dump(), before_dump)
+
+                post_req = GovernorInput(
+                    run_id="r-v3",
+                    contract=contract,
+                    phase="post_execution",
+                    policy=EnforcementPolicy(mode=mode),
+                    context=ExecutionContext(
+                        state={}, available_tools=["send_notification"]
+                    ),
+                    response={"answer": "missing status"},
+                )
+                post_res = evaluator.evaluate(post_req)
+                self.assertEqual(
+                    [(v.rule, v.rule_type) for v in post_res.violations],
+                    [("schema-complete", "response.schema_complete")]
+                    if has_violations
+                    else [],
+                )
+
+    def test_post_only_missing_v3_handler_fails_closed_before_execution(self):
+        catalog = RuleCatalog(
+            rule_types={
+                "post.unimplemented": RuleTypeSpec(
+                    allowed_phases=frozenset({"post_execution"}),
+                    params_model=EmptyRuleParams,
+                    handler=None,
+                )
+            }
+        )
+        contract = self._v3_contract(
+            rules=[
+                {
+                    "instance_id": "declared-only",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "post-check",
+                    "rule_type": "post.unimplemented",
+                    "phases": ["post_execution"],
+                },
+            ]
+        )
+        evaluator = DeterministicEvaluator(rule_catalog=catalog)
+
+        for phase in ("pre_execution", "runtime", "post_execution"):
+            with self.subTest(phase=phase):
+                kwargs: dict = {
+                    "run_id": "r-fail-closed",
+                    "contract": contract,
+                    "phase": phase,
+                    "policy": EnforcementPolicy(mode="guarded"),
+                    "context": ExecutionContext(
+                        state={},
+                        available_tools=["send_notification"],
+                        observed_agent_fingerprint="agent-v3",
+                        observed_contract_fingerprint=contract.contract_fingerprint,
+                    ),
+                }
+                if phase == "runtime":
+                    kwargs["action"] = ActionProposal(tool_name="send_notification")
+                elif phase == "post_execution":
+                    kwargs["response"] = {"answer": "ok", "status": "done"}
+                req = GovernorInput(**kwargs)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Rule type 'post.unimplemented' has no evaluation handler configured",
+                ):
+                    evaluator.evaluate(req)
+
+    def test_v3_custom_rule_reads_immutable_trajectory_and_cannot_mutate_view(self):
+        digest = "sha256:" + "b" * 64
+
+        def block_duplicate_confirmed(req: GovernorInput, _params) -> bool:
+            assert req.trajectory is not None and req.planned_effect is not None
+            op_digest = req.planned_effect.operation_digest()
+            return any(
+                eff.operation_digest == op_digest
+                for eff in req.trajectory.effects_by_status("confirmed")
+            )
+
+        def buggy_mutating_rule(req: GovernorInput, _params) -> bool:
+            req.context.state["injected"] = True  # Must raise TypeError
+            return False
+
+        catalog = RuleCatalog(
+            rule_types={
+                "effect.no_duplicate": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=EmptyRuleParams,
+                    handler=block_duplicate_confirmed,
+                ),
+                "buggy.mutator": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=EmptyRuleParams,
+                    handler=buggy_mutating_rule,
+                ),
+            }
+        )
+        planned = PlannedEffect(
+            tool_name="send_notification", parameters={"to": "ops@example.com"}
+        )
+        prior_effect = EffectRecord(
+            effect_id="eff-000001",
+            run_id="run-prev",
+            policy_scope="scope.ops",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=planned.operation_digest(),
+            status="confirmed",
+        )
+        prior_entry = TrajectoryEntry(
+            sequence=1,
+            kind="observed",
+            effect_id="eff-000001",
+            run_id="run-prev",
+            policy_scope="scope.ops",
+            action_index=1,
+            tool_name="send_notification",
+            operation_digest=planned.operation_digest(),
+            status="confirmed",
+        )
+        trajectory = TrajectoryView(
+            policy_scope="scope.ops",
+            entries=[prior_entry],
+            effects=[prior_effect],
+            suspended=False,
+        )
+
+        dup_contract = self._v3_contract(
+            rules=[
+                {
+                    "instance_id": "no-dup",
+                    "rule_type": "effect.no_duplicate",
+                    "phases": ["runtime"],
+                }
+            ]
+        )
+        req = GovernorInput(
+            run_id="run-curr",
+            contract=dup_contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(
+                state={"tenant": "ops"}, available_tools=["send_notification"]
+            ),
+            action=ActionProposal(tool_name="send_notification"),
+            host_facts=HostFacts(facts={"tenant": "ops"}),
+            planned_effect=planned,
+            policy_scope="scope.ops",
+            trajectory=trajectory,
+        )
+        decision = DeterministicEvaluator(rule_catalog=catalog).evaluate(req)
+        self.assertEqual(decision.decision, "block")
+        self.assertEqual(decision.violations[0].rule, "no-dup")
+        self.assertEqual(decision.violations[0].rule_type, "effect.no_duplicate")
+
+        mut_contract = self._v3_contract(
+            rules=[
+                {
+                    "instance_id": "mut-1",
+                    "rule_type": "buggy.mutator",
+                    "phases": ["runtime"],
+                }
+            ]
+        )
+        mut_req = req.model_copy(update={"contract": mut_contract})
+        with self.assertRaises(TypeError):
+            DeterministicEvaluator(rule_catalog=catalog).evaluate(mut_req)
+        self.assertEqual(digest, "sha256:" + "b" * 64)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,9 @@ from types import MappingProxyType
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vogtcon import (
+    ActionProposal,
     DeterministicEvaluator,
+    ExecutionContext,
     Governor,
     GovernorInput,
     RuleCatalog,
@@ -317,19 +319,32 @@ class RuleTypeRegistryTests(unittest.TestCase):
             {"tool.declared_only", "response.schema_complete"},
         )
         self.assertEqual(
-            DEFAULT_RULE_TYPES["tool.declared_only"],
+            DEFAULT_RULE_TYPES["tool.declared_only"].allowed_phases,
+            frozenset({"runtime"}),
+        )
+        self.assertIs(
+            DEFAULT_RULE_TYPES["tool.declared_only"].params_model,
+            EmptyRuleParams,
+        )
+        self.assertTrue(callable(DEFAULT_RULE_TYPES["tool.declared_only"].handler))
+
+        self.assertEqual(
+            DEFAULT_RULE_TYPES["response.schema_complete"].allowed_phases,
+            frozenset({"post_execution"}),
+        )
+        self.assertIs(
+            DEFAULT_RULE_TYPES["response.schema_complete"].params_model,
+            EmptyRuleParams,
+        )
+        self.assertTrue(
+            callable(DEFAULT_RULE_TYPES["response.schema_complete"].handler)
+        )
+        with self.assertRaises(TypeError):
             RuleTypeSpec(
                 allowed_phases=frozenset({"runtime"}),
                 params_model=EmptyRuleParams,
-            ),
-        )
-        self.assertEqual(
-            DEFAULT_RULE_TYPES["response.schema_complete"],
-            RuleTypeSpec(
-                allowed_phases=frozenset({"post_execution"}),
-                params_model=EmptyRuleParams,
-            ),
-        )
+                handler="not_callable",  # type: ignore[arg-type]
+            )
         with self.assertRaises(TypeError):
             DEFAULT_RULE_TYPES["custom.type"] = RuleTypeSpec(  # type: ignore[index]
                 allowed_phases=frozenset({"runtime"})
@@ -442,6 +457,18 @@ class RuleTypeRegistryTests(unittest.TestCase):
                     )
                 }
             )
+        with self.assertRaisesRegex(
+            ValueError, "Cannot replace built-in rule type 'tool.declared_only'"
+        ):
+            RuleCatalog(
+                rule_types={
+                    "tool.declared_only": RuleTypeSpec(
+                        allowed_phases=frozenset({"runtime"}),
+                        params_model=EmptyRuleParams,
+                        handler=lambda _req, _p: False,
+                    )
+                }
+            )
 
         for historical_id in (
             "sensitive_requires_approval",
@@ -533,6 +560,268 @@ class RuleTypeRegistryTests(unittest.TestCase):
         self.assertEqual(
             set(catalog.rule_types.keys()), set(DEFAULT_RULE_TYPES.keys())
         )
+
+
+class V3RuleEvaluationTests(unittest.TestCase):
+    def _make_v3_contract(self, rules: list[dict], declared_tools: list[str] | None = None):
+        from vogtcon.models import ContractRulesV3
+
+        return ContractRulesV3.model_validate(
+            {
+                "schema_version": 3,
+                "contract_id": "v3.eval.test",
+                "approved_agent_configurations": ["sha256:agent"],
+                "declared_tools": declared_tools if declared_tools is not None else ["send_notification"],
+                "response_schema": {"required_fields": ["answer", "status"]},
+                "memory_policy": "none",
+                "validation_phases": ["pre_execution", "runtime", "post_execution"],
+                "rules": rules,
+                "contract_fingerprint": "sha256:" + "0" * 64,
+            }
+        )
+
+    def test_builtin_v3_handlers_and_tool_declared_only_short_circuit(self):
+        from vogtcon.models import EnforcementPolicy, PlannedEffect
+
+        called_after_gate: list[str] = []
+        catalog = RuleCatalog(
+            rule_types={
+                "custom.after_gate": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=EmptyRuleParams,
+                    handler=lambda _req, _p: called_after_gate.append("ran") or True,
+                )
+            }
+        )
+        contract = self._make_v3_contract(
+            [
+                {
+                    "instance_id": "gate-1",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "after-1",
+                    "rule_type": "custom.after_gate",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "resp-1",
+                    "rule_type": "response.schema_complete",
+                    "phases": ["post_execution"],
+                },
+            ]
+        )
+
+        undeclared_req = GovernorInput(
+            run_id="r1",
+            contract=contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(state={}, available_tools=["undeclared_tool"]),
+            action=ActionProposal(tool_name="undeclared_tool"),
+            planned_effect=PlannedEffect(tool_name="undeclared_tool"),
+        )
+        violations = catalog.evaluate_v3(undeclared_req)
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0].rule, "gate-1")
+        self.assertEqual(violations[0].rule_type, "tool.declared_only")
+        self.assertEqual(violations[0].action, "undeclared_tool")
+        self.assertEqual(called_after_gate, [])
+
+        post_req = GovernorInput(
+            run_id="r1",
+            contract=contract,
+            phase="post_execution",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(state={}, available_tools=["send_notification"]),
+            response={"answer": "ok"},
+        )
+        post_violations = catalog.evaluate_v3(post_req)
+        self.assertEqual(len(post_violations), 1)
+        self.assertEqual(post_violations[0].rule, "resp-1")
+        self.assertEqual(post_violations[0].rule_type, "response.schema_complete")
+        self.assertIsNone(post_violations[0].action)
+
+    def test_multiple_bindings_parameter_materialization_and_violation_coercion(self):
+        from vogtcon.models import EnforcementPolicy, HostFacts, PlannedEffect
+
+        seen_params: list[_StrictLimitParams] = []
+
+        def check_limit(req: GovernorInput, params: BaseModel) -> bool:
+            assert isinstance(params, _StrictLimitParams)
+            seen_params.append(params)
+            amount = req.host_facts.facts.get("amount", 0) if req.host_facts else 0
+            return isinstance(amount, int) and amount > params.max_amount
+
+        catalog = RuleCatalog(
+            rule_types={
+                "budget.limit": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=_StrictLimitParams,
+                    handler=check_limit,
+                ),
+                "custom.direct_violation": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=EmptyRuleParams,
+                    handler=lambda req, _p: Violation(
+                        rule="direct-v",
+                        phase=req.phase,
+                        severity="critical",
+                        action="send_notification",
+                    ),
+                ),
+            }
+        )
+        contract = self._make_v3_contract(
+            [
+                {
+                    "instance_id": "soft-cap",
+                    "rule_type": "budget.limit",
+                    "phases": ["runtime"],
+                    "params": {"max_amount": 100},
+                },
+                {
+                    "instance_id": "hard-cap",
+                    "rule_type": "budget.limit",
+                    "phases": ["runtime"],
+                    "params": {"max_amount": 500, "currency": "USD"},
+                },
+                {
+                    "instance_id": "direct-v",
+                    "rule_type": "custom.direct_violation",
+                    "phases": ["runtime"],
+                },
+            ]
+        )
+        req = GovernorInput(
+            run_id="r-multi",
+            contract=contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(state={}, available_tools=["send_notification"]),
+            action=ActionProposal(tool_name="send_notification"),
+            host_facts=HostFacts(facts={"amount": 250}),
+            planned_effect=PlannedEffect(tool_name="send_notification"),
+        )
+        violations = catalog.evaluate_v3(req)
+        self.assertEqual([v.rule for v in violations], ["soft-cap", "direct-v"])
+        self.assertEqual(
+            [v.rule_type for v in violations],
+            ["budget.limit", "custom.direct_violation"],
+        )
+        self.assertEqual(violations[1].severity, "critical")
+        self.assertEqual(seen_params[0].currency, "MXN")
+        self.assertEqual(seen_params[1].currency, "USD")
+
+        # Invalid Violation / return type coercion checks
+        for bad_handler, expected_msg in (
+            (
+                lambda req, _p: Violation(
+                    rule="wrong-id", phase=req.phase, action="send_notification"
+                ),
+                "produced violation for 'wrong-id'",
+            ),
+            (
+                lambda req, _p: Violation(
+                    rule="b1",
+                    rule_type="wrong.type",
+                    phase=req.phase,
+                    action="send_notification",
+                ),
+                "expected 'custom.bad'",
+            ),
+            (lambda _req, _p: "invalid", "returned invalid output"),
+        ):
+            with self.subTest(expected_msg=expected_msg):
+                bad_cat = RuleCatalog(
+                    rule_types={
+                        "custom.bad": RuleTypeSpec(
+                            allowed_phases=frozenset({"runtime"}),
+                            params_model=EmptyRuleParams,
+                            handler=bad_handler,  # type: ignore[arg-type]
+                        )
+                    }
+                )
+                bad_contract = self._make_v3_contract(
+                    [{"instance_id": "b1", "rule_type": "custom.bad", "phases": ["runtime"]}]
+                )
+                bad_req = req.model_copy(update={"contract": bad_contract})
+                with self.assertRaisesRegex(ValueError, expected_msg):
+                    bad_cat.evaluate_v3(bad_req)
+
+    def test_validate_v3_handlers_fails_closed_even_for_post_only_schema_rule(self):
+        from vogtcon.models import EnforcementPolicy
+
+        schema_only_catalog = RuleCatalog(
+            rule_types={
+                "audit.schema_only": RuleTypeSpec(
+                    allowed_phases=frozenset({"post_execution"}),
+                    params_model=EmptyRuleParams,
+                    handler=None,
+                )
+            }
+        )
+        contract = self._make_v3_contract(
+            [
+                {
+                    "instance_id": "post-audit",
+                    "rule_type": "audit.schema_only",
+                    "phases": ["post_execution"],
+                }
+            ]
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "Rule type 'audit.schema_only' has no evaluation handler configured",
+        ):
+            schema_only_catalog.validate_v3_handlers(contract)
+
+        runtime_req = GovernorInput(
+            run_id="r-missing-handler",
+            contract=contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(state={}, available_tools=["send_notification"]),
+            action=ActionProposal(tool_name="send_notification"),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "Rule type 'audit.schema_only' has no evaluation handler configured",
+        ):
+            schema_only_catalog.evaluate_v3(runtime_req)
+
+        # Verify evaluate_v3 suppresses inner ValidationError traceback on bad params
+        import traceback
+        from vogtcon.models import RuleBinding
+
+        secret_val = "SECRET_EVAL_PARAM_SENTINEL_7744"
+        param_cat = RuleCatalog(
+            rule_types={
+                "budget.limit": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=_StrictLimitParams,
+                    handler=lambda _r, _p: False,
+                )
+            }
+        )
+        tampered_binding = RuleBinding.model_construct(
+            instance_id="bad-param-inst",
+            rule_type="budget.limit",
+            phases=("runtime",),
+            params={"max_amount": secret_val},
+        )
+        tampered_contract = contract.model_copy()
+        object.__setattr__(tampered_contract, "rules", (tampered_binding,))
+        tampered_req = runtime_req.model_copy(update={"contract": tampered_contract})
+        try:
+            param_cat.evaluate_v3(tampered_req)
+            self.fail("Expected ValueError for invalid params")
+        except ValueError as err:
+            self.assertIsNone(err.__cause__)
+            self.assertTrue(err.__suppress_context__)
+            self.assertNotIn(secret_val, str(err))
+            self.assertNotIn(secret_val, traceback.format_exc())
 
 
 if __name__ == "__main__":

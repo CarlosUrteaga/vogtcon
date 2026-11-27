@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from .contracts import validate_contract_rules
-from .models import GovernanceDecision, GovernorInput, Violation
+from .models import ContractRulesV3, GovernanceDecision, GovernorInput, Violation
 from .rules import DEFAULT_RULE_CATALOG, RuleCatalog
 
 
@@ -36,16 +36,27 @@ class DeterministicEvaluator:
 
     def evaluate(self, request: GovernorInput) -> GovernanceDecision:
         validate_contract_rules(request.contract, rule_catalog=self._rule_catalog)
+        request._validate_policy_binding()
         request.validate_source_agreement()
+        if isinstance(request.contract, ContractRulesV3):
+            self._rule_catalog.validate_v3_handlers(request.contract)
         mode = request.effective_mode
         violations = []
         if mode != "no_contract":
-            checks = {
-                "pre_execution": _pre_violations,
-                "runtime": self._rule_catalog.evaluate_runtime,
-                "post_execution": self._rule_catalog.evaluate_post,
-            }
-            violations = checks[request.phase](request)
+            if isinstance(request.contract, ContractRulesV3):
+                if request.phase == "pre_execution":
+                    violations = _pre_violations(
+                        request
+                    ) + self._rule_catalog.evaluate_v3(request)
+                else:
+                    violations = self._rule_catalog.evaluate_v3(request)
+            else:
+                checks = {
+                    "pre_execution": _pre_violations,
+                    "runtime": self._rule_catalog.evaluate_runtime,
+                    "post_execution": self._rule_catalog.evaluate_post,
+                }
+                violations = checks[request.phase](request)
         decision = None
         if request.phase == "runtime":
             decision = "allow" if not violations else {
