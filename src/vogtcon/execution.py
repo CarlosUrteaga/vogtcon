@@ -21,6 +21,8 @@ from .models import (
     ActionProposal,
     AgentContract,
     ContractRulesV2,
+    ContractRulesV3,
+    ContractSchema,
     EnforcementPolicy,
     ExecutionContext,
     GovernanceDecision,
@@ -135,7 +137,7 @@ class WorkflowController:
         self,
         governor: Governor,
         run_id: str,
-        contract: AgentContract | ContractRulesV2,
+        contract: ContractSchema,
         recorder: RunRecorder | None = None,
         telemetry: TelemetryObserver | None = None,
         *,
@@ -145,6 +147,10 @@ class WorkflowController:
             raise ValueError("run_id must be nonempty")
         if isinstance(contract, AgentContract) and "schema_version" in (contract.model_extra or {}):
             raise ValueError("Unsupported contract schema_version")
+        if isinstance(contract, ContractRulesV3):
+            raise ValueError(
+                "v3 contracts are not yet executable; runtime evaluation is introduced in Stage 2"
+            )
         if isinstance(contract, ContractRulesV2):
             if policy is None:
                 raise ValueError("v2 contracts require an enforcement policy")

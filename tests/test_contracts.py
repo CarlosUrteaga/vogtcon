@@ -6,17 +6,24 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vogtcon import (
     ActionProposal, EnforcementPolicy, ExecutionContext, Governor,
-    JsonlDecisionLog, WorkflowController, load_contract,
+    JsonlDecisionLog, RuleCatalog, WorkflowController, load_contract,
 )
-from vogtcon.models import ContractRulesV2
+from vogtcon.contracts import (
+    _UnsupportedContractRules,
+    compute_v3_contract_fingerprint,
+    validate_contract_rules,
+)
+from vogtcon.models import ApprovedAgentConfiguration, ContractRulesV2, ContractRulesV3
+from vogtcon.rules import EmptyRuleParams, RuleTypeSpec
 
 
 def example_contract():
@@ -136,7 +143,7 @@ class ContractLoadingTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     self.load(json.dumps(data))
         data = v2_contract()
-        data["schema_version"] = 3
+        data["schema_version"] = 4
         with self.assertRaisesRegex(ValueError, "schema_version"):
             self.load(json.dumps(data))
 
@@ -209,6 +216,626 @@ class ContractLoadingTests(unittest.TestCase):
                 before = path.read_bytes()
                 self.assertEqual(load_contract(path).original, json.loads(before))
                 self.assertEqual(path.read_bytes(), before)
+
+
+class _TransferLimitParams(BaseModel):
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+    max_amount: int = Field(ge=1)
+    currency: str = "MXN"
+    allowed_channels: list[str] = Field(default_factory=lambda: ["wire"])
+    metadata_tags: dict[str, str] = Field(default_factory=dict)
+
+
+class _TransferLimitParamsAltDefault(BaseModel):
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+    max_amount: int = Field(ge=1)
+    currency: str = "USD"
+    allowed_channels: list[str] = Field(default_factory=lambda: ["wire"])
+    metadata_tags: dict[str, str] = Field(default_factory=dict)
+
+
+def _make_custom_v3_catalog(params_model: type[BaseModel] = _TransferLimitParams) -> RuleCatalog:
+    return RuleCatalog(
+        rule_types={
+            "transfer.max_amount": RuleTypeSpec(
+                allowed_phases=frozenset({"runtime"}),
+                params_model=params_model,
+            )
+        }
+    )
+
+
+def v3_contract(
+    rules: list[dict[str, object]] | None = None,
+    rule_catalog: RuleCatalog | None = None,
+) -> dict[str, object]:
+    data: dict[str, object] = {
+        "schema_version": 3,
+        "contract_id": "example.v3",
+        "approved_agent_configurations": ["sha256:agent"],
+        "declared_tools": ["send_notification", "transfer_funds"],
+        "response_schema": {"required_fields": ["answer"]},
+        "memory_policy": "none",
+        "validation_phases": ["pre_execution", "runtime", "post_execution"],
+        "rules": (
+            rules
+            if rules is not None
+            else [
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                    "params": {},
+                },
+                {
+                    "instance_id": "schema-complete",
+                    "rule_type": "response.schema_complete",
+                    "phases": ["post_execution"],
+                    "params": {},
+                },
+            ]
+        ),
+        "metadata": {"owner": "sí"},
+        "contract_fingerprint": "sha256:placeholder",
+    }
+    typed = ContractRulesV3.model_validate(data)
+    data["contract_fingerprint"] = compute_v3_contract_fingerprint(
+        typed, rule_catalog=rule_catalog
+    )
+    return data
+
+
+class ContractV3LoadingTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "contract_v3.yaml"
+
+    def load(self, text: str, rule_catalog: RuleCatalog | None = None):
+        self.path.write_text(text, encoding="utf-8")
+        return load_contract(self.path, rule_catalog=rule_catalog)
+
+    def test_v3_loads_json_and_yaml_with_default_and_custom_catalog(self):
+        data = v3_contract()
+        for content in (
+            json.dumps(data),
+            yaml.safe_dump(data),
+            "# comment and spacing do not affect v3 identity\n\n" + yaml.safe_dump(data),
+            json.dumps(dict(reversed(list(data.items())))),
+        ):
+            with self.subTest(format=content[:20]):
+                document = self.load(content)
+                self.assertIsInstance(document.contract, ContractRulesV3)
+                self.assertEqual(document.original, data)
+                document.original["metadata"]["owner"] = "mutated"
+                self.assertEqual(document.original, data)
+
+        catalog = _make_custom_v3_catalog()
+        custom_data = v3_contract(
+            rules=[
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "mxn-cap",
+                    "rule_type": "transfer.max_amount",
+                    "phases": ["runtime"],
+                    "params": {"max_amount": 1000},
+                },
+            ],
+            rule_catalog=catalog,
+        )
+        doc_custom = self.load(yaml.safe_dump(custom_data), rule_catalog=catalog)
+        self.assertIsInstance(doc_custom.contract, ContractRulesV3)
+        self.assertEqual(doc_custom.original, custom_data)
+
+    def test_loaded_v3_contract_is_deeply_immutable_and_preserves_verified_fingerprint(
+        self,
+    ):
+        catalog = _make_custom_v3_catalog()
+        data = v3_contract(
+            rules=[
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                    "params": {},
+                },
+                {
+                    "instance_id": "mxn-cap",
+                    "rule_type": "transfer.max_amount",
+                    "phases": ["runtime"],
+                    "params": {
+                        "max_amount": 1000,
+                        "allowed_channels": ["wire", "spei"],
+                        "metadata_tags": {"region": "mx"},
+                    },
+                },
+            ],
+            rule_catalog=catalog,
+        )
+        data["approved_agent_configurations"] = [
+            "sha256:agent",
+            {"fingerprint": "sha256:agent-2", "env": "prod", "scopes": ["pay"]},
+        ]
+        data["response_schema"] = {
+            "required_fields": ["answer"],
+            "title": "TransferResponse",
+            "meta": {"strict": True, "versions": [3]},
+        }
+        data["metadata"] = {
+            "owner": "sí",
+            "nested": {"approvers": ["ops", "sec"]},
+        }
+        data["contract_fingerprint"] = compute_v3_contract_fingerprint(
+            ContractRulesV3.model_validate(data),
+            rule_catalog=catalog,
+        )
+        verified_fp = data["contract_fingerprint"]
+
+        document = self.load(json.dumps(data), rule_catalog=catalog)
+        contract = document.contract
+        self.assertIsInstance(contract, ContractRulesV3)
+        assert isinstance(contract, ContractRulesV3)
+
+        with self.assertRaises(AttributeError):
+            contract.declared_tools.append("unapproved_tool")  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.validation_phases.append("runtime")  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.rules.append(contract.rules[0])  # type: ignore[attr-defined]
+        with self.assertRaises(AttributeError):
+            contract.rules[1].phases.append("post_execution")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            contract.rules[1].params["max_amount"] = 999999  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.rules[1].params["allowed_channels"].append("cash")  # type: ignore[union-attr]
+        with self.assertRaises(TypeError):
+            contract.rules[1].params["metadata_tags"]["region"] = "us"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.response_schema.required_fields.append("extra")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            contract.response_schema.model_extra["title"] = "Tampered"
+        with self.assertRaises(AttributeError):
+            contract.response_schema.model_extra["meta"]["versions"].append(4)
+        with self.assertRaises(AttributeError):
+            contract.approved_agent_configurations.append("sha256:rogue")  # type: ignore[attr-defined]
+        cfg = contract.approved_agent_configurations[1]
+        assert isinstance(cfg, ApprovedAgentConfiguration)
+        with self.assertRaises(TypeError):
+            cfg.model_extra["env"] = "dev"
+        with self.assertRaises(AttributeError):
+            cfg.model_extra["scopes"].append("admin")
+        with self.assertRaises(TypeError):
+            contract.metadata["owner"] = "tampered"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            contract.metadata["nested"]["approvers"].append("rogue")  # type: ignore[union-attr]
+
+        self.assertEqual(contract.contract_fingerprint, verified_fp)
+        self.assertEqual(
+            compute_v3_contract_fingerprint(contract, rule_catalog=catalog),
+            verified_fp,
+        )
+
+    def test_v3_rejects_unknown_rule_types_including_legacy_argument_and_benchmark_rules(
+        self,
+    ):
+        for bad_rule in (
+            "completely.unknown",
+            "sensitive_requires_approval",
+            "memory.scope_allowed",
+            "ticket_requires_evidence",
+            "authorization.role_required",
+            "run_ledger.required",
+            "run_ledger.complete",
+            "forbidden.outcome_triggered",
+        ):
+            with self.subTest(bad_rule=bad_rule):
+                data = v3_contract()
+                data["rules"] = [
+                    {
+                        "instance_id": "bad-rule",
+                        "rule_type": bad_rule,
+                        "phases": ["runtime"],
+                    }
+                ]
+                with self.assertRaises(_UnsupportedContractRules) as ctx:
+                    self.load(json.dumps(data))
+                self.assertEqual(ctx.exception.field, "rules")
+                self.assertEqual(ctx.exception.ids, [bad_rule])
+
+    def test_v3_rejects_disallowed_phase_for_rule_type(self):
+        for rule_type, bad_phase in (
+            ("tool.declared_only", "post_execution"),
+            ("tool.declared_only", "pre_execution"),
+            ("response.schema_complete", "runtime"),
+        ):
+            with self.subTest(rule_type=rule_type, bad_phase=bad_phase):
+                data = v3_contract()
+                data["rules"] = [
+                    {
+                        "instance_id": "wrong-phase",
+                        "rule_type": rule_type,
+                        "phases": [bad_phase],
+                    }
+                ]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"Rule instance 'wrong-phase' declares unsupported phase\\(s\\) for rule_type '{rule_type}'",
+                ):
+                    self.load(json.dumps(data))
+
+    def test_v3_rejects_invalid_params_without_leaking_values(self):
+        catalog = _make_custom_v3_catalog()
+        self.assertIsNot(
+            _TransferLimitParams.model_config.get("hide_input_in_errors"),
+            True,
+        )
+        sentinel = "SECRET_PARAM_SENTINEL_XYZ"
+        for bad_params in (
+            {},  # missing required max_amount
+            {"max_amount": sentinel},  # wrong type
+            {"max_amount": 500, "extra_secret": sentinel},  # extra field
+            {"max_amount": True},  # bool coercion rejected
+            {"max_amount": 0},  # ge=1 rejected
+        ):
+            with self.subTest(bad_params=bad_params):
+                data = v3_contract(rule_catalog=catalog)
+                data["rules"] = [
+                    {
+                        "instance_id": "limit-check",
+                        "rule_type": "transfer.max_amount",
+                        "phases": ["runtime"],
+                        "params": bad_params,
+                    }
+                ]
+                typed = ContractRulesV3.model_validate(data)
+                for call_name, fn in (
+                    (
+                        "validate_contract_rules",
+                        lambda: validate_contract_rules(
+                            typed, rule_catalog=catalog
+                        ),
+                    ),
+                    (
+                        "load_contract",
+                        lambda: self.load(
+                            json.dumps(data), rule_catalog=catalog
+                        ),
+                    ),
+                ):
+                    with self.subTest(call=call_name):
+                        caught: ValueError | None = None
+                        formatted_tb = ""
+                        try:
+                            fn()
+                        except ValueError as exc:
+                            caught = exc
+                            formatted_tb = traceback.format_exc()
+                        self.assertIsNotNone(caught)
+                        assert caught is not None
+                        self.assertIsNone(caught.__cause__)
+                        self.assertTrue(caught.__suppress_context__)
+                        message = str(caught)
+                        self.assertIn(
+                            "Invalid parameters for rule instance 'limit-check' (rule_type 'transfer.max_amount')",
+                            message,
+                        )
+                        self.assertNotIn(sentinel, message)
+                        self.assertNotIn(sentinel, formatted_tb)
+
+    def test_v3_rejects_duplicate_instance_id_legacy_fields_and_incomplete_phases(self):
+        dup_data = v3_contract()
+        dup_data["rules"] = [
+            {
+                "instance_id": "dup-id",
+                "rule_type": "tool.declared_only",
+                "phases": ["runtime"],
+            },
+            {
+                "instance_id": "dup-id",
+                "rule_type": "response.schema_complete",
+                "phases": ["post_execution"],
+            },
+        ]
+        with self.assertRaisesRegex(ValidationError, "Duplicate rule instance_id"):
+            self.load(json.dumps(dup_data))
+
+        missing_rules = v3_contract()
+        missing_rules.pop("rules")
+        with self.assertRaises(ValidationError):
+            self.load(json.dumps(missing_rules))
+
+        for legacy_key, legacy_val in (
+            ("runtime_rules", ["tool.declared_only"]),
+            ("postconditions", ["response.schema_complete"]),
+            ("mode", "guarded"),
+            ("agent_feedback", {}),
+        ):
+            with self.subTest(legacy_key=legacy_key):
+                bad = v3_contract()
+                bad[legacy_key] = legacy_val
+                with self.assertRaises(ValidationError):
+                    self.load(json.dumps(bad))
+
+        bad_phases = v3_contract()
+        bad_phases["validation_phases"] = ["runtime", "post_execution"]
+        with self.assertRaisesRegex(
+            ValueError, "Enforced contracts require all three validation phases"
+        ):
+            self.load(json.dumps(bad_phases))
+
+    def test_v3_validation_precedence(self):
+        catalog = _make_custom_v3_catalog()
+
+        # 1. Unknown rule_type precedes disallowed phase, invalid params, incomplete phases, and bad fingerprint
+        data = v3_contract(rule_catalog=catalog)
+        data["validation_phases"] = ["runtime"]
+        data["contract_fingerprint"] = "sha256:wrong"
+        data["rules"] = [
+            {
+                "instance_id": "bad-phase-and-params",
+                "rule_type": "transfer.max_amount",
+                "phases": ["post_execution"],
+                "params": {"max_amount": "bad"},
+            },
+            {
+                "instance_id": "unknown-type",
+                "rule_type": "nonexistent.rule",
+                "phases": ["runtime"],
+            },
+        ]
+        with self.assertRaises(_UnsupportedContractRules) as ctx:
+            self.load(json.dumps(data), rule_catalog=catalog)
+        self.assertEqual(ctx.exception.field, "rules")
+        self.assertEqual(ctx.exception.ids, ["nonexistent.rule"])
+
+        # 2. Disallowed phase precedes invalid params, incomplete phases, and bad fingerprint
+        data["rules"] = [
+            {
+                "instance_id": "bad-phase-and-params",
+                "rule_type": "transfer.max_amount",
+                "phases": ["post_execution"],
+                "params": {"max_amount": "bad"},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "declares unsupported phase"):
+            self.load(json.dumps(data), rule_catalog=catalog)
+
+        # 3. Invalid params precede incomplete phases and bad fingerprint
+        data["rules"] = [
+            {
+                "instance_id": "bad-params",
+                "rule_type": "transfer.max_amount",
+                "phases": ["runtime"],
+                "params": {"max_amount": "bad"},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "Invalid parameters for rule instance"):
+            self.load(json.dumps(data), rule_catalog=catalog)
+
+        # 4. Incomplete validation_phases precedes bad fingerprint
+        data["rules"] = [
+            {
+                "instance_id": "ok-params",
+                "rule_type": "transfer.max_amount",
+                "phases": ["runtime"],
+                "params": {"max_amount": 100},
+            }
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "Enforced contracts require all three validation phases"
+        ):
+            self.load(json.dumps(data), rule_catalog=catalog)
+
+
+class ContractV3FingerprintTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "contract_v3.yaml"
+
+    def load(self, text: str, rule_catalog: RuleCatalog | None = None):
+        self.path.write_text(text, encoding="utf-8")
+        return load_contract(self.path, rule_catalog=rule_catalog)
+
+    def test_v3_fingerprint_equivalence_with_omitted_vs_explicit_parameter_defaults(
+        self,
+    ):
+        catalog = _make_custom_v3_catalog(_TransferLimitParams)
+        omitted_data = v3_contract(
+            rules=[
+                {
+                    "instance_id": "limit-1",
+                    "rule_type": "transfer.max_amount",
+                    "phases": ["runtime"],
+                    "params": {"max_amount": 250},
+                }
+            ],
+            rule_catalog=catalog,
+        )
+        explicit_data = v3_contract(
+            rules=[
+                {
+                    "instance_id": "limit-1",
+                    "rule_type": "transfer.max_amount",
+                    "phases": ["runtime"],
+                    "params": {"currency": "MXN", "max_amount": 250},
+                }
+            ],
+            rule_catalog=catalog,
+        )
+        self.assertEqual(
+            omitted_data["contract_fingerprint"],
+            explicit_data["contract_fingerprint"],
+        )
+
+        # Changing the parameter default in a new catalog causes load-time mismatch
+        alt_catalog = _make_custom_v3_catalog(_TransferLimitParamsAltDefault)
+        with self.assertRaisesRegex(ValueError, "Contract fingerprint mismatch"):
+            self.load(json.dumps(omitted_data), rule_catalog=alt_catalog)
+
+    def test_v3_fingerprint_changes_on_any_normative_field_or_binding_change(self):
+        catalog = _make_custom_v3_catalog()
+        base_rules = [
+            {
+                "instance_id": "rule-a",
+                "rule_type": "tool.declared_only",
+                "phases": ["runtime"],
+                "params": {},
+            },
+            {
+                "instance_id": "rule-b",
+                "rule_type": "transfer.max_amount",
+                "phases": ["runtime"],
+                "params": {"max_amount": 100},
+            },
+        ]
+        base = v3_contract(rules=base_rules, rule_catalog=catalog)
+        base_fp = base["contract_fingerprint"]
+
+        mutations: list[tuple[str, dict[str, object]]] = []
+
+        for field_name, new_value in (
+            ("contract_id", "example.v3.changed"),
+            ("declared_tools", ["send_notification"]),
+            ("response_schema", {"required_fields": ["answer", "extra"]}),
+            ("memory_policy", "strict"),
+            ("approved_agent_configurations", ["sha256:other"]),
+            ("metadata", {"owner": "other"}),
+        ):
+            mutated = json.loads(json.dumps(base))
+            mutated[field_name] = new_value
+            mutations.append((field_name, mutated))
+
+        # Binding order change
+        reordered = json.loads(json.dumps(base))
+        reordered["rules"] = list(reversed(base_rules))
+        mutations.append(("binding_order", reordered))
+
+        # instance_id change
+        changed_id = json.loads(json.dumps(base))
+        changed_id["rules"][0]["instance_id"] = "rule-a-renamed"
+        mutations.append(("instance_id", changed_id))
+
+        # rule_type change
+        changed_type = json.loads(json.dumps(base))
+        changed_type["rules"][0] = {
+            "instance_id": "rule-a",
+            "rule_type": "response.schema_complete",
+            "phases": ["post_execution"],
+            "params": {},
+        }
+        mutations.append(("rule_type", changed_type))
+
+        # param value change
+        changed_param = json.loads(json.dumps(base))
+        changed_param["rules"][1]["params"]["max_amount"] = 101
+        mutations.append(("param_value", changed_param))
+
+        multi_phase_catalog = RuleCatalog(
+            rule_types={
+                "multi.phase": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime", "post_execution"}),
+                    params_model=EmptyRuleParams,
+                )
+            }
+        )
+        multi_base = v3_contract(
+            rules=[
+                {
+                    "instance_id": "m1",
+                    "rule_type": "multi.phase",
+                    "phases": ["runtime"],
+                }
+            ],
+            rule_catalog=multi_phase_catalog,
+        )
+        multi_mutated = json.loads(json.dumps(multi_base))
+        multi_mutated["rules"][0]["phases"] = ["runtime", "post_execution"]
+        self.assertNotEqual(
+            compute_v3_contract_fingerprint(
+                ContractRulesV3.model_validate(multi_mutated),
+                rule_catalog=multi_phase_catalog,
+            ),
+            multi_base["contract_fingerprint"],
+        )
+        with self.assertRaisesRegex(ValueError, "Contract fingerprint mismatch"):
+            self.load(json.dumps(multi_mutated), rule_catalog=multi_phase_catalog)
+
+        for label, candidate in mutations:
+            with self.subTest(mutation=label):
+                new_fp = compute_v3_contract_fingerprint(
+                    ContractRulesV3.model_validate(candidate),
+                    rule_catalog=catalog,
+                )
+                self.assertNotEqual(new_fp, base_fp)
+                with self.assertRaisesRegex(
+                    ValueError, "Contract fingerprint mismatch"
+                ):
+                    self.load(json.dumps(candidate), rule_catalog=catalog)
+
+    def test_compute_v3_contract_fingerprint_rejects_non_v3_and_invalid_contracts(self):
+        v2_doc = ContractRulesV2.model_validate(v2_contract())
+        with self.assertRaisesRegex(TypeError, "Expected a ContractRulesV3 instance"):
+            compute_v3_contract_fingerprint(v2_doc)  # type: ignore[arg-type]
+
+        invalid_v3 = ContractRulesV3.model_validate(
+            {
+                **v3_contract(),
+                "rules": [
+                    {
+                        "instance_id": "unknown-rule",
+                        "rule_type": "unknown.rule",
+                        "phases": ["runtime"],
+                    }
+                ],
+            }
+        )
+        with self.assertRaises(_UnsupportedContractRules):
+            compute_v3_contract_fingerprint(invalid_v3)
+
+
+class LegacyIdentityRegressionTests(unittest.TestCase):
+    def test_pinned_v2_and_v1_fingerprints_remain_unchanged(self):
+        example_path = (
+            Path(__file__).resolve().parents[1]
+            / "examples"
+            / "notification_contract_v2.yaml"
+        )
+        example_doc = load_contract(example_path)
+        self.assertEqual(
+            example_doc.contract.contract_fingerprint,
+            "sha256:ad61db75c5b4ba43868b51cf287180e7b79adf846a012611178ff6382c692cff",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            v2_path = Path(tmpdir) / "v2.json"
+            v2_data = v2_contract()
+            v2_path.write_text(json.dumps(v2_data), encoding="utf-8")
+            v2_doc = load_contract(v2_path)
+            self.assertEqual(
+                v2_doc.contract.contract_fingerprint,
+                "sha256:5a92de44c4a3d327a2ada6e67a5cb56be3264477313285900daaaf90457776fa",
+            )
+
+            v1_path = Path(tmpdir) / "v1.json"
+            v1_data = example_contract()
+            v1_data["contract_fingerprint"] = "arbitrary-unverified-v1-fingerprint"
+            v1_path.write_text(json.dumps(v1_data), encoding="utf-8")
+            v1_doc = load_contract(v1_path)
+            self.assertEqual(
+                v1_doc.contract.contract_fingerprint,
+                "arbitrary-unverified-v1-fingerprint",
+            )
 
 
 if __name__ == "__main__":

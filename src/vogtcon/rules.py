@@ -6,12 +6,69 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TypeAlias
 
-from .models import GovernorInput, Violation
+from pydantic import BaseModel, ConfigDict
+
+from .models import (
+    FrozenJsonObject,
+    GovernorInput,
+    JsonObject,
+    Phase,
+    Violation,
+    _thaw_json_value,
+)
 
 RuleHandler: TypeAlias = Callable[[GovernorInput], bool | Violation | None]
+
+_VALID_PHASES: frozenset[Phase] = frozenset(
+    {"pre_execution", "runtime", "post_execution"}
+)
+
+
+class EmptyRuleParams(BaseModel):
+    """Parameter schema for v3 rule types that accept no parameters."""
+
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RuleTypeSpec:
+    """Typed specification for a v3 contract rule type."""
+
+    allowed_phases: frozenset[Phase]
+    params_model: type[BaseModel] = EmptyRuleParams
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.allowed_phases, frozenset)
+            or not self.allowed_phases
+            or not self.allowed_phases.issubset(_VALID_PHASES)
+        ):
+            raise ValueError(
+                "RuleTypeSpec allowed_phases must be a non-empty frozenset of valid phases"
+            )
+        if not isinstance(self.params_model, type) or not issubclass(
+            self.params_model, BaseModel
+        ):
+            raise TypeError(
+                "RuleTypeSpec params_model must be a Pydantic BaseModel subclass"
+            )
+        cfg = self.params_model.model_config
+        if (
+            cfg.get("strict") is not True
+            or cfg.get("extra") != "forbid"
+            or cfg.get("frozen") is not True
+            or cfg.get("allow_inf_nan") is not False
+        ):
+            raise ValueError(
+                "RuleTypeSpec params_model must set strict=True, extra='forbid', "
+                "frozen=True, allow_inf_nan=False"
+            )
 
 RUNTIME_RULES: tuple[str, ...] = (
     "tool.declared_only",
@@ -119,6 +176,17 @@ DEFAULT_POSTCONDITIONS: Mapping[str, RuleHandler] = MappingProxyType({
     "forbidden.outcome_triggered": _check_forbidden_outcome_triggered,
 })
 
+DEFAULT_RULE_TYPES: Mapping[str, RuleTypeSpec] = MappingProxyType({
+    "tool.declared_only": RuleTypeSpec(
+        allowed_phases=frozenset({"runtime"}),
+        params_model=EmptyRuleParams,
+    ),
+    "response.schema_complete": RuleTypeSpec(
+        allowed_phases=frozenset({"post_execution"}),
+        params_model=EmptyRuleParams,
+    ),
+})
+
 
 class RuleCatalog:
     """Add phase-specific rules while preserving the built-in identifiers.
@@ -133,9 +201,11 @@ class RuleCatalog:
         self,
         runtime_rules: Mapping[str, RuleHandler] | None = None,
         postconditions: Mapping[str, RuleHandler] | None = None,
+        rule_types: Mapping[str, RuleTypeSpec] | None = None,
     ) -> None:
         custom_runtime = dict(runtime_rules or {})
         custom_post = dict(postconditions or {})
+        custom_rule_types = dict(rule_types or {})
         for configured, builtins in (
             (custom_runtime, DEFAULT_RUNTIME_RULES),
             (custom_post, DEFAULT_POSTCONDITIONS),
@@ -143,8 +213,29 @@ class RuleCatalog:
             for rule_id, handler in configured.items():
                 if rule_id in builtins and handler is not builtins[rule_id]:
                     raise ValueError(f"Cannot replace built-in rule '{rule_id}'")
+        historical_builtins = set(DEFAULT_RUNTIME_RULES) | set(DEFAULT_POSTCONDITIONS)
+        for rule_type, spec in custom_rule_types.items():
+            if not isinstance(rule_type, str) or not rule_type:
+                raise ValueError("Rule type identifier must be a non-empty string")
+            if not isinstance(spec, RuleTypeSpec):
+                raise TypeError(
+                    f"Rule type '{rule_type}' specification must be a RuleTypeSpec"
+                )
+            if (
+                rule_type in DEFAULT_RULE_TYPES
+                and spec != DEFAULT_RULE_TYPES[rule_type]
+            ):
+                raise ValueError(f"Cannot replace built-in rule type '{rule_type}'")
+            if (
+                rule_type in historical_builtins
+                and rule_type not in DEFAULT_RULE_TYPES
+            ):
+                raise ValueError(
+                    f"Cannot shadow historical built-in rule '{rule_type}' as a v3 rule type"
+                )
         self._runtime_rules = {**DEFAULT_RUNTIME_RULES, **custom_runtime}
         self._postconditions = {**DEFAULT_POSTCONDITIONS, **custom_post}
+        self._rule_types = {**DEFAULT_RULE_TYPES, **custom_rule_types}
 
     @property
     def runtime_rules(self) -> dict[str, RuleHandler]:
@@ -153,6 +244,16 @@ class RuleCatalog:
     @property
     def postconditions(self) -> dict[str, RuleHandler]:
         return dict(self._postconditions)
+
+    @property
+    def rule_types(self) -> dict[str, RuleTypeSpec]:
+        return dict(self._rule_types)
+
+    def validate_rule_params(
+        self, rule_type: str, params: JsonObject | FrozenJsonObject
+    ) -> BaseModel:
+        spec = self._rule_types[rule_type]
+        return spec.params_model.model_validate(_thaw_json_value(params))
 
     def _coerce_violation(
         self,

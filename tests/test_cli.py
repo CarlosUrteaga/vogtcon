@@ -18,11 +18,13 @@ import yaml
 
 from vogtcon import (
     ActionProposal,
+    ContractRulesV3,
     EnforcementPolicy,
     ExecutionContext,
     JsonlDecisionLog,
     RunEvent,
     WorkflowController,
+    compute_v3_contract_fingerprint,
 )
 from vogtcon.cli import (
     EXIT_INVALID,
@@ -30,6 +32,7 @@ from vogtcon.cli import (
     EXIT_USAGE_OR_IO,
     EXIT_VALID,
     main,
+    validate_contract_file,
 )
 
 
@@ -1498,3 +1501,334 @@ class TestCliExplainStage3(unittest.TestCase):
         res = json.loads(out)
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["data"]["runs"][0]["trace_integrity"], "partial")
+
+
+class TestCliValidateV3(unittest.TestCase):
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parent.parent
+        self.notification_v1 = self.repo_root / "examples" / "notification_contract.yaml"
+        self.notification_v2 = self.repo_root / "examples" / "notification_contract_v2.yaml"
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.workspace_dir = Path(workspace.name)
+        self.contract_path = self.workspace_dir / "contract_v3.yaml"
+
+    def run_cli(self, args: list[str]) -> tuple[int, str, str]:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = main(args)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def _valid_v3_dict(self, *, rules: list[dict[str, object]] | None = None) -> dict[str, object]:
+        rule_list = (
+            rules
+            if rules is not None
+            else [
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "response-schema",
+                    "rule_type": "response.schema_complete",
+                    "phases": ["post_execution"],
+                },
+            ]
+        )
+        draft_data: dict[str, object] = {
+            "schema_version": 3,
+            "contract_id": "example.notification.v3",
+            "approved_agent_configurations": ["notification-agent-v1"],
+            "declared_tools": ["send_notification"],
+            "response_schema": {"required_fields": ["status"]},
+            "memory_policy": "none",
+            "validation_phases": ["pre_execution", "runtime", "post_execution"],
+            "rules": rule_list,
+            "contract_fingerprint": "sha256:placeholder",
+        }
+        draft = ContractRulesV3.model_validate(draft_data)
+        draft_data["contract_fingerprint"] = compute_v3_contract_fingerprint(draft)
+        return draft_data
+
+    def test_validate_v3_yaml_and_json_success(self) -> None:
+        contract = self._valid_v3_dict()
+        for suffix, dump in ((".yaml", yaml.safe_dump), (".json", json.dumps)):
+            with self.subTest(format=suffix):
+                path = self.workspace_dir / f"valid_v3{suffix}"
+                path.write_text(dump(contract), encoding="utf-8")
+
+                code_txt, out_txt, err_txt = self.run_cli(["validate", str(path)])
+                self.assertEqual((code_txt, err_txt), (EXIT_VALID, ""))
+                self.assertIn("Contract is valid", out_txt)
+                self.assertIn("Schema Version: 3", out_txt)
+                self.assertIn("(verified)", out_txt)
+                self.assertIn(
+                    "Rule Bindings:  declared-tools (tool.declared_only), response-schema (response.schema_complete)",
+                    out_txt,
+                )
+
+                code_json, out_json, err_json = self.run_cli(["validate", str(path), "--json"])
+                self.assertEqual((code_json, err_json), (EXIT_VALID, ""))
+                result = json.loads(out_json)
+                self.assertEqual(result["output_version"], 1)
+                self.assertEqual(result["command"], "validate")
+                self.assertEqual(result["status"], "valid")
+                self.assertEqual(result["path"], str(path))
+                self.assertEqual(result["diagnostics"], [])
+                data = result["data"]
+                self.assertEqual(data["contract_id"], "example.notification.v3")
+                self.assertEqual(data["contract_version"], 3)
+                self.assertIsNone(data["mode"])
+                self.assertEqual(
+                    data["validation_phases"],
+                    ["pre_execution", "runtime", "post_execution"],
+                )
+                self.assertEqual(
+                    data["fingerprint"],
+                    {"value": contract["contract_fingerprint"], "verified": True},
+                )
+                self.assertEqual(data["declared_tools"], ["send_notification"])
+                self.assertEqual(data["runtime_rules"], ["tool.declared_only"])
+                self.assertEqual(data["postconditions"], ["response.schema_complete"])
+                self.assertEqual(
+                    data["rules"],
+                    [
+                        {
+                            "instance_id": "declared-tools",
+                            "rule_type": "tool.declared_only",
+                            "phases": ["runtime"],
+                        },
+                        {
+                            "instance_id": "response-schema",
+                            "rule_type": "response.schema_complete",
+                            "phases": ["post_execution"],
+                        },
+                    ],
+                )
+                for item in data["rules"]:
+                    self.assertNotIn("params", item)
+
+                code_direct, res_direct = validate_contract_file(path)
+                self.assertEqual(code_direct, EXIT_VALID)
+                self.assertIs(type(res_direct["data"]["validation_phases"]), list)
+                self.assertIs(type(res_direct["data"]["declared_tools"]), list)
+
+        # Empty rules list is also structurally valid in v3
+        empty_v3 = self._valid_v3_dict(rules=[])
+        empty_path = self.workspace_dir / "empty_rules_v3.json"
+        empty_path.write_text(json.dumps(empty_v3), encoding="utf-8")
+        code_e, out_e, err_e = self.run_cli(["validate", str(empty_path), "--json"])
+        self.assertEqual((code_e, err_e), (EXIT_VALID, ""))
+        data_e = json.loads(out_e)["data"]
+        self.assertEqual(data_e["rules"], [])
+        self.assertEqual(data_e["runtime_rules"], [])
+        self.assertEqual(data_e["postconditions"], [])
+
+    def test_v1_and_v2_outputs_unchanged_without_rules_key_and_help_mentions_v3(self) -> None:
+        for fixture in (self.notification_v1, self.notification_v2):
+            with self.subTest(fixture=fixture.name):
+                code_j, out_j, err_j = self.run_cli(["validate", str(fixture), "--json"])
+                self.assertEqual((code_j, err_j), (EXIT_VALID, ""))
+                data = json.loads(out_j)["data"]
+                self.assertNotIn("rules", data)
+
+                code_t, out_t, err_t = self.run_cli(["validate", str(fixture)])
+                self.assertEqual((code_t, err_t), (EXIT_VALID, ""))
+                self.assertNotIn("Rule Bindings:", out_t)
+
+        code_h, out_h, err_h = self.run_cli(["--help"])
+        self.assertEqual((code_h, err_h), (0, ""))
+        self.assertIn("Validate a contract document (v1, v2, or v3).", out_h)
+
+    def test_validate_v3_fingerprint_mismatch(self) -> None:
+        bad = self._valid_v3_dict()
+        bad["contract_fingerprint"] = "sha256:" + ("0" * 64)
+        self.contract_path.write_text(yaml.safe_dump(bad), encoding="utf-8")
+
+        code_t, out_t, err_t = self.run_cli(["validate", str(self.contract_path)])
+        self.assertEqual((code_t, out_t), (EXIT_INVALID, ""))
+        self.assertIn("Contract validation failed", err_t)
+        self.assertIn("Contract fingerprint mismatch", err_t)
+
+        code_j, out_j, err_j = self.run_cli(["validate", str(self.contract_path), "--json"])
+        self.assertEqual((code_j, err_j), (EXIT_INVALID, ""))
+        result = json.loads(out_j)
+        self.assertEqual(result["status"], "invalid_contract")
+        self.assertIsNone(result["data"])
+        self.assertEqual(result["diagnostics"][0]["code"], "invalid_contract")
+        self.assertIn("Contract fingerprint mismatch", result["diagnostics"][0]["message"])
+
+    def test_validate_v3_unknown_rule_type_exit_2_and_precedence(self) -> None:
+        bad = self._valid_v3_dict()
+        bad["rules"] = [
+            {
+                "instance_id": "legacy-arg",
+                "rule_type": "sensitive_requires_approval",
+                "phases": ["post_execution"],
+                "params": {"secret_param": "LEAK_GUARD_UNKNOWN_RULE"},
+            },
+            {
+                "instance_id": "custom-1",
+                "rule_type": "custom.spend_limit",
+                "phases": ["runtime"],
+                "params": {"limit": 100},
+            },
+            {
+                "instance_id": "custom-2",
+                "rule_type": "custom.spend_limit",
+                "phases": ["runtime"],
+            },
+            {
+                "instance_id": "bad-phase-builtin",
+                "rule_type": "tool.declared_only",
+                "phases": ["post_execution"],
+            },
+        ]
+        bad["validation_phases"] = ["runtime"]
+        bad["contract_fingerprint"] = "sha256:stale"
+        self.contract_path.write_text(json.dumps(bad), encoding="utf-8")
+
+        code_j, out_j, err_j = self.run_cli(["validate", str(self.contract_path), "--json"])
+        self.assertEqual((code_j, err_j), (EXIT_UNSUPPORTED_RULES, ""))
+        result = json.loads(out_j)
+        self.assertEqual(result["output_version"], 1)
+        self.assertEqual(result["status"], "unsupported_rules")
+        self.assertEqual(
+            result["data"],
+            {
+                "field": "rules",
+                "unsupported_ids": ["custom.spend_limit", "sensitive_requires_approval"],
+            },
+        )
+        self.assertEqual(result["diagnostics"][0]["code"], "unsupported_rule")
+        self.assertNotIn("fingerprint", out_j)
+        self.assertNotIn("LEAK_GUARD_UNKNOWN_RULE", out_j)
+
+        code_t, out_t, err_t = self.run_cli(["validate", str(self.contract_path)])
+        self.assertEqual((code_t, out_t), (EXIT_UNSUPPORTED_RULES, ""))
+        self.assertIn("Contract contains rules outside default catalog", err_t)
+        self.assertIn("custom.spend_limit", err_t)
+        self.assertIn("sensitive_requires_approval", err_t)
+        self.assertNotIn("LEAK_GUARD_UNKNOWN_RULE", err_t)
+
+    def test_validate_v3_invalid_cases_omit_raw_values(self) -> None:
+        secret = "SECRET_PARAM_SENTINEL_999"
+        base = self._valid_v3_dict()
+
+        cases: list[tuple[str, dict[str, object]]] = [
+            (
+                "disallowed_phase",
+                {
+                    **base,
+                    "rules": [
+                        {
+                            "instance_id": "wrong-phase",
+                            "rule_type": "tool.declared_only",
+                            "phases": ["post_execution"],
+                        }
+                    ],
+                },
+            ),
+            (
+                "extra_params_with_secret",
+                {
+                    **base,
+                    "rules": [
+                        {
+                            "instance_id": "declared-tools",
+                            "rule_type": "tool.declared_only",
+                            "phases": ["runtime"],
+                            "params": {"unexpected": secret},
+                        }
+                    ],
+                },
+            ),
+            (
+                "duplicate_instance_id",
+                {
+                    **base,
+                    "rules": [
+                        {
+                            "instance_id": "dup-id",
+                            "rule_type": "tool.declared_only",
+                            "phases": ["runtime"],
+                        },
+                        {
+                            "instance_id": "dup-id",
+                            "rule_type": "response.schema_complete",
+                            "phases": ["post_execution"],
+                        },
+                    ],
+                },
+            ),
+            (
+                "missing_rules",
+                {k: v for k, v in base.items() if k != "rules"},
+            ),
+            (
+                "incomplete_validation_phases",
+                {**base, "validation_phases": ["runtime"]},
+            ),
+            (
+                "legacy_runtime_rules",
+                {**base, "runtime_rules": ["tool.declared_only"]},
+            ),
+            (
+                "legacy_postconditions",
+                {**base, "postconditions": ["response.schema_complete"]},
+            ),
+            (
+                "legacy_mode",
+                {**base, "mode": "guarded"},
+            ),
+            (
+                "legacy_agent_feedback",
+                {**base, "agent_feedback": {"guarded_denial_style": secret}},
+            ),
+        ]
+
+        for label, payload in cases:
+            with self.subTest(case=label):
+                self.contract_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                code_j, out_j, err_j = self.run_cli(["validate", str(self.contract_path), "--json"])
+                self.assertEqual((code_j, err_j), (EXIT_INVALID, ""))
+                res = json.loads(out_j)
+                self.assertEqual(res["output_version"], 1)
+                self.assertEqual(res["status"], "invalid_contract")
+                self.assertIsNone(res["data"])
+                self.assertEqual(res["diagnostics"][0]["code"], "invalid_contract")
+                self.assertNotIn(secret, out_j)
+                self.assertNotIn(secret, err_j)
+
+                code_t, out_t, err_t = self.run_cli(["validate", str(self.contract_path)])
+                self.assertEqual((code_t, out_t), (EXIT_INVALID, ""))
+                self.assertIn("Contract validation failed", err_t)
+                self.assertNotIn(secret, out_t)
+                self.assertNotIn(secret, err_t)
+
+    def test_validate_v3_unsupported_schema_versions(self) -> None:
+        base = self._valid_v3_dict()
+        for bad_version in (4, "3", 3.0, True):
+            with self.subTest(schema_version=repr(bad_version)):
+                payload = {**base, "schema_version": bad_version}
+                self.contract_path.write_text(json.dumps(payload), encoding="utf-8")
+                code, out, err = self.run_cli(["validate", str(self.contract_path), "--json"])
+                self.assertEqual((code, err), (EXIT_INVALID, ""))
+                result = json.loads(out)
+                self.assertEqual(result["status"], "invalid_contract")
+                self.assertIsNone(result["data"])
+
+    def test_validate_v3_stable_output_and_untouched_file_bytes(self) -> None:
+        contract = self._valid_v3_dict()
+        raw = yaml.safe_dump(contract).encode("utf-8")
+        self.contract_path.write_bytes(raw)
+        dotted_path = f"{self.contract_path.parent}/./{self.contract_path.name}"
+        args = ["validate", dotted_path, "--json"]
+        first = self.run_cli(args)
+        self.assertEqual(first, self.run_cli(args))
+        self.assertEqual(first[0], EXIT_VALID)
+        self.assertEqual(json.loads(first[1])["path"], dotted_path)
+        self.assertEqual(self.contract_path.read_bytes(), raw)

@@ -36,6 +36,7 @@ class DeterministicEvaluator:
 
     def evaluate(self, request: GovernorInput) -> GovernanceDecision:
         validate_contract_rules(request.contract, rule_catalog=self._rule_catalog)
+        request.validate_source_agreement()
         mode = request.effective_mode
         violations = []
         if mode != "no_contract":

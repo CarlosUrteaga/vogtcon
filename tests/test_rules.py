@@ -7,6 +7,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vogtcon import (
     DeterministicEvaluator,
@@ -19,9 +22,12 @@ from vogtcon import (
 from vogtcon.rules import (
     DEFAULT_POSTCONDITIONS,
     DEFAULT_RULE_CATALOG,
+    DEFAULT_RULE_TYPES,
     DEFAULT_RUNTIME_RULES,
     POSTCONDITIONS,
     RUNTIME_RULES,
+    EmptyRuleParams,
+    RuleTypeSpec,
 )
 
 
@@ -290,6 +296,243 @@ class RuleCatalogTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Cannot specify both"):
             Governor(evaluator=DeterministicEvaluator(), rule_catalog=catalog)
+
+
+class _StrictLimitParams(BaseModel):
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+    max_amount: int = Field(ge=1)
+    currency: str = "MXN"
+    channels: list[str] = Field(default_factory=lambda: ["email"])
+    tags: dict[str, int] = Field(default_factory=dict)
+
+
+class RuleTypeRegistryTests(unittest.TestCase):
+    def test_default_rule_types_vocabulary_and_immutability(self):
+        self.assertIsInstance(DEFAULT_RULE_TYPES, MappingProxyType)
+        self.assertEqual(
+            set(DEFAULT_RULE_TYPES.keys()),
+            {"tool.declared_only", "response.schema_complete"},
+        )
+        self.assertEqual(
+            DEFAULT_RULE_TYPES["tool.declared_only"],
+            RuleTypeSpec(
+                allowed_phases=frozenset({"runtime"}),
+                params_model=EmptyRuleParams,
+            ),
+        )
+        self.assertEqual(
+            DEFAULT_RULE_TYPES["response.schema_complete"],
+            RuleTypeSpec(
+                allowed_phases=frozenset({"post_execution"}),
+                params_model=EmptyRuleParams,
+            ),
+        )
+        with self.assertRaises(TypeError):
+            DEFAULT_RULE_TYPES["custom.type"] = RuleTypeSpec(  # type: ignore[index]
+                allowed_phases=frozenset({"runtime"})
+            )
+
+    def test_default_rule_types_excludes_argument_derived_and_benchmark_rules(self):
+        excluded = (
+            "sensitive_requires_approval",
+            "memory.scope_allowed",
+            "ticket_requires_evidence",
+            "authorization.role_required",
+            "run_ledger.required",
+            "run_ledger.complete",
+            "forbidden.outcome_triggered",
+        )
+        for rule_id in excluded:
+            with self.subTest(rule_id=rule_id):
+                self.assertNotIn(rule_id, DEFAULT_RULE_TYPES)
+
+    def test_rule_type_spec_validates_phases_and_strict_params_model(self):
+        for bad_phases in (
+            frozenset(),
+            frozenset({"invalid_phase"}),  # type: ignore[arg-type]
+            frozenset({"runtime", "unknown"}),  # type: ignore[arg-type]
+            {"runtime"},  # type: ignore[arg-type]
+            ["runtime"],  # type: ignore[arg-type]
+        ):
+            with self.subTest(bad_phases=bad_phases):
+                with self.assertRaisesRegex(
+                    ValueError, "non-empty frozenset of valid phases"
+                ):
+                    RuleTypeSpec(allowed_phases=bad_phases)
+
+        for bad_model in (dict, object, "not_a_model", 123):
+            with self.subTest(bad_model=bad_model):
+                with self.assertRaisesRegex(
+                    TypeError, "Pydantic BaseModel subclass"
+                ):
+                    RuleTypeSpec(
+                        allowed_phases=frozenset({"runtime"}),
+                        params_model=bad_model,  # type: ignore[arg-type]
+                    )
+
+        class NonStrictParams(BaseModel):
+            model_config = ConfigDict(
+                strict=False, extra="forbid", frozen=True, allow_inf_nan=False
+            )
+
+        class ExtraAllowParams(BaseModel):
+            model_config = ConfigDict(
+                strict=True, extra="allow", frozen=True, allow_inf_nan=False
+            )
+
+        class MutableParams(BaseModel):
+            model_config = ConfigDict(
+                strict=True, extra="forbid", frozen=False, allow_inf_nan=False
+            )
+
+        class NanAllowedParams(BaseModel):
+            model_config = ConfigDict(
+                strict=True, extra="forbid", frozen=True, allow_inf_nan=True
+            )
+
+        for model_cls in (
+            NonStrictParams,
+            ExtraAllowParams,
+            MutableParams,
+            NanAllowedParams,
+        ):
+            with self.subTest(model_cls=model_cls.__name__):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "strict=True, extra='forbid', frozen=True, allow_inf_nan=False",
+                ):
+                    RuleTypeSpec(
+                        allowed_phases=frozenset({"runtime"}),
+                        params_model=model_cls,
+                    )
+
+    def test_catalog_accepts_custom_rule_types_and_protects_builtins_and_historical_ids(
+        self,
+    ):
+        custom_spec = RuleTypeSpec(
+            allowed_phases=frozenset({"runtime"}),
+            params_model=_StrictLimitParams,
+        )
+        catalog = RuleCatalog(rule_types={"budget.limit": custom_spec})
+        self.assertIn("tool.declared_only", catalog.rule_types)
+        self.assertIn("response.schema_complete", catalog.rule_types)
+        self.assertEqual(catalog.rule_types["budget.limit"], custom_spec)
+
+        catalog_with_spread = RuleCatalog(
+            rule_types={**DEFAULT_RULE_TYPES, "budget.limit": custom_spec}
+        )
+        self.assertEqual(catalog_with_spread.rule_types["budget.limit"], custom_spec)
+
+        # Returned dict is a fresh copy
+        mutated = catalog.rule_types
+        mutated.pop("budget.limit")
+        self.assertIn("budget.limit", catalog.rule_types)
+
+        with self.assertRaisesRegex(
+            ValueError, "Cannot replace built-in rule type 'tool.declared_only'"
+        ):
+            RuleCatalog(
+                rule_types={
+                    "tool.declared_only": RuleTypeSpec(
+                        allowed_phases=frozenset({"post_execution"}),
+                        params_model=EmptyRuleParams,
+                    )
+                }
+            )
+
+        for historical_id in (
+            "sensitive_requires_approval",
+            "memory.scope_allowed",
+            "ticket_requires_evidence",
+            "authorization.role_required",
+            "run_ledger.required",
+            "run_ledger.complete",
+            "forbidden.outcome_triggered",
+        ):
+            with self.subTest(historical_id=historical_id):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"Cannot shadow historical built-in rule '{historical_id}' as a v3 rule type",
+                ):
+                    RuleCatalog(rule_types={historical_id: custom_spec})
+
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            RuleCatalog(rule_types={"": custom_spec})
+        with self.assertRaisesRegex(TypeError, "must be a RuleTypeSpec"):
+            RuleCatalog(rule_types={"budget.limit": "not_a_spec"})  # type: ignore[dict-item]
+
+    def test_validate_rule_params_materializes_defaults_and_rejects_invalid_inputs(
+        self,
+    ):
+        custom_spec = RuleTypeSpec(
+            allowed_phases=frozenset({"runtime"}),
+            params_model=_StrictLimitParams,
+        )
+        catalog = RuleCatalog(rule_types={"budget.limit": custom_spec})
+
+        validated = catalog.validate_rule_params("budget.limit", {"max_amount": 500})
+        self.assertEqual(
+            validated.model_dump(mode="json"),
+            {
+                "max_amount": 500,
+                "currency": "MXN",
+                "channels": ["email"],
+                "tags": {},
+            },
+        )
+
+        from vogtcon.models import RuleBinding
+
+        binding = RuleBinding(
+            instance_id="b1",
+            rule_type="budget.limit",
+            phases=["runtime"],
+            params={
+                "max_amount": 500,
+                "channels": ["email", "sms"],
+                "tags": {"tier": 1},
+            },
+        )
+        validated_from_frozen = catalog.validate_rule_params(
+            "budget.limit", binding.params
+        )
+        self.assertEqual(
+            validated_from_frozen.model_dump(mode="json"),
+            {
+                "max_amount": 500,
+                "currency": "MXN",
+                "channels": ["email", "sms"],
+                "tags": {"tier": 1},
+            },
+        )
+
+        empty_validated = catalog.validate_rule_params("tool.declared_only", {})
+        self.assertEqual(empty_validated.model_dump(mode="json"), {})
+
+        for bad_params in (
+            {},  # missing required max_amount
+            {"max_amount": "500"},  # string coercion forbidden
+            {"max_amount": True},  # bool coercion forbidden
+            {"max_amount": 0},  # violates ge=1
+            {"max_amount": 100, "extra_field": 1},  # extra field forbidden
+        ):
+            with self.subTest(bad_params=bad_params):
+                with self.assertRaises(ValidationError):
+                    catalog.validate_rule_params("budget.limit", bad_params)
+
+        with self.assertRaises(ValidationError):
+            catalog.validate_rule_params("tool.declared_only", {"unexpected": True})
+
+    def test_default_catalog_preserves_v1_v2_rules_and_order(self):
+        catalog = RuleCatalog()
+        self.assertEqual(tuple(catalog.runtime_rules.keys()), RUNTIME_RULES)
+        self.assertEqual(tuple(catalog.postconditions.keys()), POSTCONDITIONS)
+        self.assertEqual(
+            set(catalog.rule_types.keys()), set(DEFAULT_RULE_TYPES.keys())
+        )
 
 
 if __name__ == "__main__":
