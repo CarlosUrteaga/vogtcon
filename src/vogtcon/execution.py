@@ -86,6 +86,11 @@ class GovernedToolExecutor:
         on_tool_error: Callable[[], None] | None = None,
         action_index: int | None = None,
     ) -> ToolExecutionOutcome[T]:
+        if isinstance(request.contract, ContractRulesV3):
+            raise ValueError(
+                "v3 contracts cannot be executed directly via GovernedToolExecutor; "
+                "use WorkflowController with explicit effect_governance configuration"
+            )
         if request.phase != "runtime" or request.action is None:
             raise ValueError("Tool execution requires a runtime action")
         # Keep the proposed action stable even if a custom evaluator mutates
@@ -471,6 +476,9 @@ class WorkflowController:
 
             # Stage 2: Evaluation
             trajectory = cfg.store.snapshot(effective_scope)
+            expected_last_sequence = (
+                trajectory.entries[-1].sequence if trajectory.entries else 0
+            )
             try:
                 request = self._request(
                     "runtime",
@@ -544,6 +552,7 @@ class WorkflowController:
                     action_index=next_action_index,
                     tool_name=tool_name,
                     operation_digest=operation_digest,
+                    expected_last_sequence=expected_last_sequence,
                 )
             except (ScopeSuspendedError, ConcurrencyError):
                 raise

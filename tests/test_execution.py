@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -186,6 +187,44 @@ class ExecutorTests(unittest.TestCase):
                 request, lambda _proposal: seen.append("sent")
             )
         self.assertEqual(seen, [])
+
+    def test_governed_tool_executor_rejects_v3_contracts_while_standalone_governor_evaluates(self):
+        v3 = v3_contract()
+        ctx = _v3_context(v3)
+        v3_request = GovernorInput(
+            run_id="run-v3-legacy-exec",
+            contract=v3,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ctx,
+            action=action(sensitive=False),
+        )
+        calls: list[str] = []
+        with self.assertRaisesRegex(
+            ValueError,
+            "v3 contracts cannot be executed directly via GovernedToolExecutor",
+        ):
+            GovernedToolExecutor(Governor()).execute(
+                v3_request, lambda _proposal: calls.append("sent")
+            )
+        self.assertEqual(calls, [])
+
+        # Standalone Governor.evaluate() for v3 remains intact
+        allowed = Governor().evaluate(v3_request)
+        self.assertEqual(allowed.decision, "allow")
+        self.assertEqual(allowed.violations, [])
+
+        blocked_req = GovernorInput(
+            run_id="run-v3-legacy-exec-block",
+            contract=v3,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ctx,
+            action=ActionProposal(tool_name="undeclared_tool"),
+        )
+        blocked = Governor().evaluate(blocked_req)
+        self.assertEqual(blocked.decision, "block")
+        self.assertEqual([v.rule for v in blocked.violations], ["declared-tools"])
 
 
 class ControllerTests(unittest.TestCase):
@@ -1397,6 +1436,250 @@ class ReconciliationWorkflowTests(unittest.TestCase):
                     evidence_ref="too-late",
                 )
             )
+
+    def test_toctou_between_evaluation_and_reservation_rejected_deterministically(self):
+        catalog = RuleCatalog(
+            rule_types={
+                "custom.single_effect": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=EmptyRuleParams,
+                    handler=lambda req, _params: (
+                        req.trajectory is not None and len(req.trajectory.effects) > 0
+                    ),
+                )
+            }
+        )
+        base_v3 = v3_contract()
+        draft = ContractRulesV3.model_validate({
+            **base_v3.model_dump(mode="json"),
+            "rules": [
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "single-effect",
+                    "rule_type": "custom.single_effect",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "response-schema",
+                    "rule_type": "response.schema_complete",
+                    "phases": ["post_execution"],
+                },
+            ],
+            "contract_fingerprint": "sha256:placeholder",
+        })
+        single_v3 = draft.model_copy(
+            update={
+                "contract_fingerprint": compute_v3_contract_fingerprint(
+                    draft, rule_catalog=catalog
+                )
+            }
+        )
+        ctx = _v3_context(single_v3)
+        store = InMemoryEffectStore()
+
+        def make_cfg() -> EffectGovernanceConfig:
+            return EffectGovernanceConfig(
+                store=store,
+                resolver=_CallbackResolver(
+                    lambda proposal, c: ResolvedAction(
+                        planned_effect=PlannedEffect(tool_name=proposal.tool_name),
+                        host_facts=HostFacts(facts=dict(c.state)),
+                    )
+                ),
+                observer=_CallbackObserver(
+                    lambda _in, _res: ObservedEffect(status="confirmed", evidence_ref="ok")
+                ),
+                policy_scope="scope.toctou",
+            )
+
+        calls_a: list[str] = []
+        calls_b: list[str] = []
+        recorded_a: list[RecordedEvent] = []
+
+        class ListRec:
+            def record(self, ev: RecordedEvent) -> None:
+                recorded_a.append(ev)
+
+        controller_b = WorkflowController(
+            Governor(rule_catalog=catalog),
+            "run-b",
+            single_v3,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=make_cfg(),
+        )
+        controller_b.begin(ctx)
+
+        base_gov = Governor(rule_catalog=catalog)
+        interleaved_once = False
+
+        class InterleavingEvaluator:
+            def evaluate(self, request: GovernorInput) -> GovernanceDecision:
+                nonlocal interleaved_once
+                decision = base_gov.evaluate(request)
+                if request.phase == "runtime" and not interleaved_once:
+                    interleaved_once = True
+                    # Controller B runs start-to-finish while A's snapshot is open
+                    out_b = controller_b.execute(
+                        action(sensitive=False),
+                        ctx,
+                        lambda _p: calls_b.append("b") or "b-done",
+                    )
+                    assert out_b.executed and out_b.effect is not None
+                return decision
+
+        controller_a = WorkflowController(
+            Governor(evaluator=InterleavingEvaluator()),
+            "run-a",
+            single_v3,
+            recorder=ListRec(),
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=make_cfg(),
+        )
+        controller_a.begin(ctx)
+
+        with self.assertRaisesRegex(
+            ConcurrencyError,
+            "Policy scope trajectory changed between evaluation and reservation",
+        ):
+            controller_a.execute(
+                action(sensitive=False),
+                ctx,
+                lambda _p: calls_a.append("a") or "a-done",
+            )
+
+        self.assertEqual(calls_a, [])
+        self.assertEqual(calls_b, ["b"])
+        self.assertEqual(len(calls_a) + len(calls_b), 1)
+        self.assertEqual(controller_a.state, "active")
+
+        # Retrying on controller_a sees the updated trajectory, blocks cleanly, and uses action_index=1 (no gap)
+        retry = controller_a.execute(
+            action(sensitive=False),
+            ctx,
+            lambda _p: calls_a.append("a-retry") or "a-retry",
+        )
+        self.assertFalse(retry.executed)
+        self.assertEqual(retry.decision.decision, "block")
+        self.assertEqual([v.rule for v in retry.decision.violations], ["single-effect"])
+        self.assertEqual(calls_a, [])
+        runtime_events = [ev for ev in recorded_a if ev.phase == "runtime"]
+        self.assertEqual(len(runtime_events), 1)
+        self.assertEqual(runtime_events[0].action_index, 1)
+
+    def test_multithread_barrier_concurrent_controllers_at_most_one_executes(self):
+        catalog = RuleCatalog(
+            rule_types={
+                "custom.single_effect": RuleTypeSpec(
+                    allowed_phases=frozenset({"runtime"}),
+                    params_model=EmptyRuleParams,
+                    handler=lambda req, _params: (
+                        req.trajectory is not None and len(req.trajectory.effects) > 0
+                    ),
+                )
+            }
+        )
+        base_v3 = v3_contract()
+        draft = ContractRulesV3.model_validate({
+            **base_v3.model_dump(mode="json"),
+            "rules": [
+                {
+                    "instance_id": "declared-tools",
+                    "rule_type": "tool.declared_only",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "single-effect",
+                    "rule_type": "custom.single_effect",
+                    "phases": ["runtime"],
+                },
+                {
+                    "instance_id": "response-schema",
+                    "rule_type": "response.schema_complete",
+                    "phases": ["post_execution"],
+                },
+            ],
+            "contract_fingerprint": "sha256:placeholder",
+        })
+        single_v3 = draft.model_copy(
+            update={
+                "contract_fingerprint": compute_v3_contract_fingerprint(
+                    draft, rule_catalog=catalog
+                )
+            }
+        )
+        ctx = _v3_context(single_v3)
+        store = InMemoryEffectStore()
+        barrier = threading.Barrier(2, timeout=5.0)
+        base_gov = Governor(rule_catalog=catalog)
+
+        class BarrierEvaluator:
+            def evaluate(self, request: GovernorInput) -> GovernanceDecision:
+                decision = base_gov.evaluate(request)
+                if request.phase == "runtime":
+                    barrier.wait()
+                return decision
+
+        invocations: list[str] = []
+        inv_lock = threading.Lock()
+        outcomes: list[tuple[str, str]] = []
+        controllers: list[WorkflowController] = []
+
+        for label in ("t1", "t2"):
+            c = WorkflowController(
+                Governor(evaluator=BarrierEvaluator()),
+                f"run-{label}",
+                single_v3,
+                policy=EnforcementPolicy(mode="guarded"),
+                effect_governance=EffectGovernanceConfig(
+                    store=store,
+                    resolver=_CallbackResolver(
+                        lambda proposal, c_ctx: ResolvedAction(
+                            planned_effect=PlannedEffect(tool_name=proposal.tool_name),
+                            host_facts=HostFacts(facts=dict(c_ctx.state)),
+                        )
+                    ),
+                    observer=_CallbackObserver(
+                        lambda _in, _res: ObservedEffect(status="confirmed", evidence_ref="ok")
+                    ),
+                    policy_scope="scope.barrier",
+                ),
+            )
+            c.begin(ctx)
+            controllers.append(c)
+
+        def worker(label: str, ctrl: WorkflowController) -> None:
+            try:
+                out = ctrl.execute(
+                    action(sensitive=False),
+                    ctx,
+                    lambda _p: (inv_lock.acquire(), invocations.append(label), inv_lock.release()) and label,
+                )
+                assert out.executed and out.effect is not None
+                with inv_lock:
+                    outcomes.append((label, "executed"))
+            except ConcurrencyError:
+                with inv_lock:
+                    outcomes.append((label, "concurrency_error"))
+
+        threads = [
+            threading.Thread(target=worker, args=(lbl, ctrl))
+            for lbl, ctrl in zip(("t1", "t2"), controllers)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            self.assertFalse(t.is_alive())
+
+        statuses = sorted(status for _, status in outcomes)
+        self.assertEqual(statuses, ["concurrency_error", "executed"])
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(len(store.snapshot("scope.barrier").effects), 1)
+        self.assertTrue(all(ctrl.state == "active" for ctrl in controllers))
 
 
 if __name__ == "__main__":
