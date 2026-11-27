@@ -9,6 +9,7 @@ from copy import deepcopy
 from vogtcon import (
     AgentContract, DeterministicEvaluator, GovernanceDecision, Governor, GovernorInput,
 )
+from vogtcon.models import HostFacts, PlannedEffect
 
 
 TOOLS = ["search_policy", "create_ticket", "approve_request", "store_memory", "send_notification"]
@@ -241,6 +242,55 @@ class EvaluationTests(unittest.TestCase):
         stub = Stub()
         self.assertIs(Governor(stub).evaluate(request), result)
         self.assertIs(stub.seen, request)
+
+    def test_legacy_decisions_unchanged_with_agreeing_host_facts_and_planned_effect(self):
+        evaluator = DeterministicEvaluator()
+        for use_v2 in (False, True):
+            for mode in ("no_contract", "advisory", "guarded", "strict"):
+                for phase in ("pre_execution", "runtime", "post_execution"):
+                    with self.subTest(v2=use_v2, mode=mode, phase=phase):
+                        baseline_data = request_data(phase=phase, mode=mode)
+                        if use_v2:
+                            v2 = contract_data("guarded")
+                            v2.pop("mode")
+                            v2.pop("agent_feedback")
+                            v2["schema_version"] = 2
+                            v2["metadata"] = {}
+                            baseline_data["contract"] = v2
+                            baseline_data["policy"] = {"mode": mode}
+                        if phase == "runtime":
+                            baseline_data["context"]["state"] = {"user_role": "employee"}
+                            baseline_data["action"] = {
+                                "tool_name": "approve_request",
+                                "arguments": {"user_role": "admin", "approval_granted": True},
+                            }
+
+                        enriched_data = deepcopy(baseline_data)
+                        enriched_data["host_facts"] = HostFacts(
+                            facts={
+                                **deepcopy(baseline_data["context"]["state"]),
+                                "host_only_fact": "verified",
+                            }
+                        )
+                        if phase == "runtime":
+                            enriched_data["planned_effect"] = PlannedEffect(
+                                tool_name="approve_request",
+                                parameters={"request_id": "req-1"},
+                                defaults={"notify": False},
+                            )
+
+                        baseline_decision = evaluator.evaluate(
+                            GovernorInput.model_validate(baseline_data)
+                        )
+                        enriched_decision = evaluator.evaluate(
+                            GovernorInput.model_validate(enriched_data)
+                        )
+                        self.assertEqual(enriched_decision, baseline_decision)
+                        if phase == "runtime" and mode != "no_contract":
+                            self.assertEqual(
+                                [v.rule for v in enriched_decision.violations],
+                                ["authorization.role_required"],
+                            )
 
 
 if __name__ == "__main__":

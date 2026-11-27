@@ -136,7 +136,7 @@ class ContractLoadingTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     self.load(json.dumps(data))
         data = v2_contract()
-        data["schema_version"] = 3
+        data["schema_version"] = 4
         with self.assertRaisesRegex(ValueError, "schema_version"):
             self.load(json.dumps(data))
 

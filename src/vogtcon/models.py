@@ -11,10 +11,11 @@ checks; never compute a historical fingerprint from a model_dump().
 
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
@@ -22,7 +23,43 @@ Mode = Literal["no_contract", "advisory", "guarded", "strict"]
 Phase = Literal["pre_execution", "runtime", "post_execution"]
 Decision = Literal["allow", "allow_with_warning", "block", "abort"]
 NonEmptyString = Annotated[str, Field(min_length=1)]
+InstanceId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
 JsonObject = dict[str, JsonValue]
+
+OPERATION_IDENTITY_VERSION: Final[int] = 1
+OPERATION_DIGEST_EXCLUDED_METADATA: Final[tuple[str, ...]] = (
+    "run_id",
+    "iteration",
+    "policy_mode",
+    "contract_fingerprint",
+    "agent_fingerprint",
+    "approval_id",
+    "approver_id",
+    "requester_id",
+    "approval_issued_at",
+    "approval_expires_at",
+    "approval_scope",
+    "trace_id",
+    "span_id",
+    "host_facts",
+)
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def _canonical_sha256(value: object) -> str:
+    return f"sha256:{hashlib.sha256(_canonical_json(value).encode('utf-8')).hexdigest()}"
 
 
 class _Model(BaseModel):
@@ -98,6 +135,66 @@ class EnforcementPolicy(_Model):
     mode: Mode
 
 
+class RuleBinding(_Model):
+    """Parameterized rule instance bound to one or more validation phases."""
+
+    instance_id: InstanceId
+    rule_type: NonEmptyString
+    phases: list[Phase]
+    params: JsonObject = Field(default_factory=dict)
+
+    @field_validator("phases")
+    @classmethod
+    def check_phases(cls, value: list[Phase]) -> list[Phase]:
+        if not value:
+            raise ValueError("RuleBinding phases must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("RuleBinding phases must not contain duplicates")
+        return value
+
+
+class ContractRulesV3(_Model):
+    """Mode-independent v3 contract with parameterized rule bindings."""
+
+    schema_version: Literal[3]
+    contract_id: NonEmptyString
+    approved_agent_configurations: list[
+        NonEmptyString | ApprovedAgentConfiguration
+    ]
+    declared_tools: list[NonEmptyString]
+    response_schema: ResponseSchema
+    memory_policy: NonEmptyString
+    validation_phases: list[Phase]
+    rules: list[RuleBinding]
+    contract_fingerprint: NonEmptyString
+    metadata: JsonObject = Field(default_factory=dict)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def check_strict_int_schema_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be integer 3")
+        return value
+
+    @model_validator(mode="after")
+    def check_unique_instance_ids(self) -> Self:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for binding in self.rules:
+            if binding.instance_id in seen:
+                duplicates.add(binding.instance_id)
+            else:
+                seen.add(binding.instance_id)
+        if duplicates:
+            raise ValueError(
+                f"Duplicate rule instance_id(s): {', '.join(sorted(duplicates))}"
+            )
+        return self
+
+
+ContractSchema: TypeAlias = AgentContract | ContractRulesV2 | ContractRulesV3
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ContractDocument:
     """Keep original JSON data separate from the typed contract.
@@ -107,15 +204,17 @@ class ContractDocument:
     ordering, duplicates, and omitted keys are preserved independently of the model.
     """
 
-    contract: AgentContract | ContractRulesV2
+    contract: ContractSchema
     _original_json: str = field(repr=False)
 
     def __init__(self, document: JsonObject) -> None:
         snapshot = deepcopy(document)
         if "schema_version" not in snapshot:
-            contract = AgentContract.model_validate(snapshot)
+            contract: ContractSchema = AgentContract.model_validate(snapshot)
         elif type(snapshot["schema_version"]) is int and snapshot["schema_version"] == 2:
             contract = ContractRulesV2.model_validate(snapshot)
+        elif type(snapshot["schema_version"]) is int and snapshot["schema_version"] == 3:
+            contract = ContractRulesV3.model_validate(snapshot)
         else:
             raise ValueError("Unsupported contract schema_version")
         original_json = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
@@ -132,6 +231,44 @@ class ActionProposal(_Model):
     tool_name: NonEmptyString
     arguments: JsonObject = Field(default_factory=dict)
     iteration: Annotated[int, Field(ge=1)] | None = None
+
+
+class HostFacts(_Model):
+    """Host-supplied facts, separate from untrusted agent action proposals.
+
+    Schema validation checks structure only and does not prove provenance; the
+    host remains responsible for sourcing trustworthy facts.
+    """
+
+    facts: JsonObject = Field(default_factory=dict)
+
+
+class PlannedEffect(_Model):
+    """Host-resolved planned effect, separate from ActionProposal.
+
+    Canonical operation identity derives solely from ``tool_name`` and
+    ``effective_parameters`` (a top-level overlay where explicit ``parameters``,
+    including explicit ``None``, replace ``defaults`` keys as whole values).
+    """
+
+    tool_name: NonEmptyString
+    parameters: JsonObject = Field(default_factory=dict)
+    defaults: JsonObject = Field(default_factory=dict)
+
+    @property
+    def effective_parameters(self) -> JsonObject:
+        return {**deepcopy(self.defaults), **deepcopy(self.parameters)}
+
+    def canonical_operation(self) -> JsonObject:
+        return {
+            "identity": "vogtcon.operation",
+            "version": OPERATION_IDENTITY_VERSION,
+            "tool_name": self.tool_name,
+            "parameters": self.effective_parameters,
+        }
+
+    def operation_digest(self) -> str:
+        return _canonical_sha256(self.canonical_operation())
 
 
 class ExecutionContext(_Model):
@@ -157,6 +294,8 @@ oracle. V2 rules require a separate ``policy``; a legacy contract retains its
 embedded mode. IDs are supplied by the runtime and are not proof of authorization.
 """
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     run_id: NonEmptyString
     contract: AgentContract | ContractRulesV2
     phase: Phase
@@ -165,6 +304,8 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
     response: JsonObject | None = None
     run_ledger: JsonObject | None = None
     policy: EnforcementPolicy | None = Field(default=None, exclude_if=lambda value: value is None)
+    host_facts: HostFacts | None = Field(default=None, exclude_if=lambda value: value is None)
+    planned_effect: PlannedEffect | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("contract", mode="before")
     @classmethod
@@ -175,11 +316,19 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
             return value
         if isinstance(value, ContractRulesV2):
             return value
+        if isinstance(value, ContractRulesV3):
+            raise ValueError(
+                "v3 contracts are not yet executable; runtime evaluation is introduced in Stage 2"
+            )
         if isinstance(value, dict):
             if "schema_version" not in value:
                 return AgentContract.model_validate(value)
             if type(value["schema_version"]) is int and value["schema_version"] == 2:
                 return ContractRulesV2.model_validate(value)
+            if type(value["schema_version"]) is int and value["schema_version"] == 3:
+                raise ValueError(
+                    "v3 contracts are not yet executable; runtime evaluation is introduced in Stage 2"
+                )
             raise ValueError("Unsupported contract schema_version")
         raise ValueError("contract must be a v1 or v2 contract")
 
@@ -201,8 +350,17 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
         if self.phase == "runtime":
             if self.action is None:
                 raise ValueError("runtime evaluation requires an action")
-        elif self.action is not None:
-            raise ValueError("action is only accepted for runtime evaluation")
+            if (
+                self.planned_effect is not None
+                and self.action is not None
+                and self.planned_effect.tool_name != self.action.tool_name
+            ):
+                raise ValueError("planned_effect.tool_name conflicts with action.tool_name")
+        else:
+            if self.action is not None:
+                raise ValueError("action is only accepted for runtime evaluation")
+            if self.planned_effect is not None:
+                raise ValueError("planned_effect is only accepted for runtime evaluation")
         if self.phase == "pre_execution":
             if (
                 self.context.observed_agent_fingerprint is None
@@ -214,6 +372,17 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
                 raise ValueError("post-execution evaluation requires a response mapping")
         elif self.response is not None or self.run_ledger is not None:
             raise ValueError("response and run_ledger are only accepted after execution")
+        if self.host_facts is not None:
+            conflicts = [
+                key
+                for key in sorted(set(self.context.state) & set(self.host_facts.facts))
+                if _canonical_json(self.context.state[key])
+                != _canonical_json(self.host_facts.facts[key])
+            ]
+            if conflicts:
+                raise ValueError(
+                    f"host_facts conflicts with context.state for key(s): {', '.join(conflicts)}"
+                )
         return self
 
 
