@@ -439,6 +439,157 @@ class ConcurrencyRejectionTests(unittest.TestCase):
             release_lock.set()
             holder.join(timeout=5.0)
 
+    def test_reserve_expected_last_sequence_atomic_cas_and_scope_isolation(
+        self,
+    ) -> None:
+        store = InMemoryEffectStore()
+
+        for bad_seq in (-1, -100, True, False, "0", 1.5):
+            with self.subTest(bad_seq=repr(bad_seq)):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "expected_last_sequence must be a non-negative integer",
+                ):
+                    store.reserve(
+                        run_id="run-1",
+                        policy_scope="scope.a",
+                        action_index=1,
+                        tool_name="transfer_funds",
+                        operation_digest=_sample_digest("1"),
+                        expected_last_sequence=bad_seq,  # type: ignore[arg-type]
+                    )
+
+        # Non-zero expected_last_sequence fails on empty scope without mutating store
+        with self.assertRaisesRegex(
+            ConcurrencyError,
+            "Policy scope trajectory changed between evaluation and reservation",
+        ):
+            store.reserve(
+                run_id="run-1",
+                policy_scope="scope.a",
+                action_index=1,
+                tool_name="transfer_funds",
+                operation_digest=_sample_digest("1"),
+                expected_last_sequence=1,
+            )
+        self.assertEqual(store.snapshot("scope.a").entries, ())
+
+        # expected_last_sequence=0 succeeds on empty scope.a (creates sequence 1)
+        res1 = store.reserve(
+            run_id="run-1",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="transfer_funds",
+            operation_digest=_sample_digest("1"),
+            expected_last_sequence=0,
+        )
+        self.assertEqual(res1.effect_id, "eff-000001")
+        # Observation creates sequence 2 in scope.a
+        store.record_observation(
+            effect_id=res1.effect_id,
+            status="confirmed",
+            evidence_ref="tx-1",
+        )
+        self.assertEqual(store.snapshot("scope.a").entries[-1].sequence, 2)
+
+        # Stale expected_last_sequence=0 (or 1) fails without mutating store
+        for stale_seq in (0, 1, 99):
+            with self.subTest(stale_seq=stale_seq):
+                with self.assertRaisesRegex(
+                    ConcurrencyError,
+                    "Policy scope trajectory changed between evaluation and reservation",
+                ):
+                    store.reserve(
+                        run_id="run-2",
+                        policy_scope="scope.a",
+                        action_index=1,
+                        tool_name="transfer_funds",
+                        operation_digest=_sample_digest("2"),
+                        expected_last_sequence=stale_seq,
+                    )
+        self.assertEqual(len(store.snapshot("scope.a").entries), 2)
+        self.assertEqual(len(store.snapshot("scope.a").effects), 1)
+
+        # Activity in scope.b (sequences 3 and 4) does NOT invalidate scope.a's last sequence (2)
+        res_b = store.reserve(
+            run_id="run-b",
+            policy_scope="scope.b",
+            action_index=1,
+            tool_name="transfer_funds",
+            operation_digest=_sample_digest("b"),
+            expected_last_sequence=0,
+        )
+        store.record_observation(
+            effect_id=res_b.effect_id,
+            status="confirmed",
+            evidence_ref="tx-b",
+        )
+        self.assertEqual(store.snapshot("scope.b").entries[-1].sequence, 4)
+
+        # Matching expected_last_sequence=2 for scope.a succeeds (creates sequence 5, then 6 on observe)
+        res2 = store.reserve(
+            run_id="run-2",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="transfer_funds",
+            operation_digest=_sample_digest("2"),
+            expected_last_sequence=2,
+        )
+        self.assertEqual(res2.effect_id, "eff-000003")
+        store.record_observation(
+            effect_id=res2.effect_id,
+            status="uncertain",
+            evidence_ref="timeout-2",
+        )
+        # Reconciliation creates sequence 7 in scope.a
+        store.reconcile(
+            ReconciliationRecord(
+                effect_id=res2.effect_id,
+                resolved_status="confirmed",
+                evidence_ref="reconciled-2",
+                policy_scope="scope.a",
+            )
+        )
+        with self.assertRaises(ConcurrencyError):
+            store.reserve(
+                run_id="run-3",
+                policy_scope="scope.a",
+                action_index=1,
+                tool_name="transfer_funds",
+                operation_digest=_sample_digest("3"),
+                expected_last_sequence=6,
+            )
+
+        # Compensation creates sequence 8 in scope.a
+        store.record_compensation(
+            run_id="run-3",
+            compensation=CompensationRecord(
+                compensates_effect_id=res2.effect_id,
+                tool_name="refund_funds",
+                operation_digest=_sample_digest("c"),
+                evidence_ref="comp-2",
+                policy_scope="scope.a",
+            ),
+        )
+        with self.assertRaises(ConcurrencyError):
+            store.reserve(
+                run_id="run-3",
+                policy_scope="scope.a",
+                action_index=1,
+                tool_name="transfer_funds",
+                operation_digest=_sample_digest("3"),
+                expected_last_sequence=7,
+            )
+        res3 = store.reserve(
+            run_id="run-3",
+            policy_scope="scope.a",
+            action_index=1,
+            tool_name="transfer_funds",
+            operation_digest=_sample_digest("3"),
+            expected_last_sequence=8,
+        )
+        self.assertEqual(res3.effect_id, "eff-000005")
+
 
 class SharedScopeTests(unittest.TestCase):
     def test_cross_run_scope_continuity_and_scope_isolation(self) -> None:

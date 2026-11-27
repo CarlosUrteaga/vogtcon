@@ -311,6 +311,7 @@ class EffectStore(Protocol):
         tool_name: str,
         operation_digest: str,
         metadata: JsonObject | FrozenJsonObject | None = None,
+        expected_last_sequence: int | None = None,
     ) -> EffectRecord: ...
 
     def record_observation(
@@ -448,8 +449,16 @@ class InMemoryEffectStore:
         tool_name: str,
         operation_digest: str,
         metadata: JsonObject | FrozenJsonObject | None = None,
+        expected_last_sequence: int | None = None,
     ) -> EffectRecord:
         _validate_policy_scope_id(policy_scope)
+        if expected_last_sequence is not None and (
+            type(expected_last_sequence) is not int
+            or expected_last_sequence < 0
+        ):
+            raise ValueError(
+                "expected_last_sequence must be a non-negative integer"
+            )
         with self._acquire_lock():
             uncertain_ids = self._uncertain_effects_unlocked(policy_scope)
             if uncertain_ids:
@@ -462,6 +471,19 @@ class InMemoryEffectStore:
                 raise ConcurrencyError(
                     f"Policy scope {policy_scope!r} already has an active reserved effect '{active_id}'"
                 )
+            if expected_last_sequence is not None:
+                current_last_sequence = max(
+                    (
+                        entry.sequence
+                        for entry in self._entries
+                        if entry.policy_scope == policy_scope
+                    ),
+                    default=0,
+                )
+                if current_last_sequence != expected_last_sequence:
+                    raise ConcurrencyError(
+                        "Policy scope trajectory changed between evaluation and reservation"
+                    )
             candidate_id = f"eff-{self._next_effect_num + 1:06d}"
             candidate_seq = len(self._entries) + 1
             thawed_meta = (
