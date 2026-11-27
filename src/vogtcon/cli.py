@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from .cli_trace import analyze_log_file
 from .contracts import _UnsupportedContractRules, load_contract
-from .models import ContractRulesV2
+from .models import ContractRulesV2, ContractRulesV3
 
 EXIT_VALID = 0
 EXIT_INVALID = 1
@@ -76,6 +76,34 @@ def validate_contract_file(contract_path: str | Path) -> tuple[int, dict[str, An
             contract_path, "invalid_contract", diagnostic=("invalid_contract", message),
         )
 
+    if isinstance(contract, ContractRulesV3):
+        return EXIT_VALID, _validation_result(contract_path, "valid", data={
+            "contract_id": contract.contract_id,
+            "contract_version": 3,
+            "mode": None,
+            "validation_phases": contract.validation_phases,
+            "fingerprint": {"value": contract.contract_fingerprint, "verified": True},
+            "declared_tools": contract.declared_tools,
+            "runtime_rules": [
+                binding.rule_type
+                for binding in contract.rules
+                if "runtime" in binding.phases
+            ],
+            "postconditions": [
+                binding.rule_type
+                for binding in contract.rules
+                if "post_execution" in binding.phases
+            ],
+            "rules": [
+                {
+                    "instance_id": binding.instance_id,
+                    "rule_type": binding.rule_type,
+                    "phases": list(binding.phases),
+                }
+                for binding in contract.rules
+            ],
+        })
+
     is_v2 = isinstance(contract, ContractRulesV2)
     return EXIT_VALID, _validation_result(contract_path, "valid", data={
         "contract_id": contract.contract_id,
@@ -97,7 +125,7 @@ def render_validate_text(code: int, result: dict[str, Any]) -> str:
         phase_text = ", ".join(phases) if isinstance(phases, list) else phases
         fingerprint = data["fingerprint"]
         verification = "verified" if fingerprint["verified"] else "not verified"
-        return "\n".join([
+        lines = [
             "✓ Contract is valid",
             f"  Path:           {path}",
             f"  Contract ID:    {data['contract_id']}",
@@ -107,7 +135,14 @@ def render_validate_text(code: int, result: dict[str, Any]) -> str:
             f"  Runtime Rules:  {', '.join(data['runtime_rules'])}",
             f"  Postconditions: {', '.join(data['postconditions'])}",
             f"  Declared Tools: {', '.join(data['declared_tools'])}",
-        ])
+        ]
+        if "rules" in data:
+            bindings = ", ".join(
+                f"{item['instance_id']} ({item['rule_type']})"
+                for item in data["rules"]
+            )
+            lines.append(f"  Rule Bindings:  {bindings}")
+        return "\n".join(lines)
     message = result["diagnostics"][0]["message"]
     if code == EXIT_UNSUPPORTED_RULES:
         return "\n".join([
@@ -251,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_p = subparsers.add_parser(
         "validate",
-        help="Validate a contract document (v1 or v2).",
+        help="Validate a contract document (v1, v2, or v3).",
     )
     validate_p.add_argument(
         "contract_path",

@@ -1032,5 +1032,78 @@ remain independent of that checkout and of any developer-specific path.
         self.check_contract("strict")
 
 
+class PublicApiTests(unittest.TestCase):
+    def test_v041_and_stage1_exports_are_available_and_listed_in_all(self):
+        import vogtcon
+        from vogtcon import contracts, models, rules
+
+        historical_exports = (
+            "load_contract",
+            "DeterministicEvaluator",
+            "Governor",
+            "GovernorEvaluator",
+            "GovernedToolExecutor",
+            "ToolExecutionOutcome",
+            "WorkflowController",
+            "RuleCatalog",
+            "DEFAULT_RULE_CATALOG",
+            "JsonlDecisionLog",
+            "RunEvent",
+            "RunRecorder",
+            "TelemetryObserver",
+            "ActionProposal",
+            "AgentContract",
+            "ContractDocument",
+            "ContractRulesV2",
+            "EnforcementPolicy",
+            "ExecutionContext",
+            "GovernanceDecision",
+            "GovernorInput",
+            "Violation",
+        )
+        stage1_exports = (
+            "compute_v3_contract_fingerprint",
+            "ContractRulesV3",
+            "HostFacts",
+            "OPERATION_DIGEST_EXCLUDED_METADATA",
+            "OPERATION_IDENTITY_VERSION",
+            "PlannedEffect",
+            "RuleBinding",
+            "DEFAULT_RULE_TYPES",
+            "EmptyRuleParams",
+            "RuleTypeSpec",
+        )
+
+        self.assertEqual(len(historical_exports), 22)
+        self.assertEqual(len(stage1_exports), 10)
+        self.assertEqual(len(vogtcon.__all__), 32)
+        self.assertEqual(len(set(vogtcon.__all__)), 32)
+        self.assertEqual(
+            set(vogtcon.__all__),
+            set(historical_exports) | set(stage1_exports),
+        )
+
+        for name in historical_exports + stage1_exports:
+            with self.subTest(symbol=name):
+                self.assertIn(name, vogtcon.__all__)
+                self.assertTrue(hasattr(vogtcon, name))
+
+        self.assertIs(
+            vogtcon.compute_v3_contract_fingerprint,
+            contracts.compute_v3_contract_fingerprint,
+        )
+        for name in (
+            "ContractRulesV3",
+            "HostFacts",
+            "OPERATION_DIGEST_EXCLUDED_METADATA",
+            "OPERATION_IDENTITY_VERSION",
+            "PlannedEffect",
+            "RuleBinding",
+        ):
+            self.assertIs(getattr(vogtcon, name), getattr(models, name))
+        for name in ("DEFAULT_RULE_TYPES", "EmptyRuleParams", "RuleTypeSpec"):
+            self.assertIs(getattr(vogtcon, name), getattr(rules, name))
+
+
 if __name__ == "__main__":
     unittest.main()

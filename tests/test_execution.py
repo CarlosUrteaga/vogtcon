@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from vogtcon import (
     ActionProposal,
     AgentContract,
     ContractRulesV2,
+    ContractRulesV3,
     EnforcementPolicy,
     ExecutionContext,
     GovernedToolExecutor,
@@ -17,8 +20,10 @@ from vogtcon import (
     GovernorInput,
     GovernanceDecision,
     RuleCatalog,
+    RunEvent,
     Violation,
     WorkflowController,
+    compute_v3_contract_fingerprint,
 )
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
@@ -49,6 +54,33 @@ def v2_contract() -> ContractRulesV2:
     data.pop("agent_feedback")
     data["schema_version"] = 2
     return ContractRulesV2.model_validate(data)
+
+
+def v3_contract() -> ContractRulesV3:
+    draft = ContractRulesV3.model_validate({
+        "schema_version": 3,
+        "contract_id": "test.notify.v3",
+        "approved_agent_configurations": ["agent-v1"],
+        "declared_tools": ["send_notification"],
+        "response_schema": {"required_fields": ["status"]},
+        "memory_policy": "none",
+        "validation_phases": ["pre_execution", "runtime", "post_execution"],
+        "rules": [
+            {
+                "instance_id": "declared-tools",
+                "rule_type": "tool.declared_only",
+                "phases": ["runtime"],
+            },
+            {
+                "instance_id": "response-schema",
+                "rule_type": "response.schema_complete",
+                "phases": ["post_execution"],
+            },
+        ],
+        "contract_fingerprint": "sha256:placeholder",
+    })
+    fingerprint = compute_v3_contract_fingerprint(draft)
+    return draft.model_copy(update={"contract_fingerprint": fingerprint})
 
 
 def context(*, approval: bool = False, agent_fp: str = "agent-v1") -> ExecutionContext:
@@ -376,6 +408,48 @@ class ControllerTests(unittest.TestCase):
             controller.execute(action(), context(), lambda _a: effects.append("sent"))
         self.assertEqual(controller.state, "aborted")
         self.assertEqual(effects, [])
+
+    def test_v3_contracts_are_not_executable(self):
+        recorded: list[RunEvent] = []
+        effects: list[str] = []
+
+        class ListRecorder:
+            def record(self, event: RunEvent) -> None:
+                recorded.append(event)
+
+        def tool_callable(_proposal: ActionProposal) -> str:
+            effects.append("sent")
+            return "sent"
+
+        v3 = v3_contract()
+        recorder = ListRecorder()
+
+        with self.assertRaisesRegex(ValueError, "v3 contracts are not yet executable"):
+            WorkflowController(
+                Governor(),
+                "run-v3",
+                v3,
+                recorder=recorder,
+                policy=EnforcementPolicy(mode="guarded"),
+            )
+
+        with self.assertRaisesRegex(ValueError, "v3 contracts are not yet executable"):
+            WorkflowController(Governor(), "run-v3-no-policy", v3, recorder=recorder)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            v3_path = Path(tmpdir) / "contract_v3.json"
+            v3_path.write_text(json.dumps(v3.model_dump(mode="json")), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "v3 contracts are not yet executable"):
+                WorkflowController.from_contract_path(
+                    v3_path,
+                    "run-v3-path",
+                    policy=EnforcementPolicy(mode="guarded"),
+                    recorder=recorder,
+                )
+
+        self.assertEqual(recorded, [])
+        self.assertEqual(effects, [])
+        self.assertTrue(callable(tool_callable))
 
 
 if __name__ == "__main__":
