@@ -44,6 +44,21 @@ def classify_notification_sensitivity(recipient: str, channel: str = "email") ->
     return normalized_recipient in SENSITIVE_RECIPIENTS or normalized_channel == "pager"
 
 
+def normalize_notification_params(arguments: dict[str, Any]) -> tuple[str, str, str]:
+    """Normalize recipient, message, and channel consistently for resolution and delivery."""
+    raw_recipient = arguments.get("recipient")
+    recipient = raw_recipient.strip().lower() if isinstance(raw_recipient, str) else ""
+    raw_message = arguments.get("message")
+    message = str(raw_message) if raw_message is not None else ""
+    raw_channel = arguments.get("channel")
+    channel = (
+        raw_channel.strip().lower()
+        if isinstance(raw_channel, str) and raw_channel.strip()
+        else "email"
+    )
+    return recipient, message, channel
+
+
 @dataclass
 class InMemoryNotificationV3Tool:
     """Local deterministic sink simulating an external notification gateway."""
@@ -51,9 +66,7 @@ class InMemoryNotificationV3Tool:
     deliveries: list[dict[str, str]] = field(default_factory=list)
 
     def send(self, proposal: ActionProposal) -> dict[str, str]:
-        recipient = str(proposal.arguments.get("recipient", "")).strip().lower()
-        channel = str(proposal.arguments.get("channel", "email")).strip().lower()
-        message = str(proposal.arguments.get("message", ""))
+        recipient, message, channel = normalize_notification_params(proposal.arguments)
         receipt_id = f"notif-{len(self.deliveries) + 1:04d}"
         record = {
             "receipt_id": receipt_id,
@@ -84,22 +97,11 @@ class NotificationResolver:
     def resolve(
         self, action: ActionProposal, context: ExecutionContext
     ) -> ResolvedAction:
-        raw_recipient = action.arguments.get("recipient")
-        recipient = (
-            raw_recipient.strip().lower()
-            if isinstance(raw_recipient, str)
-            else ""
-        )
-        raw_channel = action.arguments.get("channel")
-        channel = (
-            raw_channel.strip().lower()
-            if isinstance(raw_channel, str) and raw_channel.strip()
-            else "email"
-        )
+        recipient, message, channel = normalize_notification_params(action.arguments)
         # Sensitivity is strictly host-classified; action.arguments["sensitive"] is ignored.
         sensitive = classify_notification_sensitivity(recipient, channel)
-        parameters: dict[str, Any] = {"recipient": recipient}
-        if isinstance(raw_channel, str) and raw_channel.strip():
+        parameters: dict[str, Any] = {"recipient": recipient, "message": message}
+        if channel != "email":
             parameters["channel"] = channel
         planned_effect = PlannedEffect(
             tool_name=action.tool_name,
