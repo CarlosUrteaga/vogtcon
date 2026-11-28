@@ -347,13 +347,13 @@ class WorkflowController:
     def contract(self) -> ContractSchema:
         return self._contract.model_copy(deep=True)
 
-    def _allow_approval_retry_after_absent(
+    def _approval_binding_policy(
         self,
         tool_name: str,
         host_facts: HostFacts | None,
-    ) -> bool:
-        if not isinstance(self._contract, ContractRulesV3):
-            return False
+    ) -> tuple[bool, bool]:
+        if not isinstance(self._contract, ContractRulesV3) or self._mode == "no_contract":
+            return False, False
         matching_flags: list[bool] = []
         for binding in self._contract.rules:
             if (
@@ -371,7 +371,8 @@ class WorkflowController:
             ):
                 continue
             matching_flags.append(params.allow_retry_after_confirmed_absent)
-        return bool(matching_flags) and all(matching_flags)
+        requires_approval = bool(matching_flags)
+        return requires_approval, requires_approval and all(matching_flags)
 
     def _request(
         self,
@@ -488,9 +489,15 @@ class WorkflowController:
             if self._state != "active":
                 raise RuntimeError("Run is not active")
 
+            action_snapshot = action.model_copy(deep=True)
+            context_snapshot = context.model_copy(deep=True)
+
             # Stage 1: Resolution
             try:
-                resolved = cfg.resolver.resolve(action, context)
+                resolved = cfg.resolver.resolve(
+                    action_snapshot.model_copy(deep=True),
+                    context_snapshot.model_copy(deep=True),
+                )
             except ConcurrencyError:
                 raise
             except Exception:
@@ -529,8 +536,8 @@ class WorkflowController:
             try:
                 request = self._request(
                     "runtime",
-                    context,
-                    action=action,
+                    context_snapshot.model_copy(deep=True),
+                    action=action_snapshot.model_copy(deep=True),
                     host_facts=resolved.host_facts,
                     planned_effect=resolved.planned_effect,
                     policy_scope=effective_scope,
@@ -596,19 +603,22 @@ class WorkflowController:
 
             # Stage 3: Reservation
             next_action_index = self._action_index + 1
+            requires_approval, allow_retry_after_absent = self._approval_binding_policy(
+                tool_name, resolved.host_facts
+            )
             has_approval_violation = any(
                 v.rule_type == "approval.bound_required" for v in decision.violations
             )
             reserve_kwargs: dict[str, object] = {}
-            if resolved.approval is not None and not (
-                decision.decision == "allow_with_warning" and has_approval_violation
+            if (
+                requires_approval
+                and resolved.approval is not None
+                and not (decision.decision == "allow_with_warning" and has_approval_violation)
             ):
                 reserve_kwargs = {
                     "approval_id": resolved.approval.approval_id,
                     "approval_single_use": resolved.approval.single_use,
-                    "allow_retry_after_confirmed_absent": self._allow_approval_retry_after_absent(
-                        tool_name, resolved.host_facts
-                    ),
+                    "allow_retry_after_confirmed_absent": allow_retry_after_absent,
                 }
             try:
                 reserved = cfg.store.reserve(
@@ -655,7 +665,6 @@ class WorkflowController:
                 raise
 
             # Stage 5: Invocation + Stage 6: Observation
-            assert request.action is not None
             tool_span = self._telemetry.span(
                 "governor.tool.execute",
                 phase="runtime",
@@ -666,7 +675,7 @@ class WorkflowController:
             ) if self._telemetry is not None else nullcontext(None)
             with tool_span:
                 try:
-                    result = tool(request.action)
+                    result = tool(action_snapshot.model_copy(deep=True))
                 except Exception as tool_exc:
                     obs_in = ObservationInput(
                         effect_id=reserved.effect_id,

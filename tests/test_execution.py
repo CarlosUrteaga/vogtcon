@@ -2536,6 +2536,176 @@ class BoundAuthorizationExecutionTests(unittest.TestCase):
             "consumed",
         )
 
+    def test_proposal_snapshot_before_resolution_prevents_caller_and_resolver_mutation_redirect(self):
+        v3 = self._auth_v3_contract()
+        ctx = _v3_context(v3, state={})
+        planned = self._planned(recipient="alerts@example.com")
+        appr = self._approval(planned, approval_id="appr-snap-1")
+        caller_proposal = ActionProposal(
+            tool_name="send_notification",
+            arguments={"recipient": "alerts@example.com", "evidence_ids": ["ev-001"]},
+        )
+        observed_recipients: list[object] = []
+
+        def mutating_resolve(
+            arg_proposal: ActionProposal, arg_ctx: ExecutionContext
+        ) -> ResolvedAction:
+            resolved = ResolvedAction(
+                planned_effect=planned,
+                host_facts=HostFacts(facts={"sensitive": True}),
+                policy_scope="scope.auth",
+                requester_id="req-1",
+                evaluated_at="2026-06-01T10:30:00Z",
+                approval=appr,
+                retrieved_evidence=self._evidence(),
+            )
+            # Mutate both caller's original proposal and the resolver's copy after resolution
+            caller_proposal.arguments["recipient"] = "evil@example.com"
+            arg_proposal.arguments["recipient"] = "resolver-evil@example.com"
+            arg_ctx.state["tampered"] = True
+            return resolved
+
+        controller = WorkflowController(
+            Governor(),
+            "run-snap-mutation",
+            v3,
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=InMemoryEffectStore(),
+                resolver=_CallbackResolver(mutating_resolve),
+                observer=_CallbackObserver(
+                    lambda _in, _res: ObservedEffect(status="confirmed", evidence_ref="snap-ok")
+                ),
+                policy_scope="scope.auth",
+            ),
+        )
+        controller.begin(ctx)
+        outcome = controller.execute(
+            caller_proposal,
+            ctx,
+            lambda invoked: observed_recipients.append(invoked.arguments["recipient"]) or "sent",
+        )
+        self.assertTrue(outcome.executed)
+        self.assertEqual(observed_recipients, ["alerts@example.com"])
+
+    def test_unrelated_approval_on_non_sensitive_or_non_governed_tool_is_not_consumed(self):
+        base_v3 = self._auth_v3_contract()
+        draft = ContractRulesV3.model_validate({
+            **base_v3.model_dump(mode="json"),
+            "declared_tools": ["send_notification", "list_status"],
+            "contract_fingerprint": "sha256:placeholder",
+        })
+        v3 = draft.model_copy(
+            update={"contract_fingerprint": compute_v3_contract_fingerprint(draft)}
+        )
+        ctx = ExecutionContext(
+            state={},
+            available_tools=["send_notification", "list_status"],
+            observed_agent_fingerprint="agent-v1",
+            observed_contract_fingerprint=v3.contract_fingerprint,
+        )
+        sensitive_planned = self._planned(recipient="alerts@example.com")
+        sensitive_approval = self._approval(
+            sensitive_planned, approval_id="appr-sensitive-only"
+        )
+        ops_planned = self._planned(recipient="ops@example.com")
+        status_planned = PlannedEffect(tool_name="list_status", parameters={})
+
+        store = InMemoryEffectStore()
+        recorded: list[RecordedEvent] = []
+
+        class ListRec:
+            def record(self, ev: RecordedEvent) -> None:
+                recorded.append(ev)
+
+        resolver_mode = {"kind": "ops"}
+
+        def resolve_fn(proposal: ActionProposal, _c: ExecutionContext) -> ResolvedAction:
+            if resolver_mode["kind"] == "ops":
+                return ResolvedAction(
+                    planned_effect=ops_planned,
+                    host_facts=HostFacts(facts={"sensitive": False}),
+                    policy_scope="scope.auth",
+                    requester_id="req-1",
+                    evaluated_at="2026-06-01T10:20:00Z",
+                    approval=sensitive_approval,
+                    retrieved_evidence=self._evidence(),
+                )
+            if resolver_mode["kind"] == "status":
+                return ResolvedAction(
+                    planned_effect=status_planned,
+                    host_facts=HostFacts(facts={"sensitive": True}),
+                    policy_scope="scope.auth",
+                    requester_id="req-1",
+                    evaluated_at="2026-06-01T10:22:00Z",
+                    approval=sensitive_approval,
+                )
+            return ResolvedAction(
+                planned_effect=sensitive_planned,
+                host_facts=HostFacts(facts={"sensitive": True}),
+                policy_scope="scope.auth",
+                requester_id="req-1",
+                evaluated_at="2026-06-01T10:25:00Z",
+                approval=sensitive_approval,
+                retrieved_evidence=self._evidence(),
+            )
+
+        controller = WorkflowController(
+            Governor(),
+            "run-non-consume",
+            v3,
+            recorder=ListRec(),
+            policy=EnforcementPolicy(mode="guarded"),
+            effect_governance=EffectGovernanceConfig(
+                store=store,
+                resolver=_CallbackResolver(resolve_fn),
+                observer=_CallbackObserver(
+                    lambda _in, _res: ObservedEffect(status="confirmed", evidence_ref="ok")
+                ),
+                policy_scope="scope.auth",
+            ),
+        )
+        controller.begin(ctx)
+
+        # 1. Non-sensitive ops@example.com with sensitive_approval attached does NOT bind or consume it
+        out_ops = controller.execute(
+            ActionProposal(tool_name="send_notification", arguments={"recipient": "ops@example.com"}),
+            ctx,
+            lambda _p: "ops-sent",
+        )
+        self.assertTrue(out_ops.executed)
+        assert out_ops.effect is not None
+        self.assertIsNone(out_ops.effect.approval_id)
+        self.assertIsNone(store.snapshot("scope.auth").approval_by_id("appr-sensitive-only"))
+        self.assertTrue(all(ev.approval_id is None for ev in recorded))
+
+        # 2. Unrelated non-governed tool list_status also does NOT bind or consume sensitive_approval
+        resolver_mode["kind"] = "status"
+        out_status = controller.execute(
+            ActionProposal(tool_name="list_status", arguments={}),
+            ctx,
+            lambda _p: "status-ok",
+        )
+        self.assertTrue(out_status.executed)
+        assert out_status.effect is not None
+        self.assertIsNone(out_status.effect.approval_id)
+        self.assertIsNone(store.snapshot("scope.auth").approval_by_id("appr-sensitive-only"))
+
+        # 3. Intended sensitive alerts@example.com immediately succeeds and consumes sensitive_approval
+        resolver_mode["kind"] = "alerts"
+        out_alerts = controller.execute(
+            ActionProposal(tool_name="send_notification", arguments={"recipient": "alerts@example.com"}),
+            ctx,
+            lambda _p: "alerts-sent",
+        )
+        self.assertTrue(out_alerts.executed)
+        assert out_alerts.effect is not None
+        self.assertEqual(out_alerts.effect.approval_id, "appr-sensitive-only")
+        self.assertEqual(
+            store.snapshot("scope.auth").approval_by_id("appr-sensitive-only").status,
+            "consumed",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
