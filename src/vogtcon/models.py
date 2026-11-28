@@ -17,6 +17,7 @@ import json
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Self, TypeAlias
 
@@ -54,7 +55,43 @@ PolicyScopeId = Annotated[
     str,
     Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
 ]
+ApprovalId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+]
+PrincipalId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$"),
+]
+EvidenceId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$"),
+]
+ApprovalStatus = Literal["active", "revoked", "expired"]
+ApprovalUsageStatus = Literal[
+    "reserved", "consumed", "locked_uncertain", "released_absent"
+]
 Sha256Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    if not isinstance(value, str) or "T" not in value or value != value.strip():
+        raise ValueError("Invalid ISO-8601 timestamp")
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("Invalid ISO-8601 timestamp") from None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("Timestamp must include an explicit timezone offset")
+    return dt.astimezone(timezone.utc)
+
+
+def _validate_timestamp_str(value: str) -> str:
+    _parse_utc_timestamp(value)
+    return value
+
+
+TimestampStr = Annotated[str, AfterValidator(_validate_timestamp_str)]
 JsonObject = dict[str, JsonValue]
 FrozenJsonValue: TypeAlias = (
     None
@@ -560,6 +597,146 @@ class PlannedEffect(_Model):
         return _canonical_sha256(self.canonical_operation())
 
 
+def _tuple_to_list_if_tuple(value: object) -> object:
+    return list(value) if isinstance(value, tuple) else value
+
+
+def _validate_unique_str_tuple(
+    value: list[NonEmptyString],
+) -> tuple[NonEmptyString, ...]:
+    if len(set(value)) != len(value):
+        raise ValueError("Items must not contain duplicates")
+    return tuple(value)
+
+
+if TYPE_CHECKING:
+    _FrozenUniqueStrTupleField: TypeAlias = tuple[NonEmptyString, ...]
+else:
+    _FrozenUniqueStrTupleField = Annotated[
+        list[NonEmptyString],
+        BeforeValidator(_tuple_to_list_if_tuple),
+        AfterValidator(_validate_unique_str_tuple),
+        PlainSerializer(list, return_type=list[NonEmptyString]),
+    ]
+
+
+class HostApproval(_Model):
+    """Host-issued operation-bound approval artifact.
+
+    Schema validation verifies structure and timestamp ordering only; the host
+    remains responsible for authenticating principals, issuing approvals, and
+    supplying a trustworthy evaluation timestamp.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    approval_id: ApprovalId
+    operation_digest: Sha256Digest
+    requester_id: PrincipalId
+    approver_id: PrincipalId
+    approver_authorities: _FrozenUniqueStrTupleField = Field(
+        default_factory=tuple, validate_default=True
+    )
+    policy_scope: PolicyScopeId
+    issued_at: TimestampStr
+    expires_at: TimestampStr
+    status: ApprovalStatus = "active"
+    single_use: bool = True
+    metadata: _FrozenJsonObjectField = Field(
+        default_factory=dict, validate_default=True
+    )
+
+    @model_validator(mode="after")
+    def check_validity_window(self) -> Self:
+        if _parse_utc_timestamp(self.expires_at) <= _parse_utc_timestamp(
+            self.issued_at
+        ):
+            raise ValueError(
+                "HostApproval expires_at must be strictly after issued_at"
+            )
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            for key, val in update.items():
+                merged[key] = _thaw_json_value(val) if key == "metadata" else val
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
+class RetrievedEvidence(_Model):
+    """Host-verified retrieved evidence reference.
+
+    Host-verified retrieval proves provenance and existence of the retrieved
+    item only; it does NOT prove semantic relevance, accuracy, or sufficiency
+    for an action.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    evidence_id: EvidenceId
+    source: NonEmptyString
+    content_digest: Sha256Digest | None = None
+    retrieved_at: TimestampStr | None = None
+    metadata: _FrozenJsonObjectField = Field(
+        default_factory=dict, validate_default=True
+    )
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            for key, val in update.items():
+                merged[key] = _thaw_json_value(val) if key == "metadata" else val
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
+class ApprovalStateRecord(_Model):
+    """Authoritative store snapshot of a bound approval's reservation/consumption state."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    approval_id: ApprovalId
+    operation_digest: Sha256Digest
+    policy_scope: PolicyScopeId
+    status: ApprovalUsageStatus
+    effect_id: EffectId
+    single_use: bool = True
+    retry_count: Annotated[int, Field(ge=0)] = 0
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            merged.update(update)
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
 class EffectRecord(_Model):
     """Materialized snapshot of a governed effect in an authoritative store."""
 
@@ -572,6 +749,9 @@ class EffectRecord(_Model):
     tool_name: NonEmptyString
     operation_digest: Sha256Digest
     status: EffectStatus
+    approval_id: ApprovalId | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     compensates_effect_id: EffectId | None = None
     evidence_ref: NonEmptyString | None = None
     metadata: _FrozenJsonObjectField = Field(
@@ -618,6 +798,9 @@ class TrajectoryEntry(_Model):
     tool_name: NonEmptyString
     operation_digest: Sha256Digest
     status: EffectStatus
+    approval_id: ApprovalId | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     compensates_effect_id: EffectId | None = None
     evidence_ref: NonEmptyString | None = None
     metadata: _FrozenJsonObjectField = Field(
@@ -687,14 +870,12 @@ class TrajectoryEntry(_Model):
         return self.__copy__()
 
 
-def _tuple_to_list_if_tuple(value: object) -> object:
-    return list(value) if isinstance(value, tuple) else value
-
-
 if TYPE_CHECKING:
     _FrozenTrajectoryEntriesField: TypeAlias = tuple[TrajectoryEntry, ...]
     _FrozenEffectRecordsField: TypeAlias = tuple[EffectRecord, ...]
     _FrozenEffectIdTupleField: TypeAlias = tuple[EffectId, ...]
+    _FrozenApprovalStatesField: TypeAlias = tuple[ApprovalStateRecord, ...]
+    _FrozenEvidenceTupleField: TypeAlias = tuple[RetrievedEvidence, ...]
 else:
     _FrozenTrajectoryEntriesField = Annotated[
         list[TrajectoryEntry],
@@ -714,6 +895,18 @@ else:
         AfterValidator(tuple),
         PlainSerializer(list, return_type=list[EffectId]),
     ]
+    _FrozenApprovalStatesField = Annotated[
+        list[ApprovalStateRecord],
+        BeforeValidator(_tuple_to_list_if_tuple),
+        AfterValidator(tuple),
+        WrapSerializer(lambda value, handler: handler(list(value))),
+    ]
+    _FrozenEvidenceTupleField = Annotated[
+        list[RetrievedEvidence],
+        BeforeValidator(_tuple_to_list_if_tuple),
+        AfterValidator(tuple),
+        WrapSerializer(lambda value, handler: handler(list(value))),
+    ]
 
 
 class TrajectoryView(_Model):
@@ -731,6 +924,11 @@ class TrajectoryView(_Model):
     suspended: bool = False
     uncertain_effect_ids: _FrozenEffectIdTupleField = Field(
         default_factory=tuple, validate_default=True
+    )
+    approvals: _FrozenApprovalStatesField = Field(
+        default_factory=tuple,
+        validate_default=True,
+        exclude_if=lambda value: not value,
     )
 
     @model_validator(mode="after")
@@ -772,6 +970,21 @@ class TrajectoryView(_Model):
             )
         if self.uncertain_effect_ids and not self.suspended:
             raise ValueError("TrajectoryView with uncertain effects must be suspended")
+
+        seen_approval_ids: set[str] = set()
+        for approval_state in self.approvals:
+            if approval_state.approval_id in seen_approval_ids:
+                raise ValueError(
+                    f"Duplicate approval_id in TrajectoryView: '{approval_state.approval_id}'"
+                )
+            seen_approval_ids.add(approval_state.approval_id)
+            if (
+                self.policy_scope is not None
+                and approval_state.policy_scope != self.policy_scope
+            ):
+                raise ValueError(
+                    "TrajectoryView approval policy_scope does not match view policy_scope"
+                )
         return self
 
     def effect_by_id(self, effect_id: str) -> EffectRecord | None:
@@ -782,6 +995,12 @@ class TrajectoryView(_Model):
 
     def effects_by_status(self, status: EffectStatus) -> tuple[EffectRecord, ...]:
         return tuple(effect for effect in self.effects if effect.status == status)
+
+    def approval_by_id(self, approval_id: str) -> ApprovalStateRecord | None:
+        for approval_state in self.approvals:
+            if approval_state.approval_id == approval_id:
+                return approval_state
+        return None
 
     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
         return self.__copy__()
@@ -799,6 +1018,7 @@ class TrajectoryView(_Model):
                 "effects": list(self.effects),
                 "suspended": self.suspended,
                 "uncertain_effect_ids": list(self.uncertain_effect_ids),
+                "approvals": list(self.approvals),
             }
             merged.update(update)
             return type(self).model_validate(merged)
@@ -937,6 +1157,10 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
     planned_effect: PlannedEffect | None = Field(default=None, exclude_if=lambda value: value is None)
     policy_scope: PolicyScopeId | None = Field(default=None, exclude_if=lambda value: value is None)
     trajectory: TrajectoryView | None = Field(default=None, exclude_if=lambda value: value is None)
+    requester_id: PrincipalId | None = Field(default=None, exclude_if=lambda value: value is None)
+    evaluated_at: TimestampStr | None = Field(default=None, exclude_if=lambda value: value is None)
+    approval: HostApproval | None = Field(default=None, exclude_if=lambda value: value is None)
+    retrieved_evidence: _FrozenEvidenceTupleField | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("contract", mode="before")
     @classmethod
@@ -979,6 +1203,10 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
         return (
             self.host_facts is not None
             or self.trajectory is not None
+            or self.approval is not None
+            or self.retrieved_evidence is not None
+            or self.requester_id is not None
+            or self.evaluated_at is not None
             or isinstance(self.contract, ContractRulesV3)
         )
 
@@ -992,8 +1220,13 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
                     raise ValueError(
                         "planned_effect.tool_name conflicts with action.tool_name"
                     )
-        elif self.planned_effect is not None:
-            raise ValueError("planned_effect is only accepted for runtime evaluation")
+        else:
+            if self.planned_effect is not None:
+                raise ValueError(
+                    "planned_effect is only accepted for runtime evaluation"
+                )
+            if self.approval is not None:
+                raise ValueError("approval is only accepted for runtime evaluation")
         if (
             self.policy_scope is not None
             and self.trajectory is not None
@@ -1001,6 +1234,24 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
             and self.trajectory.policy_scope != self.policy_scope
         ):
             raise ValueError("trajectory.policy_scope conflicts with policy_scope")
+        if (
+            self.approval is not None
+            and self.host_facts is not None
+            and "approval_id" in self.host_facts.facts
+            and _canonical_json(self.host_facts.facts["approval_id"])
+            != _canonical_json(self.approval.approval_id)
+        ):
+            raise ValueError("host_facts conflicts with approval for key: approval_id")
+        if (
+            self.requester_id is not None
+            and self.host_facts is not None
+            and "requester_id" in self.host_facts.facts
+            and _canonical_json(self.host_facts.facts["requester_id"])
+            != _canonical_json(self.requester_id)
+        ):
+            raise ValueError(
+                "host_facts conflicts with requester_id for key: requester_id"
+            )
         if self.host_facts is not None:
             conflicts = [
                 key
@@ -1047,6 +1298,19 @@ embedded mode. IDs are supplied by the runtime and are not proof of authorizatio
             update=dict(update) if update is not None else None,
             deep=deep,
         )
+        if update is not None and "retrieved_evidence" in update:
+            ev_val = copied.retrieved_evidence
+            if ev_val is not None:
+                object.__setattr__(
+                    copied,
+                    "retrieved_evidence",
+                    tuple(
+                        item
+                        if isinstance(item, RetrievedEvidence)
+                        else RetrievedEvidence.model_validate(item)
+                        for item in ev_val
+                    ),
+                )
         copied._validate_policy_binding()
         copied.validate_source_agreement()
         if copied._requires_frozen_evaluation_view():

@@ -213,8 +213,13 @@ def render_explain_text(
                 v_str = ", ".join(act["violation_rules"]) if act["violation_rules"] else "0 violations"
                 prior_idx = act["prior_same_tool_block_action_index"]
                 prior_note = f" (prior same-tool block at action {prior_idx})" if prior_idx is not None else ""
+                approval_note = (
+                    f" [approval: {act['approval_id']}]"
+                    if act.get("approval_id") is not None
+                    else ""
+                )
                 lines.append(
-                    f"  {act['decision_sequence']}  action {idx:<3}  {tool}  {act['decision']}  {v_str}{prior_note}"
+                    f"  {act['decision_sequence']}  action {idx:<3}  {tool}  {act['decision']}  {v_str}{prior_note}{approval_note}"
                 )
             else:
                 lines.append(f"  -  action {idx:<3}  {tool}  decision missing")
@@ -260,13 +265,18 @@ def render_explain_text(
                 )
                 scope = act.get("policy_scope")
                 scope_note = f" scope={scope}" if scope is not None else ""
+                approval_note = (
+                    f" [approval: {act['approval_id']}]"
+                    if act.get("approval_id") is not None
+                    else ""
+                )
                 obs_evidence = (
                     "indeterminate"
                     if act.get("reconciliation_sequence") is not None
                     else evidence
                 )
                 lines.append(
-                    f"  {act['observation_sequence']}  action {idx:<3}  effect_observed  {eff_id} status={obs_status}{scope_note} ({obs_evidence})"
+                    f"  {act['observation_sequence']}  action {idx:<3}  effect_observed  {eff_id} status={obs_status}{scope_note}{approval_note} ({obs_evidence})"
                 )
             if act.get("reconciliation_sequence") is not None:
                 eff_id = act.get("effect_id") or "-"
@@ -285,8 +295,13 @@ def render_explain_text(
                     if rec.get("policy_scope") is not None
                     else ""
                 )
+                approval_note = (
+                    f" [approval: {rec['approval_id']}]"
+                    if rec.get("approval_id") is not None
+                    else ""
+                )
                 lines.append(
-                    f"  {rec['sequence']}  reconcile  effect_reconciled  {rec['effect_id']} status={rec['effect_status']}{scope_note} ref={rec['evidence_ref']}"
+                    f"  {rec['sequence']}  reconcile  effect_reconciled  {rec['effect_id']} status={rec['effect_status']}{scope_note}{approval_note} ref={rec['evidence_ref']}"
                 )
 
         for comp in run.get("compensations") or ():

@@ -26,16 +26,20 @@ from vogtcon import (
 from vogtcon.models import (
     OPERATION_DIGEST_EXCLUDED_METADATA,
     OPERATION_IDENTITY_VERSION,
+    ApprovalStateRecord,
     ApprovedAgentConfiguration,
     ContractRulesV2,
     ContractRulesV3,
     EffectRecord,
+    HostApproval,
     HostFacts,
     PlannedEffect,
     ResponseSchema,
+    RetrievedEvidence,
     RuleBinding,
     TrajectoryEntry,
     TrajectoryView,
+    _parse_utc_timestamp,
 )
 
 
@@ -1720,6 +1724,278 @@ class GovernorInputV3AndTrajectoryTests(unittest.TestCase):
             request.model_copy(update={"trajectory": view_b})
 
 
+class ApprovalAndEvidenceModelTests(unittest.TestCase):
+    def _digest(self, seed: str = "a") -> str:
+        return "sha256:" + (seed * 64)[:64]
+
+    def test_utc_timestamp_parsing_and_no_secret_leak_in_traceback(self):
+        import traceback
+
+        dt_z = _parse_utc_timestamp("2026-11-27T10:30:00Z")
+        dt_offset = _parse_utc_timestamp("2026-11-27T04:30:00-06:00")
+        self.assertEqual(dt_z, dt_offset)
+
+        sentinel = "SECRET_TS_PAYLOAD_T_8811"
+        for bad_ts in (
+            "2026-11-27",
+            "2026-11-27 10:30:00Z",
+            "2026-11-27T10:30:00",
+            " 2026-11-27T10:30:00Z ",
+            "2026-11-27t10:30:00Z",
+            sentinel,
+            "",
+        ):
+            with self.subTest(bad_ts=bad_ts):
+                try:
+                    _parse_utc_timestamp(bad_ts)
+                    self.fail("Expected ValueError")
+                except ValueError as err:
+                    self.assertIsNone(err.__cause__)
+                    self.assertNotIn(sentinel, str(err))
+                    self.assertNotIn(sentinel, traceback.format_exc())
+
+    def test_host_approval_immutability_window_authorities_and_no_secret_leak(self):
+        caller_authorities = ["finance.approve", "ops.approve"]
+        caller_meta = {"ticket": "INC-1", "nested": {"tags": ["p1"]}}
+        approval = HostApproval(
+            approval_id="app-001",
+            operation_digest=self._digest("1"),
+            requester_id="user:alice@example.com",
+            approver_id="user:bob@example.com",
+            approver_authorities=caller_authorities,
+            policy_scope="scope.finance",
+            issued_at="2026-11-27T10:00:00Z",
+            expires_at="2026-11-27T08:00:00-03:00",  # 11:00Z > 10:00Z
+            metadata=caller_meta,
+        )
+        caller_authorities.append("admin")
+        caller_meta["nested"]["tags"].append("mutated")
+
+        self.assertEqual(approval.approver_authorities, ("finance.approve", "ops.approve"))
+        self.assertEqual(approval.metadata["nested"]["tags"], ("p1",))
+        self.assertIsInstance(approval.approver_authorities, tuple)
+        self.assertIsInstance(approval.metadata, MappingProxyType)
+
+        # Empty approver_authorities is valid at schema level
+        no_auth = approval.model_copy(update={"approver_authorities": ()})
+        self.assertEqual(no_auth.approver_authorities, ())
+
+        with self.assertRaises(AttributeError):
+            approval.approver_authorities.append("admin")  # type: ignore[attr-defined]
+        with self.assertRaises(TypeError):
+            approval.metadata["ticket"] = "INC-2"
+        with self.assertRaises(AttributeError):
+            approval.metadata["nested"]["tags"].append("p2")
+
+        for dumped in (
+            approval.model_dump(),
+            approval.model_dump(mode="json"),
+            json.loads(approval.model_dump_json()),
+        ):
+            self.assertIs(type(dumped["approver_authorities"]), list)
+            self.assertIs(type(dumped["metadata"]), dict)
+            self.assertIs(type(dumped["metadata"]["nested"]["tags"]), list)
+
+        self.assertEqual(deepcopy(approval), approval)
+        self.assertEqual(
+            approval, HostApproval.model_validate_json(approval.model_dump_json())
+        )
+
+        # Equal or earlier expires_at (including timezone offset equivalence) rejected
+        for bad_expires in (
+            "2026-11-27T10:00:00Z",
+            "2026-11-27T12:00:00+02:00",  # 10:00Z == issued_at
+            "2026-11-27T09:59:59Z",
+        ):
+            with self.subTest(bad_expires=bad_expires):
+                with self.assertRaisesRegex(
+                    ValidationError, "expires_at must be strictly after issued_at"
+                ):
+                    approval.model_copy(update={"expires_at": bad_expires})
+
+        # Duplicate authorities rejected
+        with self.assertRaisesRegex(ValidationError, "must not contain duplicates"):
+            approval.model_copy(update={"approver_authorities": ["ops", "ops"]})
+
+        sentinel = "SECRET_APPROVAL_META_9988"
+        with self.assertRaises(ValidationError) as ctx:
+            HostApproval(
+                approval_id="bad id!",
+                operation_digest=self._digest("1"),
+                requester_id="alice",
+                approver_id="bob",
+                policy_scope="scope.finance",
+                issued_at="2026-11-27T10:00:00Z",
+                expires_at="2026-11-27T11:00:00Z",
+                metadata={"secret": sentinel},
+            )
+        self.assertNotIn(sentinel, str(ctx.exception))
+
+    def test_retrieved_evidence_approval_state_and_trajectory_view_approvals(self):
+        self.assertIn("relevance", RetrievedEvidence.__doc__ or "")
+        ev_meta = {"chunk": [1, 2]}
+        ev = RetrievedEvidence(
+            evidence_id="doc:kb/policy-1",
+            source="kb.internal",
+            content_digest=self._digest("c"),
+            retrieved_at="2026-11-27T10:00:00Z",
+            metadata=ev_meta,
+        )
+        ev_meta["chunk"].append(3)
+        self.assertEqual(ev.metadata["chunk"], (1, 2))
+        with self.assertRaises(TypeError):
+            ev.metadata["x"] = 1
+        self.assertEqual(deepcopy(ev), ev)
+        self.assertEqual(
+            ev, RetrievedEvidence.model_validate_json(ev.model_dump_json())
+        )
+
+        # Stage 2 TrajectoryView without approvals omits 'approvals' key on dump
+        empty_view = TrajectoryView(policy_scope="scope.a")
+        self.assertEqual(empty_view.approvals, ())
+        self.assertNotIn("approvals", empty_view.model_dump())
+        self.assertNotIn('"approvals"', empty_view.model_dump_json())
+
+        # EffectRecord & TrajectoryEntry omit approval_id when None, include when set
+        eff_no_app = EffectRecord(
+            effect_id="eff-1",
+            run_id="run-1",
+            policy_scope="scope.a",
+            tool_name="send_notification",
+            operation_digest=self._digest("1"),
+            status="confirmed",
+        )
+        self.assertNotIn("approval_id", eff_no_app.model_dump())
+        eff_with_app = eff_no_app.model_copy(update={"approval_id": "app-1"})
+        self.assertEqual(eff_with_app.approval_id, "app-1")
+        self.assertEqual(eff_with_app.model_dump()["approval_id"], "app-1")
+
+        app_state = ApprovalStateRecord(
+            approval_id="app-1",
+            operation_digest=self._digest("1"),
+            policy_scope="scope.a",
+            status="consumed",
+            effect_id="eff-1",
+            single_use=True,
+            retry_count=0,
+        )
+        view_with_app = TrajectoryView(
+            policy_scope="scope.a",
+            effects=[eff_with_app],
+            approvals=[app_state],
+        )
+        self.assertEqual(view_with_app.approval_by_id("app-1"), app_state)
+        self.assertIsNone(view_with_app.approval_by_id("app-missing"))
+        self.assertIs(type(view_with_app.model_dump()["approvals"]), list)
+        self.assertEqual(
+            view_with_app,
+            TrajectoryView.model_validate_json(view_with_app.model_dump_json()),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "Duplicate approval_id"):
+            TrajectoryView(
+                policy_scope="scope.a", approvals=[app_state, app_state]
+            )
+        with self.assertRaisesRegex(
+            ValidationError, "approval policy_scope does not match"
+        ):
+            TrajectoryView(
+                policy_scope="scope.b", approvals=[app_state]
+            )
+
+
+class GovernorInputAuthorizationTests(unittest.TestCase):
+    def _approval(self, approval_id: str = "app-1") -> HostApproval:
+        return HostApproval(
+            approval_id=approval_id,
+            operation_digest="sha256:" + "a" * 64,
+            requester_id="alice",
+            approver_id="bob",
+            approver_authorities=["ops.approve"],
+            policy_scope="scope.ops",
+            issued_at="2026-11-27T10:00:00Z",
+            expires_at="2026-11-27T11:00:00Z",
+        )
+
+    def test_legacy_dump_omission_runtime_only_approval_and_strict_agreement(self):
+        legacy = GovernorInput.model_validate(input_data("runtime"))
+        dumped = legacy.model_dump()
+        for key in ("requester_id", "evaluated_at", "approval", "retrieved_evidence"):
+            self.assertNotIn(key, dumped)
+
+        for phase in ("pre_execution", "post_execution"):
+            with self.subTest(phase=phase):
+                bad = input_data(phase)
+                bad["approval"] = self._approval()
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "approval is only accepted for runtime evaluation",
+                ):
+                    GovernorInput.model_validate(bad)
+
+        secret_id = "SECRET_FOREIGN_APPROVAL_ID_4411"
+        conflict_app = input_data("runtime")
+        conflict_app["approval"] = self._approval("app-expected")
+        conflict_app["host_facts"] = {"facts": {"approval_id": secret_id}}
+        with self.assertRaises(ValidationError) as ctx_app:
+            GovernorInput.model_validate(conflict_app)
+        self.assertIn(
+            "host_facts conflicts with approval for key: approval_id",
+            str(ctx_app.exception),
+        )
+        self.assertNotIn(secret_id, str(ctx_app.exception))
+
+        secret_req = "SECRET_REQUESTER_9922"
+        conflict_req = input_data("runtime")
+        conflict_req["requester_id"] = "alice"
+        conflict_req["host_facts"] = {"facts": {"requester_id": secret_req}}
+        with self.assertRaises(ValidationError) as ctx_req:
+            GovernorInput.model_validate(conflict_req)
+        self.assertIn(
+            "host_facts conflicts with requester_id for key: requester_id",
+            str(ctx_req.exception),
+        )
+        self.assertNotIn(secret_req, str(ctx_req.exception))
+
+        ev_list = [RetrievedEvidence(evidence_id="ev-1", source="kb")]
+        caller_ctx = ExecutionContext(
+            state={"k": [1]}, available_tools=["send_notification"]
+        )
+        valid = GovernorInput(
+            run_id="run-auth",
+            contract=ContractRulesV3.model_validate(v3_contract_data()),
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=caller_ctx,
+            action=ActionProposal(tool_name="send_notification"),
+            requester_id="alice",
+            evaluated_at="2026-11-27T10:05:00Z",
+            approval=self._approval("app-1"),
+            host_facts=HostFacts(
+                facts={"approval_id": "app-1", "requester_id": "alice"}
+            ),
+            retrieved_evidence=ev_list,
+        )
+        ev_list.clear()
+        assert valid.retrieved_evidence is not None
+        self.assertEqual(len(valid.retrieved_evidence), 1)
+        self.assertIsInstance(valid.retrieved_evidence, tuple)
+        self.assertIsInstance(valid.context.state, MappingProxyType)
+        self.assertIs(type(valid.model_dump()["retrieved_evidence"]), list)
+        self.assertEqual(
+            valid, GovernorInput.model_validate_json(valid.model_dump_json())
+        )
+
+        copied = valid.model_copy(
+            update={
+                "retrieved_evidence": [
+                    RetrievedEvidence(evidence_id="ev-2", source="kb")
+                ]
+            }
+        )
+        self.assertIsInstance(copied.retrieved_evidence, tuple)
+
+
 class DecisionModelTests(unittest.TestCase):
     def test_preserves_all_historical_runtime_decision_names(self):
         for decision in ("allow", "allow_with_warning", "block", "abort"):
@@ -1886,18 +2162,46 @@ class PublicApiTests(unittest.TestCase):
             + stage2_records_exports
             + stage2_rules_exports
         )
+        stage3_model_exports = (
+            "ApprovalId",
+            "ApprovalStateRecord",
+            "ApprovalStatus",
+            "ApprovalUsageStatus",
+            "EvidenceId",
+            "HostApproval",
+            "PrincipalId",
+            "RetrievedEvidence",
+            "TimestampStr",
+        )
+        stage3_effects_exports = ("ApprovalReuseError",)
+        stage3_rules_exports = (
+            "BoundApprovalParams",
+            "DestinationAllowlistParams",
+            "RetrievedEvidenceParams",
+        )
+        stage3_exports = (
+            stage3_model_exports
+            + stage3_effects_exports
+            + stage3_rules_exports
+        )
 
         self.assertEqual(len(historical_exports), 22)
         self.assertEqual(len(stage1_exports), 10)
         self.assertEqual(len(stage2_exports), 28)
-        self.assertEqual(len(vogtcon.__all__), 60)
-        self.assertEqual(len(set(vogtcon.__all__)), 60)
+        self.assertEqual(len(stage3_exports), 13)
+        self.assertEqual(len(vogtcon.__all__), 73)
+        self.assertEqual(len(set(vogtcon.__all__)), 73)
         self.assertEqual(
             set(vogtcon.__all__),
-            set(historical_exports) | set(stage1_exports) | set(stage2_exports),
+            set(historical_exports)
+            | set(stage1_exports)
+            | set(stage2_exports)
+            | set(stage3_exports),
         )
 
-        for name in historical_exports + stage1_exports + stage2_exports:
+        for name in (
+            historical_exports + stage1_exports + stage2_exports + stage3_exports
+        ):
             with self.subTest(symbol=name):
                 self.assertIn(name, vogtcon.__all__)
                 self.assertTrue(hasattr(vogtcon, name))
@@ -1914,6 +2218,7 @@ class PublicApiTests(unittest.TestCase):
             "PlannedEffect",
             "RuleBinding",
             *stage2_model_exports,
+            *stage3_model_exports,
         ):
             self.assertIs(getattr(vogtcon, name), getattr(models, name))
         for name in (
@@ -1921,9 +2226,10 @@ class PublicApiTests(unittest.TestCase):
             "EmptyRuleParams",
             "RuleTypeSpec",
             *stage2_rules_exports,
+            *stage3_rules_exports,
         ):
             self.assertIs(getattr(vogtcon, name), getattr(rules, name))
-        for name in stage2_effects_exports:
+        for name in (*stage2_effects_exports, *stage3_effects_exports):
             self.assertIs(getattr(vogtcon, name), getattr(effects, name))
         for name in stage2_records_exports:
             self.assertIs(getattr(vogtcon, name), getattr(records, name))

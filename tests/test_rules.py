@@ -28,7 +28,10 @@ from vogtcon.rules import (
     DEFAULT_RUNTIME_RULES,
     POSTCONDITIONS,
     RUNTIME_RULES,
+    BoundApprovalParams,
+    DestinationAllowlistParams,
     EmptyRuleParams,
+    RetrievedEvidenceParams,
     RuleTypeSpec,
 )
 
@@ -316,29 +319,43 @@ class RuleTypeRegistryTests(unittest.TestCase):
         self.assertIsInstance(DEFAULT_RULE_TYPES, MappingProxyType)
         self.assertEqual(
             set(DEFAULT_RULE_TYPES.keys()),
-            {"tool.declared_only", "response.schema_complete"},
+            {
+                "tool.declared_only",
+                "response.schema_complete",
+                "approval.bound_required",
+                "destination.allowlist",
+                "evidence.retrieved_required",
+            },
         )
-        self.assertEqual(
-            DEFAULT_RULE_TYPES["tool.declared_only"].allowed_phases,
-            frozenset({"runtime"}),
+        expected_specs = (
+            ("tool.declared_only", frozenset({"runtime"}), EmptyRuleParams),
+            (
+                "response.schema_complete",
+                frozenset({"post_execution"}),
+                EmptyRuleParams,
+            ),
+            (
+                "approval.bound_required",
+                frozenset({"runtime"}),
+                BoundApprovalParams,
+            ),
+            (
+                "destination.allowlist",
+                frozenset({"runtime"}),
+                DestinationAllowlistParams,
+            ),
+            (
+                "evidence.retrieved_required",
+                frozenset({"runtime"}),
+                RetrievedEvidenceParams,
+            ),
         )
-        self.assertIs(
-            DEFAULT_RULE_TYPES["tool.declared_only"].params_model,
-            EmptyRuleParams,
-        )
-        self.assertTrue(callable(DEFAULT_RULE_TYPES["tool.declared_only"].handler))
-
-        self.assertEqual(
-            DEFAULT_RULE_TYPES["response.schema_complete"].allowed_phases,
-            frozenset({"post_execution"}),
-        )
-        self.assertIs(
-            DEFAULT_RULE_TYPES["response.schema_complete"].params_model,
-            EmptyRuleParams,
-        )
-        self.assertTrue(
-            callable(DEFAULT_RULE_TYPES["response.schema_complete"].handler)
-        )
+        for rule_type, phases, model_cls in expected_specs:
+            with self.subTest(rule_type=rule_type):
+                spec = DEFAULT_RULE_TYPES[rule_type]
+                self.assertEqual(spec.allowed_phases, phases)
+                self.assertIs(spec.params_model, model_cls)
+                self.assertTrue(callable(spec.handler))
         with self.assertRaises(TypeError):
             RuleTypeSpec(
                 allowed_phases=frozenset({"runtime"}),
@@ -822,6 +839,607 @@ class V3RuleEvaluationTests(unittest.TestCase):
             self.assertTrue(err.__suppress_context__)
             self.assertNotIn(secret_val, str(err))
             self.assertNotIn(secret_val, traceback.format_exc())
+
+
+class BoundApprovalRuleTests(unittest.TestCase):
+    def _contract(self, params: dict | None = None):
+        from vogtcon.models import ContractRulesV3
+
+        rule_params = (
+            params
+            if params is not None
+            else {
+                "tools": ["send_notification"],
+                "required_authorities": ["notif.approver"],
+                "sensitivity_fact_key": "is_sensitive",
+            }
+        )
+        return ContractRulesV3.model_validate(
+            {
+                "schema_version": 3,
+                "contract_id": "v3.bound.approval",
+                "approved_agent_configurations": ["agent-v3"],
+                "declared_tools": ["send_notification", "search"],
+                "response_schema": {"required_fields": ["status"]},
+                "memory_policy": "none",
+                "validation_phases": ["pre_execution", "runtime", "post_execution"],
+                "rules": [
+                    {
+                        "instance_id": "bound-approval",
+                        "rule_type": "approval.bound_required",
+                        "phases": ["runtime"],
+                        "params": rule_params,
+                    }
+                ],
+                "contract_fingerprint": "sha256:" + "1" * 64,
+            }
+        )
+
+    def test_bound_approval_parameter_validation_and_immutability(self):
+        from copy import deepcopy
+
+        p = BoundApprovalParams.model_validate(
+            {
+                "tools": ["send_notification"],
+                "required_authorities": ["notif.approve", "sec.officer"],
+            }
+        )
+        self.assertEqual(p.tools, ("send_notification",))
+        self.assertEqual(p.required_authorities, ("notif.approve", "sec.officer"))
+        self.assertEqual(p.authority_match, "any")
+        self.assertFalse(p.allow_self_approval)
+        self.assertTrue(p.require_single_use)
+        self.assertFalse(p.allow_retry_after_confirmed_absent)
+        self.assertEqual(deepcopy(p), p)
+        self.assertEqual(p.model_copy(deep=True), p)
+        with self.assertRaises(ValidationError):
+            p.model_copy(update={"tools": []})
+
+        for bad in (
+            {"tools": [], "required_authorities": ["a"]},
+            {"tools": ["t"], "required_authorities": []},
+            {"tools": ["t", "t"], "required_authorities": ["a"]},
+            {"tools": ["t"], "required_authorities": ["a", "a"]},
+            {"tools": ["t"], "required_authorities": ["a"], "extra": 1},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError):
+                    BoundApprovalParams.model_validate(bad)
+
+    def test_bound_approval_checks_all_authorization_and_single_use_invariants(
+        self,
+    ):
+        from vogtcon.models import (
+            ApprovalStateRecord,
+            EnforcementPolicy,
+            ExecutionContext,
+            HostApproval,
+            HostFacts,
+            PlannedEffect,
+            TrajectoryView,
+        )
+
+        catalog = DEFAULT_RULE_CATALOG
+        planned = PlannedEffect(
+            tool_name="send_notification",
+            parameters={"recipient": "ceo@example.com", "body": "Q4"},
+        )
+        digest = planned.operation_digest()
+        base_approval = HostApproval(
+            approval_id="app-100",
+            operation_digest=digest,
+            requester_id="agent-user",
+            approver_id="mgr-user",
+            approver_authorities=["notif.approver"],
+            policy_scope="scope.notif",
+            issued_at="2026-11-27T10:00:00Z",
+            expires_at="2026-11-27T11:00:00Z",
+        )
+        empty_traj = TrajectoryView(policy_scope="scope.notif")
+
+        def make_req(**overrides):
+            kwargs = {
+                "run_id": "r1",
+                "contract": self._contract(),
+                "phase": "runtime",
+                "policy": EnforcementPolicy(mode="guarded"),
+                "context": ExecutionContext(
+                    state={}, available_tools=["send_notification", "search"]
+                ),
+                "action": ActionProposal(
+                    tool_name="send_notification",
+                    arguments={"is_sensitive": False, "approval_granted": True},
+                ),
+                "host_facts": HostFacts(facts={"is_sensitive": True}),
+                "planned_effect": planned,
+                "policy_scope": "scope.notif",
+                "requester_id": "agent-user",
+                "evaluated_at": "2026-11-27T10:30:00Z",
+                "approval": base_approval,
+                "trajectory": empty_traj,
+            }
+            kwargs.update(overrides)
+            return GovernorInput(**kwargs)
+
+        # 1. Valid approval passes
+        self.assertEqual(catalog.evaluate_v3(make_req()), [])
+
+        # 2. Non-governed tool passes without approval
+        search_req = make_req(
+            action=ActionProposal(tool_name="search"),
+            planned_effect=PlannedEffect(tool_name="search"),
+            approval=None,
+        )
+        self.assertEqual(catalog.evaluate_v3(search_req), [])
+
+        # 3. Host-classified non-sensitive passes without approval
+        self.assertEqual(
+            catalog.evaluate_v3(
+                make_req(
+                    host_facts=HostFacts(facts={"is_sensitive": False}),
+                    approval=None,
+                )
+            ),
+            [],
+        )
+
+        # 4. Agent claiming sensitive=False in arguments while host_facts says True or is missing/non-bool fails closed (INV-04, INV-10)
+        for bad_facts in (
+            None,
+            HostFacts(facts={}),
+            HostFacts(facts={"is_sensitive": "false"}),
+            HostFacts(facts={"is_sensitive": 0}),
+            HostFacts(facts={"is_sensitive": True}),
+        ):
+            with self.subTest(bad_facts=bad_facts):
+                v = catalog.evaluate_v3(
+                    make_req(host_facts=bad_facts, approval=None)
+                )
+                self.assertEqual(len(v), 1)
+                self.assertEqual(v[0].rule_type, "approval.bound_required")
+
+        # 5. Missing planned_effect, requester_id, policy_scope, evaluated_at, or trajectory fails closed
+        for missing_field in (
+            "planned_effect",
+            "requester_id",
+            "policy_scope",
+            "evaluated_at",
+            "trajectory",
+        ):
+            with self.subTest(missing_field=missing_field):
+                self.assertEqual(
+                    len(catalog.evaluate_v3(make_req(**{missing_field: None}))),
+                    1,
+                )
+
+        # Unscoped TrajectoryView(policy_scope=None) when request.policy_scope is set fails closed!
+        self.assertEqual(
+            len(
+                catalog.evaluate_v3(
+                    make_req(trajectory=TrajectoryView(policy_scope=None))
+                )
+            ),
+            1,
+        )
+
+        # 6. Modified operation_digest (e.g. changed recipient or parameter) fails
+        modified_effect = PlannedEffect(
+            tool_name="send_notification",
+            parameters={"recipient": "attacker@example.com", "body": "Q4"},
+        )
+        self.assertEqual(
+            len(catalog.evaluate_v3(make_req(planned_effect=modified_effect))),
+            1,
+        )
+
+        # 7. Foreign requester, wrong scope, revoked/expired status fail
+        self.assertEqual(
+            len(catalog.evaluate_v3(make_req(requester_id="other-user"))), 1
+        )
+        self.assertEqual(
+            len(
+                catalog.evaluate_v3(
+                    make_req(
+                        policy_scope="scope.other",
+                        trajectory=TrajectoryView(policy_scope="scope.other"),
+                    )
+                )
+            ),
+            1,
+        )
+        for bad_status in ("revoked", "expired"):
+            self.assertEqual(
+                len(
+                    catalog.evaluate_v3(
+                        make_req(
+                            approval=base_approval.model_copy(
+                                update={"status": bad_status}
+                            )
+                        )
+                    )
+                ),
+                1,
+            )
+
+        # 8. Self-approval: rejected by default; when allow_self_approval=True, STILL requires required_authorities!
+        self_app_with_auth = base_approval.model_copy(
+            update={"approver_id": "agent-user"}
+        )
+        self.assertEqual(
+            len(catalog.evaluate_v3(make_req(approval=self_app_with_auth))), 1
+        )
+        allow_self_contract = self._contract(
+            {
+                "tools": ["send_notification"],
+                "required_authorities": ["notif.approver", "sec.lead"],
+                "authority_match": "all",
+                "allow_self_approval": True,
+            }
+        )
+        # Missing sec.lead authority -> rejected even with allow_self_approval=True
+        self.assertEqual(
+            len(
+                catalog.evaluate_v3(
+                    make_req(
+                        contract=allow_self_contract,
+                        approval=self_app_with_auth,
+                    )
+                )
+            ),
+            1,
+        )
+        # Empty authorities -> rejected
+        self.assertEqual(
+            len(
+                catalog.evaluate_v3(
+                    make_req(
+                        contract=allow_self_contract,
+                        approval=self_app_with_auth.model_copy(
+                            update={"approver_authorities": []}
+                        ),
+                    )
+                )
+            ),
+            1,
+        )
+        # Both authorities present -> allowed
+        self.assertEqual(
+            catalog.evaluate_v3(
+                make_req(
+                    contract=allow_self_contract,
+                    approval=self_app_with_auth.model_copy(
+                        update={
+                            "approver_authorities": [
+                                "notif.approver",
+                                "sec.lead",
+                            ]
+                        }
+                    ),
+                )
+            ),
+            [],
+        )
+
+        # 9. Validity window boundaries & timezone offset equivalence (no wall-clock)
+        # Exact issued_at is allowed; 1 second before is rejected; exact expires_at is rejected
+        self.assertEqual(
+            catalog.evaluate_v3(
+                make_req(evaluated_at="2026-11-27T10:00:00Z")
+            ),
+            [],
+        )
+        self.assertEqual(
+            catalog.evaluate_v3(
+                make_req(evaluated_at="2026-11-27T04:30:00-06:00")
+            ),
+            [],
+        )
+        self.assertEqual(
+            len(
+                catalog.evaluate_v3(
+                    make_req(evaluated_at="2026-11-27T09:59:59Z")
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                catalog.evaluate_v3(
+                    make_req(evaluated_at="2026-11-27T11:00:00Z")
+                )
+            ),
+            1,
+        )
+
+        # 10. Single-use trajectory states: reserved, consumed, locked_uncertain, released_absent
+        for blocked_usage_status in ("reserved", "consumed", "locked_uncertain"):
+            with self.subTest(usage_status=blocked_usage_status):
+                traj = TrajectoryView(
+                    policy_scope="scope.notif",
+                    approvals=[
+                        ApprovalStateRecord(
+                            approval_id="app-100",
+                            operation_digest=digest,
+                            policy_scope="scope.notif",
+                            status=blocked_usage_status,  # type: ignore[arg-type]
+                            effect_id="eff-000001",
+                        )
+                    ],
+                )
+                self.assertEqual(
+                    len(catalog.evaluate_v3(make_req(trajectory=traj))), 1
+                )
+
+        absent_traj = TrajectoryView(
+            policy_scope="scope.notif",
+            approvals=[
+                ApprovalStateRecord(
+                    approval_id="app-100",
+                    operation_digest=digest,
+                    policy_scope="scope.notif",
+                    status="released_absent",
+                    effect_id="eff-000001",
+                )
+            ],
+        )
+        # Disallowed when allow_retry_after_confirmed_absent=False
+        self.assertEqual(
+            len(catalog.evaluate_v3(make_req(trajectory=absent_traj))), 1
+        )
+        # Allowed when allow_retry_after_confirmed_absent=True for identical digest
+        retry_contract = self._contract(
+            {
+                "tools": ["send_notification"],
+                "required_authorities": ["notif.approver"],
+                "allow_retry_after_confirmed_absent": True,
+            }
+        )
+        self.assertEqual(
+            catalog.evaluate_v3(
+                make_req(contract=retry_contract, trajectory=absent_traj)
+            ),
+            [],
+        )
+
+
+class DestinationAllowlistRuleTests(unittest.TestCase):
+    def test_destination_allowlist_reads_only_trusted_sources_and_blocks_spoofed_args(
+        self,
+    ):
+        from vogtcon.models import (
+            ContractRulesV3,
+            EnforcementPolicy,
+            ExecutionContext,
+            HostFacts,
+            PlannedEffect,
+        )
+
+        for bad_params in (
+            {"tools": [], "allowed_destinations": ["ops@example.com"]},
+            {"tools": ["send_notification"], "allowed_destinations": []},
+            {"tools": ["send_notification"], "allowed_destinations": ["a", "a"]},
+        ):
+            with self.assertRaises(ValidationError):
+                DestinationAllowlistParams.model_validate(bad_params)
+
+        contract = ContractRulesV3.model_validate(
+            {
+                "schema_version": 3,
+                "contract_id": "v3.dest",
+                "approved_agent_configurations": ["agent-v3"],
+                "declared_tools": ["send_notification"],
+                "response_schema": {"required_fields": ["status"]},
+                "memory_policy": "none",
+                "validation_phases": ["pre_execution", "runtime", "post_execution"],
+                "rules": [
+                    {
+                        "instance_id": "dest-effect",
+                        "rule_type": "destination.allowlist",
+                        "phases": ["runtime"],
+                        "params": {
+                            "tools": ["send_notification"],
+                            "allowed_destinations": [
+                                "ops@example.com",
+                                "sec@example.com",
+                            ],
+                            "destination_param": "recipient",
+                            "source": "planned_effect",
+                        },
+                    },
+                    {
+                        "instance_id": "dest-facts",
+                        "rule_type": "destination.allowlist",
+                        "phases": ["runtime"],
+                        "params": {
+                            "tools": ["send_notification"],
+                            "allowed_destinations": ["internal.example.com"],
+                            "destination_param": "resolved_domain",
+                            "source": "host_facts",
+                        },
+                    },
+                ],
+                "contract_fingerprint": "sha256:" + "2" * 64,
+            }
+        )
+
+        valid_req = GovernorInput(
+            run_id="r-dest",
+            contract=contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(
+                state={}, available_tools=["send_notification"]
+            ),
+            action=ActionProposal(
+                tool_name="send_notification",
+                arguments={"recipient": "evil@attacker.org"},
+            ),
+            planned_effect=PlannedEffect(
+                tool_name="send_notification",
+                defaults={"recipient": "ops@example.com"},
+            ),
+            host_facts=HostFacts(
+                facts={"resolved_domain": "internal.example.com"}
+            ),
+        )
+        self.assertEqual(DEFAULT_RULE_CATALOG.evaluate_v3(valid_req), [])
+
+        # Agent spoofs allowed recipient in ActionProposal.arguments while PlannedEffect has attacker destination (INV-04)
+        spoofed_req = valid_req.model_copy(
+            update={
+                "action": ActionProposal(
+                    tool_name="send_notification",
+                    arguments={
+                        "recipient": "ops@example.com",
+                        "resolved_domain": "internal.example.com",
+                    },
+                ),
+                "planned_effect": PlannedEffect(
+                    tool_name="send_notification",
+                    parameters={"recipient": "exfil@attacker.org"},
+                ),
+            }
+        )
+        v = DEFAULT_RULE_CATALOG.evaluate_v3(spoofed_req)
+        self.assertEqual([item.rule for item in v], ["dest-effect"])
+
+        # Missing or non-string destination fails closed
+        missing_facts_req = valid_req.model_copy(update={"host_facts": None})
+        self.assertEqual(
+            [item.rule for item in DEFAULT_RULE_CATALOG.evaluate_v3(missing_facts_req)],
+            ["dest-facts"],
+        )
+
+
+class RetrievedEvidenceRuleTests(unittest.TestCase):
+    def test_retrieved_evidence_verifies_host_provenance_and_blocks_invented_claims(
+        self,
+    ):
+        from vogtcon.models import (
+            ContractRulesV3,
+            EnforcementPolicy,
+            ExecutionContext,
+            PlannedEffect,
+            RetrievedEvidence,
+        )
+
+        self.assertIn(
+            "does NOT prove semantic relevance",
+            RetrievedEvidenceParams.__doc__ or "",
+        )
+        for bad_params in (
+            {"tools": []},
+            {"tools": ["create_ticket"], "min_count": 0},
+            {"tools": ["create_ticket"], "allowed_sources": []},
+        ):
+            with self.assertRaises(ValidationError):
+                RetrievedEvidenceParams.model_validate(bad_params)
+
+        contract = ContractRulesV3.model_validate(
+            {
+                "schema_version": 3,
+                "contract_id": "v3.evidence",
+                "approved_agent_configurations": ["agent-v3"],
+                "declared_tools": ["create_ticket"],
+                "response_schema": {"required_fields": ["status"]},
+                "memory_policy": "none",
+                "validation_phases": ["pre_execution", "runtime", "post_execution"],
+                "rules": [
+                    {
+                        "instance_id": "ticket-evidence",
+                        "rule_type": "evidence.retrieved_required",
+                        "phases": ["runtime"],
+                        "params": {
+                            "tools": ["create_ticket"],
+                            "min_count": 2,
+                            "allowed_sources": ["kb.trusted", "logs.prod"],
+                            "require_content_digest": True,
+                            "claim_param": "evidence_ids",
+                        },
+                    }
+                ],
+                "contract_fingerprint": "sha256:" + "3" * 64,
+            }
+        )
+        ev1 = RetrievedEvidence(
+            evidence_id="ev-1",
+            source="kb.trusted",
+            content_digest="sha256:" + "a" * 64,
+        )
+        ev2 = RetrievedEvidence(
+            evidence_id="ev-2",
+            source="logs.prod",
+            content_digest="sha256:" + "b" * 64,
+        )
+
+        valid_req = GovernorInput(
+            run_id="r-ev",
+            contract=contract,
+            phase="runtime",
+            policy=EnforcementPolicy(mode="guarded"),
+            context=ExecutionContext(
+                state={}, available_tools=["create_ticket"]
+            ),
+            action=ActionProposal(
+                tool_name="create_ticket",
+                arguments={"evidence_ids": ["invented-in-args"]},
+            ),
+            planned_effect=PlannedEffect(
+                tool_name="create_ticket",
+                parameters={"evidence_ids": ["ev-1", "ev-2"]},
+            ),
+            retrieved_evidence=[ev1, ev2],
+        )
+        self.assertEqual(DEFAULT_RULE_CATALOG.evaluate_v3(valid_req), [])
+
+        # Invented evidence ID in claim_param fails closed
+        invented_req = valid_req.model_copy(
+            update={
+                "planned_effect": PlannedEffect(
+                    tool_name="create_ticket",
+                    parameters={"evidence_ids": ["ev-1", "ev-999-invented"]},
+                )
+            }
+        )
+        self.assertEqual(
+            len(DEFAULT_RULE_CATALOG.evaluate_v3(invented_req)), 1
+        )
+
+        # Duplicate claimed IDs below min_count unique IDs fails closed
+        dup_claim_req = valid_req.model_copy(
+            update={
+                "planned_effect": PlannedEffect(
+                    tool_name="create_ticket",
+                    parameters={"evidence_ids": ["ev-1", "ev-1"]},
+                )
+            }
+        )
+        self.assertEqual(
+            len(DEFAULT_RULE_CATALOG.evaluate_v3(dup_claim_req)), 1
+        )
+
+        # Evidence from disallowed source or missing content_digest fails closed
+        untrusted_source = RetrievedEvidence(
+            evidence_id="ev-2",
+            source="untrusted.web",
+            content_digest="sha256:" + "b" * 64,
+        )
+        no_digest = RetrievedEvidence(
+            evidence_id="ev-2",
+            source="logs.prod",
+            content_digest=None,
+        )
+        for bad_ev in (untrusted_source, no_digest):
+            self.assertEqual(
+                len(
+                    DEFAULT_RULE_CATALOG.evaluate_v3(
+                        valid_req.model_copy(
+                            update={"retrieved_evidence": [ev1, bad_ev]}
+                        )
+                    )
+                ),
+                1,
+            )
 
 
 if __name__ == "__main__":

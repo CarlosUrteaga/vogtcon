@@ -2324,3 +2324,71 @@ class TestCliExplainV2(unittest.TestCase):
         res = json.loads(out)
         self.assertEqual(res["status"], "invalid_log")
         self.assertEqual(res["diagnostics"][0]["code"], "invalid_event")
+
+    def test_explain_v2_approval_id_correlation_and_conflict_detection(self) -> None:
+        digest = PlannedEffect(tool_name="send_notification").operation_digest()
+
+        def write_events(evs: list[RunEvent | RunEventV2]) -> None:
+            self.log_path.write_text(
+                "\n".join(ev.model_dump_json() for ev in evs) + "\n", encoding="utf-8"
+            )
+
+        # 1. Valid approval_id on decision, effect_observed, and cross-run effect_reconciled
+        write_events([
+            RunEventV2(run_id="r-app-1", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="r-app-1", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-000001", operation_digest=digest, effect_status="reserved", approval_id="app-100"),
+            RunEventV2(run_id="r-app-1", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-000001", operation_digest=digest),
+            RunEventV2(run_id="r-app-1", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="unknown", effect_id="eff-000001", operation_digest=digest, effect_status="uncertain", approval_id="app-100"),
+            RunEventV2(run_id="r-app-1", sequence=5, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+            RunEventV2(run_id="r-app-2", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="r-app-2", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_reconciled", execution_status="completed", effect_id="eff-000001", operation_digest=digest, effect_status="confirmed", evidence_ref="audit-ok", approval_id="app-100"),
+            RunEventV2(run_id="r-app-2", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-000002", operation_digest=digest, effect_status="reserved"),
+            RunEventV2(run_id="r-app-2", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-000002", operation_digest=digest),
+            RunEventV2(run_id="r-app-2", sequence=5, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-000002", operation_digest=digest, effect_status="confirmed"),
+            RunEventV2(run_id="r-app-2", sequence=6, contract_id="c1", mode="guarded", phase="post_execution", event_type="decision"),
+        ])
+        code_j, out_j, err_j = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code_j, err_j), (0, ""))
+        r1, r2 = json.loads(out_j)["data"]["runs"]
+        self.assertEqual(r1["actions"][0]["approval_id"], "app-100")
+        self.assertEqual(r2["reconciliations"][0]["approval_id"], "app-100")
+        # Non-approval action omits approval_id key entirely
+        self.assertNotIn("approval_id", r2["actions"][0])
+
+        code_t, out_t, err_t = self.run_cli(["explain", str(self.log_path)])
+        self.assertEqual((code_t, err_t), (0, ""))
+        self.assertIn("[approval: app-100]", out_t)
+
+        # 2. Conflicting approval_id between decision and effect_observed -> inconsistent_log
+        write_events([
+            RunEventV2(run_id="r-conflict-obs", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+            RunEventV2(run_id="r-conflict-obs", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-000001", operation_digest=digest, effect_status="reserved", approval_id="app-1"),
+            RunEventV2(run_id="r-conflict-obs", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-000001", operation_digest=digest),
+            RunEventV2(run_id="r-conflict-obs", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-000001", operation_digest=digest, effect_status="confirmed", approval_id="app-2"),
+        ])
+        code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+        self.assertEqual((code, err), (1, ""))
+        self.assertEqual(json.loads(out)["status"], "inconsistent_log")
+
+        # 3. Conflicting approval_id on same-run and cross-run effect_reconciled -> inconsistent_log
+        for cross_run in (False, True):
+            with self.subTest(cross_run=cross_run):
+                rec_run = "r-rec-2" if cross_run else "r-rec-1"
+                rec_seq = 2 if cross_run else 5
+                evs = [
+                    RunEventV2(run_id="r-rec-1", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision"),
+                    RunEventV2(run_id="r-rec-1", sequence=2, contract_id="c1", mode="guarded", phase="runtime", event_type="decision", action_index=1, tool_name="send_notification", decision="allow", effect_id="eff-000001", operation_digest=digest, effect_status="reserved", approval_id="app-1"),
+                    RunEventV2(run_id="r-rec-1", sequence=3, contract_id="c1", mode="guarded", phase="runtime", event_type="tool_completed", action_index=1, tool_name="send_notification", execution_status="completed", effect_id="eff-000001", operation_digest=digest),
+                    RunEventV2(run_id="r-rec-1", sequence=4, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_observed", action_index=1, tool_name="send_notification", execution_status="unknown", effect_id="eff-000001", operation_digest=digest, effect_status="uncertain", approval_id="app-1"),
+                ]
+                if cross_run:
+                    evs.append(
+                        RunEventV2(run_id="r-rec-2", sequence=1, contract_id="c1", mode="guarded", phase="pre_execution", event_type="decision")
+                    )
+                evs.append(
+                    RunEventV2(run_id=rec_run, sequence=rec_seq, contract_id="c1", mode="guarded", phase="runtime", event_type="effect_reconciled", execution_status="completed", effect_id="eff-000001", operation_digest=digest, effect_status="confirmed", evidence_ref="audit-bad", approval_id="app-TAMPERED")
+                )
+                write_events(evs)
+                code, out, err = self.run_cli(["explain", str(self.log_path), "--json"])
+                self.assertEqual((code, err), (1, ""))
+                self.assertEqual(json.loads(out)["status"], "inconsistent_log")

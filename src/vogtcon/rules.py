@@ -8,18 +8,21 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import Annotated, Any, Literal, Self, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .models import (
     ContractRulesV3,
     FrozenJsonObject,
     GovernorInput,
     JsonObject,
+    NonEmptyString,
     Phase,
     RuleBinding,
     Violation,
+    _FrozenUniqueStrTupleField,
+    _parse_utc_timestamp,
     _thaw_json_value,
 )
 
@@ -39,6 +42,129 @@ class EmptyRuleParams(BaseModel):
     model_config = ConfigDict(
         strict=True, extra="forbid", frozen=True, allow_inf_nan=False
     )
+
+
+class BoundApprovalParams(BaseModel):
+    """Parameter schema for the ``approval.bound_required`` v3 rule type."""
+
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+    tools: _FrozenUniqueStrTupleField = Field(min_length=1)
+    required_authorities: _FrozenUniqueStrTupleField = Field(min_length=1)
+    authority_match: Literal["any", "all"] = "any"
+    sensitivity_fact_key: NonEmptyString | None = None
+    allow_self_approval: bool = False
+    require_single_use: bool = True
+    allow_retry_after_confirmed_absent: bool = False
+
+    @model_validator(mode="after")
+    def check_non_empty_tuples(self) -> Self:
+        if not self.tools:
+            raise ValueError("BoundApprovalParams tools must be non-empty")
+        if not self.required_authorities:
+            raise ValueError(
+                "BoundApprovalParams required_authorities must be non-empty"
+            )
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            merged.update(update)
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
+class DestinationAllowlistParams(BaseModel):
+    """Parameter schema for the ``destination.allowlist`` v3 rule type."""
+
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+    tools: _FrozenUniqueStrTupleField = Field(min_length=1)
+    allowed_destinations: _FrozenUniqueStrTupleField = Field(min_length=1)
+    destination_param: NonEmptyString = "destination"
+    source: Literal["planned_effect", "host_facts"] = "planned_effect"
+
+    @model_validator(mode="after")
+    def check_non_empty_tuples(self) -> Self:
+        if not self.tools:
+            raise ValueError("DestinationAllowlistParams tools must be non-empty")
+        if not self.allowed_destinations:
+            raise ValueError(
+                "DestinationAllowlistParams allowed_destinations must be non-empty"
+            )
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            merged.update(update)
+            return type(self).model_validate(merged)
+        return self.__copy__()
+
+
+class RetrievedEvidenceParams(BaseModel):
+    """Parameter schema for the ``evidence.retrieved_required`` v3 rule type.
+
+    Verifies only that host-verified retrieved evidence references satisfy
+    count, source, digest, and optional claim-subset checks.
+    Retrieval does NOT prove semantic relevance or accuracy.
+    """
+
+    model_config = ConfigDict(
+        strict=True, extra="forbid", frozen=True, allow_inf_nan=False
+    )
+
+    tools: _FrozenUniqueStrTupleField = Field(min_length=1)
+    min_count: Annotated[int, Field(ge=1)] = 1
+    allowed_sources: _FrozenUniqueStrTupleField | None = None
+    require_content_digest: bool = False
+    claim_param: NonEmptyString | None = None
+
+    @model_validator(mode="after")
+    def check_non_empty_tuples(self) -> Self:
+        if not self.tools:
+            raise ValueError("RetrievedEvidenceParams tools must be non-empty")
+        if self.allowed_sources is not None and not self.allowed_sources:
+            raise ValueError(
+                "RetrievedEvidenceParams allowed_sources must be non-empty when specified"
+            )
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:
+        return self.__copy__()
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            merged = self.model_dump()
+            merged.update(update)
+            return type(self).model_validate(merged)
+        return self.__copy__()
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +320,159 @@ def _check_v3_response_schema_complete(
     )
 
 
+def _check_v3_bound_approval(
+    request: GovernorInput, params: BaseModel
+) -> bool:
+    assert isinstance(params, BoundApprovalParams)
+    if request.planned_effect is None:
+        return True
+    if request.planned_effect.tool_name not in params.tools:
+        return False
+    if params.sensitivity_fact_key is not None:
+        if (
+            request.host_facts is None
+            or params.sensitivity_fact_key not in request.host_facts.facts
+        ):
+            return True
+        raw_sensitive = request.host_facts.facts[params.sensitivity_fact_key]
+        if type(raw_sensitive) is not bool:
+            return True
+        if raw_sensitive is False:
+            return False
+
+    if (
+        request.approval is None
+        or request.requester_id is None
+        or request.policy_scope is None
+        or request.evaluated_at is None
+    ):
+        return True
+
+    approval = request.approval
+    if approval.status != "active":
+        return True
+    if approval.operation_digest != request.planned_effect.operation_digest():
+        return True
+    if approval.requester_id != request.requester_id:
+        return True
+    if approval.policy_scope != request.policy_scope:
+        return True
+    if (
+        not params.allow_self_approval
+        and approval.approver_id == request.requester_id
+    ):
+        return True
+
+    held = set(approval.approver_authorities)
+    required = set(params.required_authorities)
+    if params.authority_match == "all":
+        if not required.issubset(held):
+            return True
+    else:
+        if not (held & required):
+            return True
+
+    eval_dt = _parse_utc_timestamp(request.evaluated_at)
+    issued_dt = _parse_utc_timestamp(approval.issued_at)
+    expires_dt = _parse_utc_timestamp(approval.expires_at)
+    if not (issued_dt <= eval_dt < expires_dt):
+        return True
+
+    if params.require_single_use:
+        if (
+            not approval.single_use
+            or request.trajectory is None
+            or request.trajectory.policy_scope != request.policy_scope
+        ):
+            return True
+        usage = request.trajectory.approval_by_id(approval.approval_id)
+        if usage is not None:
+            if (
+                usage.operation_digest != approval.operation_digest
+                or usage.policy_scope != approval.policy_scope
+                or not usage.single_use
+            ):
+                return True
+            if usage.status in ("reserved", "consumed", "locked_uncertain"):
+                return True
+            if (
+                usage.status == "released_absent"
+                and not params.allow_retry_after_confirmed_absent
+            ):
+                return True
+
+    return False
+
+
+def _check_v3_destination_allowlist(
+    request: GovernorInput, params: BaseModel
+) -> bool:
+    assert isinstance(params, DestinationAllowlistParams)
+    if request.planned_effect is None:
+        return True
+    if request.planned_effect.tool_name not in params.tools:
+        return False
+    if params.source == "planned_effect":
+        dest = request.planned_effect.effective_parameters.get(
+            params.destination_param
+        )
+    else:
+        if request.host_facts is None:
+            return True
+        dest = request.host_facts.facts.get(params.destination_param)
+    if (
+        type(dest) is not str
+        or not dest
+        or dest not in params.allowed_destinations
+    ):
+        return True
+    return False
+
+
+def _check_v3_evidence_retrieved_required(
+    request: GovernorInput, params: BaseModel
+) -> bool:
+    """Verify host-retrieved evidence provenance, count, digest, and claimed subset.
+
+    Retrieval verification does NOT prove semantic relevance or accuracy.
+    """
+    assert isinstance(params, RetrievedEvidenceParams)
+    if request.planned_effect is None:
+        return True
+    if request.planned_effect.tool_name not in params.tools:
+        return False
+    if request.retrieved_evidence is None:
+        return True
+    verified_ids = {
+        item.evidence_id
+        for item in request.retrieved_evidence
+        if (
+            params.allowed_sources is None
+            or item.source in params.allowed_sources
+        )
+        and (
+            not params.require_content_digest
+            or item.content_digest is not None
+        )
+    }
+    if len(verified_ids) < params.min_count:
+        return True
+    if params.claim_param is not None:
+        claimed = request.planned_effect.effective_parameters.get(
+            params.claim_param
+        )
+        if not isinstance(claimed, list) or any(
+            type(item) is not str or not item for item in claimed
+        ):
+            return True
+        claimed_set = set(claimed)
+        if len(claimed_set) < params.min_count or not claimed_set.issubset(
+            verified_ids
+        ):
+            return True
+    return False
+
+
 DEFAULT_RUNTIME_RULES: Mapping[str, RuleHandler] = MappingProxyType({
     "tool.declared_only": _check_tool_declared_only,
     "ticket_requires_evidence": _check_ticket_requires_evidence,
@@ -219,6 +498,21 @@ DEFAULT_RULE_TYPES: Mapping[str, RuleTypeSpec] = MappingProxyType({
         allowed_phases=frozenset({"post_execution"}),
         params_model=EmptyRuleParams,
         handler=_check_v3_response_schema_complete,
+    ),
+    "approval.bound_required": RuleTypeSpec(
+        allowed_phases=frozenset({"runtime"}),
+        params_model=BoundApprovalParams,
+        handler=_check_v3_bound_approval,
+    ),
+    "destination.allowlist": RuleTypeSpec(
+        allowed_phases=frozenset({"runtime"}),
+        params_model=DestinationAllowlistParams,
+        handler=_check_v3_destination_allowlist,
+    ),
+    "evidence.retrieved_required": RuleTypeSpec(
+        allowed_phases=frozenset({"runtime"}),
+        params_model=RetrievedEvidenceParams,
+        handler=_check_v3_evidence_retrieved_required,
     ),
 })
 

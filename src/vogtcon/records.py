@@ -23,6 +23,7 @@ from pydantic import (
 )
 
 from .models import (
+    ApprovalId,
     Decision,
     EffectId,
     EffectStatus,
@@ -129,6 +130,9 @@ class RunEventV2(BaseModel):
     effect_id: EffectId | None = None
     operation_digest: Sha256Digest | None = None
     effect_status: EffectStatus | None = None
+    approval_id: ApprovalId | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     compensates_effect_id: EffectId | None = None
     evidence_ref: NonEmptyString | None = None
     trace_id: str | None = None
@@ -162,9 +166,13 @@ class RunEventV2(BaseModel):
                         "runtime decisions require decision and action identity"
                     )
                 if self.decision in ("block", "abort"):
-                    if self.effect_id is not None or self.effect_status is not None:
+                    if (
+                        self.effect_id is not None
+                        or self.effect_status is not None
+                        or self.approval_id is not None
+                    ):
                         raise ValueError(
-                            "blocked or aborted decisions cannot reserve an effect"
+                            "blocked or aborted decisions cannot reserve an effect or approval"
                         )
                 elif self.effect_id is not None:
                     if (
@@ -176,6 +184,8 @@ class RunEventV2(BaseModel):
                         )
                 elif self.effect_status is not None:
                     raise ValueError("effect_status on decision requires effect_id")
+                elif self.approval_id is not None:
+                    raise ValueError("approval_id on decision requires effect_id")
             elif any(
                 v is not None
                 for v in (
@@ -185,6 +195,7 @@ class RunEventV2(BaseModel):
                     self.effect_id,
                     self.effect_status,
                     self.operation_digest,
+                    self.approval_id,
                 )
             ):
                 raise ValueError(
@@ -203,6 +214,7 @@ class RunEventV2(BaseModel):
                 or self.compensates_effect_id is not None
                 or self.effect_status is not None
                 or self.evidence_ref is not None
+                or self.approval_id is not None
                 or self.execution_status != expected_exec
             ):
                 raise ValueError(
@@ -258,6 +270,7 @@ class RunEventV2(BaseModel):
                 or self.execution_status != "completed"
                 or self.decision is not None
                 or self.violation_rules
+                or self.approval_id is not None
             ):
                 raise ValueError(
                     "effect_compensated events require runtime phase, effect_id, tool_name, operation_digest, effect_status='confirmed', compensates_effect_id, evidence_ref, and execution_status='completed'"
