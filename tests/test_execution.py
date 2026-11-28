@@ -1818,7 +1818,7 @@ class BoundAuthorizationExecutionTests(unittest.TestCase):
         planned = self._planned()
         approval = self._approval(planned)
         store = InMemoryEffectStore()
-        calls: list[str] = []
+        calls: list[ActionProposal] = []
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log = JsonlDecisionLog(Path(tmpdir) / "bound.jsonl")
@@ -1859,16 +1859,31 @@ class BoundAuthorizationExecutionTests(unittest.TestCase):
             outcome = controller.execute(
                 ActionProposal(
                     tool_name="send_notification",
-                    arguments={"recipient": "alerts@example.com", "sensitive": False},
+                    arguments={
+                        "recipient": "alerts@example.com",
+                        "channel": "sms",
+                        "sensitive": False,
+                    },
+                    iteration=3,
                 ),
                 ctx,
-                lambda _p: calls.append("sent") or "ok",
+                lambda invocation: calls.append(invocation) or "ok",
             )
             self.assertTrue(outcome.executed)
             assert outcome.effect is not None
             self.assertEqual(outcome.effect.status, "confirmed")
             self.assertEqual(outcome.effect.approval_id, "appr-001")
-            self.assertEqual(calls, ["sent"])
+            expected_invocation = ActionProposal(
+                tool_name="send_notification",
+                arguments={
+                    "recipient": "alerts@example.com",
+                    "channel": "email",
+                    "evidence_ids": ["ev-001"],
+                },
+                iteration=3,
+            )
+            self.assertEqual(calls, [expected_invocation])
+            self.assertEqual(outcome.effect.operation_digest, planned.operation_digest())
             self.assertEqual(controller.finish(ctx, {"status": "ok"}).violations, [])
 
             snap = store.snapshot("scope.auth")
@@ -1921,12 +1936,12 @@ class BoundAuthorizationExecutionTests(unittest.TestCase):
             replay = controller2.execute(
                 ActionProposal(tool_name="send_notification"),
                 ctx,
-                lambda _p: calls.append("replayed"),
+                lambda invocation: calls.append(invocation),
             )
             self.assertFalse(replay.executed)
             self.assertEqual(replay.decision.decision, "block")
             self.assertEqual([v.rule for v in replay.decision.violations], ["bound-approval"])
-            self.assertEqual(calls, ["sent"])
+            self.assertEqual(calls, [expected_invocation])
 
     def test_rejects_tampered_authorization_evidence_destination_and_spoofed_sensitivity(self):
         v3 = self._auth_v3_contract()

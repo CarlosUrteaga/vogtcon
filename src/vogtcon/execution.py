@@ -621,6 +621,14 @@ class WorkflowController:
                     "allow_retry_after_confirmed_absent": allow_retry_after_absent,
                 }
             try:
+                if isinstance(self._contract, ContractRulesV3):
+                    invocation = ActionProposal(
+                        tool_name=tool_name,
+                        arguments=resolved.planned_effect.effective_parameters,
+                        iteration=action_snapshot.iteration,
+                    )
+                else:
+                    invocation = action_snapshot.model_copy(deep=True)
                 reserved = cfg.store.reserve(
                     run_id=self._run_id,
                     policy_scope=effective_scope,
@@ -675,7 +683,7 @@ class WorkflowController:
             ) if self._telemetry is not None else nullcontext(None)
             with tool_span:
                 try:
-                    result = tool(action_snapshot.model_copy(deep=True))
+                    result = tool(invocation)
                 except Exception as tool_exc:
                     obs_in = ObservationInput(
                         effect_id=reserved.effect_id,
@@ -853,6 +861,7 @@ class WorkflowController:
         context: ExecutionContext,
         tool: Callable[[ActionProposal], T],
     ) -> ToolExecutionOutcome[T]:
+        """Execute a governed action with the host-resolved parameters for v3."""
         if self._effect_governance is not None:
             return self._execute_governed(action, context, tool)
         if self._state != "active":
